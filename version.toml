@@ -1,0 +1,5 @@
+schema_version = 1
+suite = "1.0.0"
+launcher = "1.0.0"
+cot_runtime = "0.1.0-alpha"
+mom_runtime = "0.0.0-dev"

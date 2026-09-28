@@ -1,0 +1,16 @@
+MojoRecomp libmspack LZX Build Recipe
+=====================================
+
+MojoRecomp uses the LZX decompressor from libmspack commit
+305907723a4e7ab2018e58040059ffb5e77db837. This CMake project builds that
+source as the replaceable `mojorecomp-lzx.dll` used by the runtime.
+
+Example Windows x64 build:
+
+    cmake -S mojorecomp-build -B build -G Ninja ^
+      -DCMAKE_BUILD_TYPE=Release ^
+      -DLIBMSPACK_ROOT=<path-to-libmspack-source>
+    cmake --build build
+
+libmspack is licensed under LGPL-2.1. The distributed source archive contains
+the exact pinned source, this build recipe, and the applicable license text.

@@ -1,0 +1,17 @@
+id = "mom"
+name = "Crash: Mind over Mutant"
+runtime = "mom-runtime.exe"
+runtime_version = "0.0.0-dev"
+status = "coming-soon"
+playable = false
+
+[files]
+required = ["default.xex"]
+
+[capabilities]
+resolution_scale = false
+aspect_ratio = false
+fxaa = false
+anisotropic_filtering = false
+debug_mode = false
+localization = false

@@ -1,0 +1,5 @@
+name = "MojoRecomp Launcher"
+version = "1.0.0"
+release_channel = "development"
+
+update_catalog = "https://github.com/OAleex/MojoRecomp/releases/latest/download/update-catalog.toml"

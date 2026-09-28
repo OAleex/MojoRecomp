@@ -1,0 +1,34 @@
+{
+  "name": "mojorecomp-launcher",
+  "private": true,
+  "version": "1.0.0",
+  "license": "ISC",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "vite build",
+    "generate:notices": "node scripts/generate-third-party-notices.mjs",
+    "prepare:bundle": "node scripts/generate-third-party-notices.mjs && node scripts/prepare-bundle.mjs && vite build",
+    "package:portable": "node scripts/package-portable.mjs",
+    "package:production": "node scripts/package-portable.mjs",
+    "package:release": "node scripts/package-release.mjs",
+    "validate:release": "node scripts/validate-release.mjs",
+    "validate:production": "node scripts/validate-release.mjs",
+    "test:release-metadata": "node --test scripts/release-metadata.test.mjs",
+    "build:portable": "npm.cmd run build:production",
+    "build:production": "npm.cmd run prepare:bundle && node scripts/build-tauri-release.mjs && npm.cmd run package:production && npm.cmd run validate:production",
+    "check": "tsc --noEmit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "svelte": "^5.57.1"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@tauri-apps/cli": "^2.11.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}

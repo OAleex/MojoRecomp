@@ -1,0 +1,29 @@
+MojoRecomp FFmpeg Build Recipe
+==============================
+
+This directory contains the narrow Windows x86_64 FFmpeg build used by the
+Crash of the Titans runtime for XMA/audio decoding.
+
+`setup.bat` checks out `https://github.com/wmarti/FFmpeg.git` at commit
+`0604b464c7cb4ebc94940cf1f324a3b26b87717c` and builds the selected
+`libavcodec` and `libavutil` sources here with the repository's pinned Windows
+Clang/LLD toolchain. They are combined into the replaceable
+`mojorecomp-ffmpeg.dll`; no FFmpeg object code is linked into
+`cot-runtime.exe`. Build output is written to the ignored
+`thirdparty/ffmpeg-build/` directory; the source checkout is kept under the
+ignored `thirdparty/ffmpeg-src/` directory.
+
+The explicit source lists and generated codec/parser/bitstream-filter overlays
+are adapted from ReXGlue SDK v0.10.0 commit
+`c94f5ebdcb3c9d1a460ca48e04f9758448f8d518`. Its BSD-3-Clause license is
+preserved as `launcher/resources/licenses/ReXGlue-LICENSE.txt`.
+
+The pinned FFmpeg Windows configuration disables GPL, nonfree and version3
+components. FFmpeg remains subject to its own LGPL terms and related notices.
+The release process produces an exact corresponding-source archive containing
+the pinned source, this recipe, the CMake source selection, overlays, and the
+applicable license text.
+
+The former legacy local `thirdparty/ffmpeg-rexglue/` header/archive snapshot has
+been removed. Runtime CMake consumes headers from `thirdparty/ffmpeg-src/` and
+libraries from `thirdparty/ffmpeg-build/`.

@@ -1,0 +1,88 @@
+# Local game data and generated code are never versioned.
+/game/
+/games/
+/userdata/
+/ppc/
+/out/
+/build/
+/thirdparty/
+/.private/
+/.release/
+
+# Proprietary disc/title inputs must never be staged outside their normal roots.
+*.iso
+*.xex
+*.xexp
+*.rcf
+
+# First-run/generated caches.
+shader_cache/
+cache/
+*.log
+*.dmp
+*.tmp
+*.bak
+*.zip
+*.7z
+
+# Compilers, linkers and language tools.
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.map
+*.exe
+*.dll
+__pycache__/
+*.py[cod]
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# Local diagnostic sessions and one-off investigation state.
+/.last-*.txt
+/runtime/.last-*.txt
+/.diag-*
+/.probe-*
+/*.bmp
+/*.jpg
+/*.jpeg
+/*.png
+/*.webp
+/*.gif
+/_diag-temp/
+/_launcher-empty-state-test*/
+/diagnostics/
+
+# IDE / OS noise.
+.vs/
+.vscode/
+.idea/
+.DS_Store
+*.suo
+*.user
+*.VC.db
+Thumbs.db
+Desktop.ini
+
+# Runtime-local CMake/Ninja outputs and generated link stubs.
+runtime/build-*/
+runtime/generated_import_stubs.cpp
+
+# Launcher dependency/build output.
+launcher/node_modules/
+launcher/dist/
+launcher/.svelte-kit/
+launcher/.vite/
+launcher/coverage/
+launcher/src-tauri/target/
+launcher/src-tauri/binaries/
+launcher/src-tauri/gen/
+launcher/bundle/
+launcher/release/
+launcher/src-tauri/icons/android/
+launcher/src-tauri/icons/ios/
+launcher/src-tauri/icons/*.png
+launcher/src-tauri/icons/icon.icns
+

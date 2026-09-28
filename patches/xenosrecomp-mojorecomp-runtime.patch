@@ -1,0 +1,391 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 1c74034..4badba4 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -3,6 +3,8 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++#define SPEC_CONSTANT_ALPHA_FUNC_SHIFT  8
++#define SPEC_CONSTANT_ALPHA_FUNC_MASK   (7 << SPEC_CONSTANT_ALPHA_FUNC_SHIFT)
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+@@ -30,6 +32,12 @@ struct PushConstants
+ #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+ #define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 264)
+ #define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 272)
++#define g_TextureSampleScale(INDEX) vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 288 + (INDEX) * 4)
++#define g_PosScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 352)
++#define g_PosOffset                vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 360)
++#define g_PosDepthTransform        vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 368)
++#define g_DepthOutputScale         vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 376)
++#define g_LoopCount(INDEX)         (vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 384 + (INDEX) * 4) & 0xFFu)
+ 
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+ 
+@@ -41,12 +49,66 @@ struct PushConstants
+     uint g_Booleans : packoffset(c16.x); \
+     uint g_SwappedTexcoords : packoffset(c16.y); \
+     float2 g_HalfPixelOffset : packoffset(c16.z); \
+-    float g_AlphaThreshold : packoffset(c17.x);
++    float g_AlphaThreshold : packoffset(c17.x); \
++    float4 g_TextureSampleScales[4] : packoffset(c18); \
++    float2 g_PosScale : packoffset(c22.x); \
++    float2 g_PosOffset : packoffset(c22.z); \
++    float2 g_PosDepthTransform : packoffset(c23.x); \
++    float g_DepthOutputScale : packoffset(c23.z); \
++    uint4 g_LoopConstants[8] : packoffset(c24);
++
++#define g_LoopCount(INDEX) (g_LoopConstants[(INDEX) >> 2][(INDEX) & 3] & 0xFFu)
++#define g_TextureSampleScale(INDEX) (g_TextureSampleScales[(INDEX) >> 2][(INDEX) & 3])
+ 
+ uint g_SpecConstants();
+ 
+ #endif
+ 
++// Xenos D24FS8 stores positive 20e4 float24 depth. Host render targets use
++// D32_SFLOAT_S8 with the guest 0..1 viewport range mapped to host 0..0.5.
++// Quantize an interpolated / explicitly exported host depth exactly to the
++// nearest-even guest float24 value, then map it back to the host range. This is
++// the same precision boundary used by the reference rasterizer and prevents a
++// later GEQUAL/EQUAL pass from comparing fresh float32 Z against depth that has
++// already made an EDRAM float24 round-trip.
++float MojoQuantizeFloat24Depth(float hostDepth)
++{
++    uint f32 = asuint(saturate(hostDepth * 2.0f));
++    uint f24;
++    if (f32 < 0x38800000u)
++    {
++        uint shift = min(113u - (f32 >> 23u), 24u);
++        f24 = ((f32 & 0x7FFFFFu) | 0x800000u) >> shift;
++    }
++    else
++    {
++        f24 = f32 + 0xC8000000u;
++    }
++    // Round to nearest even while dropping the low 3 mantissa bits.
++    f24 += 3u + ((f24 >> 3u) & 1u);
++    f24 = (f24 >> 3u) & 0xFFFFFFu;
++    if (f24 == 0u)
++        return 0.0f;
++
++    uint mantissa = f24 & 0xFFFFFu;
++    int exponent = int(f24 >> 20u);
++    if (exponent == 0)
++    {
++        int highest = firstbithigh(mantissa);
++        uint shift = uint(20 - highest);
++        exponent = 1 - int(shift);
++        mantissa = (mantissa << shift) & 0xFFFFFu;
++    }
++    float guestDepth = asfloat((uint(exponent + 112) << 23u) | (mantissa << 3u));
++    return guestDepth * 0.5f;
++}
++
++#ifdef MOJORECOMP_FLOAT24_DEPTH
++    #define MOJORECOMP_DEPTH_OUTPUT(VALUE) MojoQuantizeFloat24Depth(VALUE)
++#else
++    #define MOJORECOMP_DEPTH_OUTPUT(VALUE) (VALUE)
++#endif
++
+ Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+ Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+ TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..e856e0f 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -170,48 +170,59 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+         ++indentation;
+     }
+ 
+-    indent();
+-    print("r{}.", instr.dstRegister);
+-    printDstSwizzle(instr.dstSwizzle, false);
+-
+-    out += " = ";
+-
+     auto findResult = vertexElements.find(address);
+     assert(findResult != vertexElements.end());
+ 
+-    switch (findResult->second.usage)
++    bool hasFetchComponents = false;
++    for (size_t i = 0; i < 4; ++i)
+     {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+-        print("tfetchR11G11B10(");
+-        break;
+-
+-    case DeclUsage::TexCoord:
+-        print("tfetchTexcoord(g_SwappedTexcoords, ");
+-        break;
++        const auto swizzle = getDestSwizzle(instr.dstSwizzle, uint32_t(i));
++        hasFetchComponents |= swizzle >= FetchDestinationSwizzle::X &&
++                              swizzle <= FetchDestinationSwizzle::W;
+     }
+ 
+-    print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
+-
+-    switch (findResult->second.usage)
++    if (hasFetchComponents)
+     {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        out += ')';
+-        break;
++        indent();
++        print("r{}.", instr.dstRegister);
++        printDstSwizzle(instr.dstSwizzle, false);
+ 
+-    case DeclUsage::TexCoord:
+-        print(", {})", uint32_t(findResult->second.usageIndex));
+-        break;
+-    }
++        out += " = ";
+ 
+-    out += '.';
+-    printDstSwizzle(instr.dstSwizzle, true);
++        switch (findResult->second.usage)
++        {
++        case DeclUsage::Normal:
++        case DeclUsage::Tangent:
++        case DeclUsage::Binormal:
++            specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++            print("tfetchR11G11B10(");
++            break;
+ 
+-    out += ";\n";
++        case DeclUsage::TexCoord:
++            print("tfetchTexcoord(g_SwappedTexcoords, ");
++            break;
++        }
++
++        print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
++
++        switch (findResult->second.usage)
++        {
++        case DeclUsage::Normal:
++        case DeclUsage::Tangent:
++        case DeclUsage::Binormal:
++            out += ')';
++            break;
++
++        case DeclUsage::TexCoord:
++            print(", {})", uint32_t(findResult->second.usageIndex));
++            break;
++        }
++
++        out += '.';
++        printDstSwizzle(instr.dstSwizzle, true);
++
++        out += ";\n";
++    }
+ 
+     printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+ 
+@@ -348,6 +359,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+ 
++    if (instr.opcode == FetchOpcode::TextureFetch)
++        print(" * g_TextureSampleScale({})", instr.constIndex);
++
+     out += ";\n";
+ 
+     printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+@@ -666,6 +680,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     uint32_t vectorWriteMask = instr.vectorWriteMask;
+     if (instr.exportData)
+         vectorWriteMask &= ~instr.scalarWriteMask;
++    const bool depthExport = exportRegister == "oDepth";
+ 
+     if (vectorWriteMask != 0)
+     {
+@@ -687,6 +702,8 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         }
+ 
+         out += " = ";
++        if (depthExport)
++            out += "MOJORECOMP_DEPTH_OUTPUT((";
+ 
+         if (instr.vectorSaturate)
+             out += "saturate(";
+@@ -802,6 +819,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         if (instr.vectorSaturate)
+             out += ')';
+ 
++        if (depthExport)
++            out += ") * g_DepthOutputScale)";
++
+         out += ";\n";
+     }
+ 
+@@ -1053,7 +1073,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+                 out += SWIZZLES[i];
+         }
+ 
+-        out += " = ps;\n";
++        out += depthExport
++            ? " = MOJORECOMP_DEPTH_OUTPUT(ps * g_DepthOutputScale);\n"
++            : " = ps;\n";
+     }
+ 
+     if (instr.exportData)
+@@ -1072,7 +1094,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             else if (oneMask & mask)
+             {
+                 indent();
+-                println("{}.{} = 1.0;", exportRegister, SWIZZLES[i]);
++                if (depthExport)
++                    println("{}.{} = MOJORECOMP_DEPTH_OUTPUT(g_DepthOutputScale);",
++                            exportRegister, SWIZZLES[i]);
++                else
++                    println("{}.{} = 1.0;", exportRegister, SWIZZLES[i]);
+             }
+         }
+     }
+@@ -1152,7 +1178,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             if (constantInfo->registerCount > 1)
+             {
+-                uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
++                uint32_t tailCount = 256 - constantInfo->registerIndex;
+ 
+                 println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
+                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
+@@ -1210,7 +1236,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             if (constantInfo->registerCount > 1)
+             {
+-                uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
++                uint32_t tailCount = 256 - constantInfo->registerIndex;
+                 println("#define {0}(INDEX) select((INDEX) < {1}, {0}[min(INDEX, {2})], 0.0)", constantName, tailCount, tailCount - 1);
+             }
+         }
+@@ -1298,6 +1324,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             out += ",\n\tout float4 oC3 : SV_Target3";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_DEPTH)
+             out += ",\n\tout float oDepth : SV_Depth";
++        else
++        {
++            // Optional host-render-target D24FS8 precision emulation. The normal
++            // module is unchanged; a second module is compiled with this define
++            // only for draws that need float24 depth conversion.
++            out += "\n#ifdef MOJORECOMP_FLOAT24_DEPTH\n";
++            out += ",\n\tout float oDepth : SV_Depth\n";
++            out += "#endif\n";
++        }
+     }
+     else
+     {
+@@ -1356,6 +1391,20 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += ")\n";
+     out += "{\n";
+ 
++    if (isPixelShader)
++    {
++        const auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
++        if ((pixelShader->outputs & PIXEL_SHADER_OUTPUT_DEPTH) == 0)
++        {
++            // SV_Position.z is the host viewport-space depth. Initialize the
++            // optional depth output before guest control flow so every return
++            // path writes the same quantized value.
++            out += "#ifdef MOJORECOMP_FLOAT24_DEPTH\n";
++            out += "\toDepth = MOJORECOMP_DEPTH_OUTPUT(iPos.z);\n";
++            out += "#endif\n";
++        }
++    }
++
+ #ifdef UNLEASHED_RECOMP
+     if (hasMtxProjection)
+     {
+@@ -1631,6 +1680,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 count = cfInstr.condExec.count;
+                 sequence = cfInstr.condExec.sequence;
+                 shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
++#ifdef MOJORECOMP_XENOS_BOOL_EXEC
++                // Preserve the complete 256-bit runtime boolean register file.
++                // The block condition is distinct from per-instruction p0.
++                shouldReturn = cfInstr.opcode == ControlFlowOpcode::CondExecEnd ||
++                               cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd;
++                indent();
++                println("if (MOJORECOMP_BOOL_CONSTANT({}) == {})", uint32_t(cfInstr.condExec.boolAddress),
++                        cfInstr.condExec.condition ? "true" : "false");
++                indent();
++                out += "{\n";
++                ++indentation;
++                shouldCloseCurlyBracket = true;
++#endif
+                 break;
+ 
+             case ControlFlowOpcode::CondExecPred:
+@@ -1648,7 +1710,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 #ifdef UNLEASHED_RECOMP
+                     print("[unroll] ");
+                 #endif
+-                    println("for (aL = 0; aL < i{}.x; aL++)", uint32_t(cfInstr.loopStart.loopId));
++                    println("for (aL = 0; aL < g_LoopCount({}); aL++)", uint32_t(cfInstr.loopStart.loopId));
+                     indent();
+                     out += "{\n";
+                     ++indentation;
+@@ -1669,7 +1731,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 else
+                 {
+                     out += "\t\t\t++aL;\n";
+-                    println("\t\t\tif (aL < i{}.x)", uint32_t(cfInstr.loopEnd.loopId));
++                    println("\t\t\tif (aL < g_LoopCount({}))", uint32_t(cfInstr.loopEnd.loopId));
+                     out += "\t\t\t{\n";
+                     println("\t\t\t\tpc = {};", uint32_t(cfInstr.loopEnd.address));
+                     out += "\t\t\t\tcontinue;\n";
+@@ -1804,7 +1866,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     out += '{';
+ 
+                     indent();
+-                    out += "\tclip(oC0.w - g_AlphaThreshold);\n";
++                    out += "\tuint alphaFunc = (g_SpecConstants() >> SPEC_CONSTANT_ALPHA_FUNC_SHIFT) & 7u;\n";
++                    indent();
++                    out += "\tbool alphaPass = alphaFunc == 0u ? false :\n";
++                    indent();
++                    out += "\t                 alphaFunc == 1u ? (oC0.w <  g_AlphaThreshold) :\n";
++                    indent();
++                    out += "\t                 alphaFunc == 2u ? (oC0.w == g_AlphaThreshold) :\n";
++                    indent();
++                    out += "\t                 alphaFunc == 3u ? (oC0.w <= g_AlphaThreshold) :\n";
++                    indent();
++                    out += "\t                 alphaFunc == 4u ? (oC0.w >  g_AlphaThreshold) :\n";
++                    indent();
++                    out += "\t                 alphaFunc == 5u ? (oC0.w != g_AlphaThreshold) :\n";
++                    indent();
++                    out += "\t                 alphaFunc == 6u ? (oC0.w >= g_AlphaThreshold) : true;\n";
++                    indent();
++                    out += "\tclip(alphaPass ? 1.0 : -1.0);\n";
+ 
+                     indent();
+                     out += "}";
+@@ -1832,7 +1910,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     if (!hasMtxProjection)
+                 #endif
+                     {
++                        out += "\toPos.xy = oPos.xy * g_PosScale + g_PosOffset * oPos.w;\n";
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
++                        out += "\toPos.z = oPos.z * g_PosDepthTransform.x + g_PosDepthTransform.y * oPos.w;\n";
+                     }
+                 }
+ 
+@@ -1881,7 +1961,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "\t}\n";
+ 
+     if (!isPixelShader && hasMtxProjection)
++    {
++        out += "\toPos.xy = oPos.xy * g_PosScale + g_PosOffset * oPos.w;\n";
+         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
++        out += "\toPos.z = oPos.z * g_PosDepthTransform.x + g_PosDepthTransform.y * oPos.w;\n";
++    }
+ #endif
+ 
+     out += "}";

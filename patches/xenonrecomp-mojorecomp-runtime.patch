@@ -1,0 +1,107 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..ec37bcc 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -609,7 +609,13 @@ bool Recompiler::Recompile(
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            // XenonRecomp switch tables are discovered from the 32-bit rotate /
++            // mask sequence feeding CTR.  The guest branches using that 32-bit
++            // index even when the source GPR contains non-zero upper bits (for
++            // example addi 0xFFFFFFFF + 1 => 0x1_00000000).  Using u64 here can
++            // make the host compiler index its jump table far out of range while
++            // the preceding guest cmplwi still accepted the low 32-bit value.
++            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -812,6 +818,12 @@ bool Recompiler::Recompile(
+         // no op
+         break;
+ 
++    case PPC_INST_DCBST:
++        // Data-cache block store is a cache-management hint on Xenon. Guest
++        // memory is coherent host memory in a static recompilation, so there is
++        // no separate cache line to write back here.
++        break;
++
+     case PPC_INST_DCBZ:
+         print("\tmemset(base + ((");
+         if (insn.operands[0] != 0)
+@@ -895,6 +907,14 @@ bool Recompiler::Recompile(
+         println("\t{}.compare({}.f64, {}.f64);", cr(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
+         break;
+ 
++    case PPC_INST_FCMPO:
++        // The translated runtime currently models the condition result, which
++        // is what title code consumes. This matches the existing fcmpu path and
++        // the proven ReXGlue translation for this title.
++        printSetFlushMode(false);
++        println("\t{}.compare({}.f64, {}.f64);", cr(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
++        break;
++
+     case PPC_INST_FCTID:
+         printSetFlushMode(false);
+         println("\t{}.s64 = ({}.f64 > double(LLONG_MAX)) ? LLONG_MAX : simde_mm_cvtsd_si64(simde_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
+@@ -985,6 +1005,11 @@ bool Recompiler::Recompile(
+         println("\t{}.f64 = float(1.0 / {}.f64);", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
++    case PPC_INST_FRSQRTE:
++        printSetFlushMode(false);
++        println("\t{}.f64 = double(float(1.0 / sqrt({}.f64)));", f(insn.operands[0]), f(insn.operands[1]));
++        break;
++
+     case PPC_INST_FRSP:
+         printSetFlushMode(false);
+         println("\t{}.f64 = double(float({}.f64));", f(insn.operands[0]), f(insn.operands[1]));
+@@ -1137,6 +1162,7 @@ bool Recompiler::Recompile(
+     case PPC_INST_LVEWX128:
+     case PPC_INST_LVX:
+     case PPC_INST_LVX128:
++    case PPC_INST_LVXL128:
+         // NOTE: for endian swapping, we reverse the whole vector instead of individual elements.
+         // this is accounted for in every instruction (eg. dp3 sums yzw instead of xyz)
+         print("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ((", v(insn.operands[0]));
+@@ -1240,6 +1266,10 @@ bool Recompiler::Recompile(
+         }
+         break;
+ 
++    case PPC_INST_MCRF:
++        println("\t{} = {};", cr(insn.operands[0]), cr(insn.operands[1]));
++        break;
++
+     case PPC_INST_MFFS:
+         println("\t{}.u64 = ctx.fpscr.loadFromHost();", f(insn.operands[0]));
+         break;
+@@ -1311,6 +1341,12 @@ bool Recompiler::Recompile(
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
++    case PPC_INST_MULHDU:
++        println("\t{}.u64 = static_cast<uint64_t>((static_cast<__uint128_t>({}.u64) * static_cast<__uint128_t>({}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
++        break;
++
+     case PPC_INST_MULLD:
+         println("\t{}.s64 = {}.s64 * {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+@@ -1609,6 +1645,7 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_STVLX:
+     case PPC_INST_STVLX128:
++    case PPC_INST_STVLXL128:
+         // TODO: vectorize
+         // NOTE: accounting for the full vector reversal here
+         print("\t{} = ", ea());
+@@ -1769,6 +1806,7 @@ bool Recompiler::Recompile(
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         break;
+ 
++    case PPC_INST_VANDC:
+     case PPC_INST_VANDC128:
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
+         break;

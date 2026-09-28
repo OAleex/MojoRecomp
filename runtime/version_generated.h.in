@@ -1,0 +1,10 @@
+#pragma once
+
+namespace mojorecomp::version {
+
+inline constexpr char kSuite[] = "@MOJORECOMP_SUITE_VERSION@";
+inline constexpr char kLauncher[] = "@MOJORECOMP_LAUNCHER_VERSION@";
+inline constexpr char kCotRuntime[] = "@MOJORECOMP_COT_RUNTIME_VERSION@";
+inline constexpr char kMomRuntime[] = "@MOJORECOMP_MOM_RUNTIME_VERSION@";
+
+} // namespace mojorecomp::version

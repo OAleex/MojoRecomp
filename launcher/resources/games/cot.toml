@@ -1,0 +1,28 @@
+id = "cot"
+name = "Crash of the Titans"
+runtime = "cot-runtime.exe"
+runtime_version = "0.1.0-alpha"
+status = "alpha"
+playable = true
+
+[files]
+required = ["default.xex", "default.rcf"]
+
+[[files.integrity]]
+path = "default.xex"
+size = 5382144
+sha256 = "e76824b242c6c628738c373bdf052d456945d8e343eb934100617fd423e86373"
+verify_on_launch = true
+
+[[files.integrity]]
+path = "default.rcf"
+size = 1266263595
+sha256 = "42c04b348b02a47ed1fd98ce15b93907843de4d0977aa4d21f0722f1e9283874"
+
+[capabilities]
+resolution_scale = true
+aspect_ratio = true
+fxaa = true
+anisotropic_filtering = true
+debug_mode = true
+localization = true
