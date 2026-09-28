@@ -1,21 +1,22 @@
 @echo off
 setlocal EnableExtensions
 
+set "ROOT=%~dp0.."
+for %%I in ("%ROOT%") do set "ROOT=%%~fI"
 set "CHECKOUT=%~1"
-if not defined CHECKOUT set "CHECKOUT=%~dp0..\thirdparty\XenosRecomp-src"
+if not defined CHECKOUT set "CHECKOUT=%ROOT%\thirdparty\work\XenosRecomp"
 for %%I in ("%CHECKOUT%") do set "CHECKOUT=%%~fI"
 set "PATCH=%~dp0..\patches\xenosrecomp-mojorecomp-runtime.patch"
 for %%I in ("%PATCH%") do set "PATCH=%%~fI"
-
-git -C "%CHECKOUT%" apply --reverse --check "%PATCH%" >nul 2>nul
-if not errorlevel 1 (
-  echo MojoRecomp Xenos runtime patch is already applied.
-  exit /b 0
-)
-
-git -C "%CHECKOUT%" apply --check "%PATCH%" || (
+pushd "%CHECKOUT%" >nul || exit /b 1
+git apply --check "%PATCH%" || (
+  popd >nul
   echo ERROR: MojoRecomp Xenos runtime patch conflicts with this checkout.
   exit /b 1
 )
-git -C "%CHECKOUT%" apply "%PATCH%" || exit /b 1
+git apply "%PATCH%" || (
+  popd >nul
+  exit /b 1
+)
+popd >nul
 exit /b 0

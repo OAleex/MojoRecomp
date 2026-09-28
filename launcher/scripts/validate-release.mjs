@@ -194,9 +194,9 @@ const sourceRuntime = resolve(projectRoot, "runtime/build-smoke/cot-runtime.exe"
 const stagedRuntime = resolve(launcherRoot, "src-tauri/binaries/cot-runtime-x86_64-pc-windows-msvc.exe");
 const ffmpegSource = resolve(projectRoot, "runtime/build-smoke/mojorecomp-ffmpeg.dll");
 const lzxSource = resolve(projectRoot, "runtime/build-smoke/mojorecomp-lzx.dll");
-const dxcRoot = resolve(projectRoot, "thirdparty/XenosRecomp-src/thirdparty/dxc-bin/bin/x64");
+const dxcRoot = resolve(projectRoot, "thirdparty/XenosRecomp/thirdparty/dxc-bin/bin/x64");
 const stagedLib = resolve(launcherRoot, "bundle/lib");
-const extractXisoSource = resolve(projectRoot, "thirdparty/extract-xiso/extract-xiso.exe");
+const extractXisoSource = resolve(projectRoot, "thirdparty/build/extract-xiso/extract-xiso.exe");
 const stagedExtractXiso = resolve(launcherRoot, "bundle/tools/extract-xiso.exe");
 for (const [source, staged, label] of [
   [sourceRuntime, stagedRuntime, "COT runtime"],

@@ -1,0 +1,44 @@
+diff --git a/extract-xiso.c b/extract-xiso.c
+index 4393fe3..368e673 100644
+--- a/extract-xiso.c
++++ b/extract-xiso.c
+@@ -259,23 +259,26 @@
+ 	#define libftp_client
+ 	#include "libftp-5.0.1.modified.by.in/FtpLibrary.h"
+ #else
++	#if defined( _WIN32 )
++		#include <winsock2.h>
++	#endif
+ 	typedef 							struct FTP_STAT { char type; unsigned long size; char *name; void *next; } FTP_STAT;
+ 
+ 	#define FTP							void
+ 	#define STATUS						int
+-	
+-	#define FtpBye( a )					do { } while ( 0 )
+-	#define FtpClose( a )				do { } while ( 0 )
+-	#define FtpBinary( a )				do { } while ( 0 )
+-	#define FtpChdir( a, b )			do { } while ( 0 )
+-	#define FtpMkdir( a, b )			do { } while ( 0 )
+-	#define FtpStatFree( a )			do { } while ( 0 )
+-	#define FtpStat( a, b, c )			do { } while ( 0 )
+-	#define FtpOpenRead( a, b )			do { } while ( 0 )
+-	#define FtpOpenWrite( a, b )		do { } while ( 0 )
+-	#define FtpReadBlock( a, b, c )		do { } while ( 0 )
+-	#define FtpWriteBlock( a, b, c )	do { } while ( 0 )
+-	#define FtpLogin( a, b, c, d, e )	do { } while ( 0 )
++
++	#define FtpBye( a )					( 0 )
++	#define FtpClose( a )					( 0 )
++	#define FtpBinary( a )					( -1 )
++	#define FtpChdir( a, b )				( -1 )
++	#define FtpMkdir( a, b )				( -1 )
++	#define FtpStatFree( a )				( 0 )
++	#define FtpStat( a, b, c )				( -1 )
++	#define FtpOpenRead( a, b )				( -1 )
++	#define FtpOpenWrite( a, b )			( -1 )
++	#define FtpReadBlock( a, b, c )			( -1 )
++	#define FtpWriteBlock( a, b, c )		( -1 )
++	#define FtpLogin( a, b, c, d, e )		( -1 )
+ #endif
+ 
+ #if defined( _WIN32 )

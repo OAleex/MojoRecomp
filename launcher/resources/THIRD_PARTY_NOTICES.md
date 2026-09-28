@@ -19,7 +19,7 @@ are tracked in `launcher/public/art/SOURCES.md`.
 
 - License: MIT.
 - Pinned commit: `ddd128bcca99fe8bfbb99bea583c972351fa6ace`.
-- Local source: `thirdparty/XenonRecomp-src/LICENSE.md`.
+- Local source: `thirdparty/XenonRecomp/LICENSE.md`.
 - Copyright notice in the pinned license: `Copyright (c) 2025 hedge-dev and contributors`.
 
 The runtime links selected XenonUtils functionality from this checkout. The final
@@ -33,7 +33,7 @@ the audited link map.
 
 - License: MIT.
 - Pinned commit: `990d03b28a27b50277ee5d8d942e1c5f873869d1`.
-- Local source: `thirdparty/XenosRecomp-src/LICENSE.md`.
+- Local source: `thirdparty/XenosRecomp/LICENSE.md`.
 - Copyright notice in the pinned license: `Copyright (c) 2025 hedge-dev and contributors`.
 
 MojoRecomp compiles the required Xenos shader-recompiler source directly into the COT
@@ -52,7 +52,7 @@ pipeline.
 
 - License: SDL's zlib-style license notice.
 - Audited headers identify version `3.5.0`.
-- Local notice source: `thirdparty/sdl3/include/SDL3/SDL_copying.h`.
+- Local notice source: `thirdparty/SDL/include/SDL3/SDL_copying.h`.
 - The pinned notice identifies `Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>`.
 
 ### Runtime support libraries
@@ -80,7 +80,7 @@ MojoRecomp no longer depends on the earlier opaque archived FFmpeg libraries for
 public build path. `setup.bat` checks out the public `wmarti/FFmpeg` repository at
 commit `0604b464c7cb4ebc94940cf1f324a3b26b87717c` and rebuilds the narrow Windows
 x86_64 library set through `tools/ffmpeg-rexglue/` into the ignored
-`thirdparty/ffmpeg-build/` directory. The selected libavcodec and libavutil objects
+`thirdparty/build/FFmpeg/` directory. The selected libavcodec and libavutil objects
 are combined into the replaceable `mojorecomp-ffmpeg.dll`. No FFmpeg object code is
 linked into `cot-runtime.exe`.
 
@@ -157,7 +157,7 @@ the project's ISC License.
 ## DXC / DXIL
 
 The Windows launcher embeds `dxcompiler.dll` and `dxil.dll` from the pinned
-`XenosRecomp-src/thirdparty/dxc-bin` tree and materializes them internally at
+`thirdparty/XenosRecomp/thirdparty/dxc-bin` tree and materializes them internally at
 runtime.
 
 The XenosRecomp `dxc-bin` submodule is pinned at

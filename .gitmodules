@@ -1,0 +1,18 @@
+[submodule "thirdparty/XenonRecomp"]
+	path = thirdparty/XenonRecomp
+	url = https://github.com/hedge-dev/XenonRecomp.git
+[submodule "thirdparty/XenosRecomp"]
+	path = thirdparty/XenosRecomp
+	url = https://github.com/hedge-dev/XenosRecomp.git
+[submodule "thirdparty/FFmpeg"]
+	path = thirdparty/FFmpeg
+	url = https://github.com/wmarti/FFmpeg.git
+[submodule "thirdparty/SDL"]
+	path = thirdparty/SDL
+	url = https://github.com/libsdl-org/SDL.git
+[submodule "thirdparty/Vulkan-Headers"]
+	path = thirdparty/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "thirdparty/extract-xiso"]
+	path = thirdparty/extract-xiso
+	url = https://github.com/XboxDev/extract-xiso.git

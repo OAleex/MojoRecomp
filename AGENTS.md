@@ -98,7 +98,8 @@ owned by another rights holder.
   presentation. Runtime tests live under `runtime/tests/`.
 - `config/`: maintained XenonRecomp configuration and switch tables. Treat these
   inputs, not generated PPC output, as the source of truth for recompilation.
-- `patches/`: reviewed patches for pinned XenonRecomp/XenosRecomp dependencies.
+- `patches/`: reviewed patches for pinned XenonRecomp, XenosRecomp, and other
+  upstream dependencies that require MojoRecomp compatibility changes.
   Update the maintained patch instead of hand-editing a disposable dependency
   checkout.
 - `tools/`: analysis and recompilation helpers. Windows entry points are `.bat`.
@@ -106,8 +107,10 @@ owned by another rights holder.
   texts, and distribution metadata. Do not delete license files to reduce file
   count.
 - `ppc/`: local generated guest code. It is not maintained public source.
-- `thirdparty/`: local pinned tools/dependencies. It is not a place for direct,
-  permanent project changes.
+- `thirdparty/`: pinned upstream source dependencies are tracked as Git
+  submodules. Generated build/work trees and the local LLVM toolchain are
+  ignored. Keep submodules pristine; permanent MojoRecomp changes belong in
+  `patches/`, project build wrappers, or maintained source outside the submodule.
 - `.private/`: ignored local operational state. It must never enter public
   source, patches, logs, reports, prompts, or release artifacts.
 - `version.toml`: source of truth for suite, launcher, and per-title versions.

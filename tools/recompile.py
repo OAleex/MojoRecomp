@@ -7,10 +7,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RECOMP = ROOT / "thirdparty" / "XenonRecomp-src" / "build-win" / "XenonRecomp" / "XenonRecomp.exe"
+XENON_WORK = ROOT / "thirdparty" / "work" / "XenonRecomp"
+RECOMP = ROOT / "thirdparty" / "build" / "XenonRecomp" / "XenonRecomp" / "XenonRecomp.exe"
 CONFIG = ROOT / "config" / "CrashOfTheTitans.toml"
-CONTEXT = ROOT / "thirdparty" / "XenonRecomp-src" / "XenonUtils" / "ppc_context.h"
-RECOMPILER_SOURCE = ROOT / "thirdparty" / "XenonRecomp-src" / "XenonRecomp" / "recompiler.cpp"
+CONTEXT = XENON_WORK / "XenonUtils" / "ppc_context.h"
+RECOMPILER_SOURCE = XENON_WORK / "XenonRecomp" / "recompiler.cpp"
 GENERATED = ROOT / "ppc"
 
 

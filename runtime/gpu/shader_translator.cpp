@@ -742,15 +742,15 @@ static void LoadDxcOnce()
     // the executable directory for development and portable layouts.
     candidates.push_back((HostPaths::ExeDir() / "lib" / libName).string());
     candidates.push_back((HostPaths::ExeDir() / libName).string());
-    // MojoRecomp's reproducible development layout: the pinned XenosRecomp tree lives
-    // two directories above runtime/build-* and carries the matching DXC binaries.
+    // MojoRecomp's reproducible development layout keeps the pristine XenosRecomp
+    // submodule two directories above runtime/build-* with the matching DXC binaries.
 #ifdef __aarch64__
     const char* arch = "arm64";
 #else
     const char* arch = "x64";
 #endif
     const auto devDxc = HostPaths::ExeDir() / ".." / ".." / "thirdparty" /
-                        "XenosRecomp-src" / "thirdparty" / "dxc-bin";
+                        "XenosRecomp" / "thirdparty" / "dxc-bin";
     candidates.push_back((devDxc / "lib" / arch / libName).lexically_normal().string());
     candidates.push_back((devDxc / "bin" / arch / libName).lexically_normal().string());
 

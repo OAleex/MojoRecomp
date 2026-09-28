@@ -5,7 +5,24 @@
 /ppc/
 /out/
 /build/
-/thirdparty/
+/thirdparty/*
+!/thirdparty/README.md
+!/thirdparty/XenonRecomp/
+!/thirdparty/XenosRecomp/
+!/thirdparty/FFmpeg/
+!/thirdparty/SDL/
+!/thirdparty/Vulkan-Headers/
+!/thirdparty/extract-xiso/
+
+# Local third-party toolchain, build output, patch work trees, and legacy checkouts.
+/thirdparty/llvm22/
+/thirdparty/build/
+/thirdparty/work/
+/thirdparty/XenonRecomp-src/
+/thirdparty/XenosRecomp-src/
+/thirdparty/ffmpeg-src/
+/thirdparty/ffmpeg-build/
+/thirdparty/sdl3/
 /.private/
 /.release/
 

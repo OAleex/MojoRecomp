@@ -3,7 +3,7 @@ setlocal EnableExtensions
 
 set "ROOT=%~dp0.."
 for %%I in ("%ROOT%") do set "ROOT=%%~fI"
-set "ANALYZE=%ROOT%\thirdparty\XenonRecomp-src\build-win\XenonAnalyse\XenonAnalyse.exe"
+set "ANALYZE=%ROOT%\thirdparty\build\XenonRecomp\XenonAnalyse\XenonAnalyse.exe"
 set "XEX=%ROOT%\game\default.xex"
 set "OUT=%ROOT%\config\CrashOfTheTitans_switch_tables.toml"
 

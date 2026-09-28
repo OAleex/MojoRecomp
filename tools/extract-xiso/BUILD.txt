@@ -1,0 +1,22 @@
+MojoRecomp extract-xiso Build Recipe
+====================================
+
+MojoRecomp builds extract-xiso from the pinned XboxDev/extract-xiso v2.7.1
+submodule. The upstream Visual C++ project targets an obsolete toolchain, so this
+CMake wrapper reproduces the Windows console build with the current MojoRecomp
+compiler. `setup.bat` mirrors the pristine submodule into
+`thirdparty/work/extract-xiso`, applies the MojoRecomp `NO_FTP` compatibility
+patch there, and builds the patched copy.
+
+The MojoRecomp build disables the unused FTP upload path. Local ISO listing,
+extraction, creation, and rewrite behavior remain provided by the upstream tool.
+
+Configure with:
+
+  cmake -S tools/extract-xiso -B thirdparty/build/extract-xiso -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DEXTRACT_XISO_ROOT=thirdparty/extract-xiso
+
+The resulting executable is:
+
+  thirdparty/build/extract-xiso/extract-xiso.exe

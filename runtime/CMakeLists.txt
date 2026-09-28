@@ -17,7 +17,7 @@ if(WIN32)
         "${CMAKE_CURRENT_BINARY_DIR}/generated/mojorecomp_runtime.rc" @ONLY)
 endif()
 set(MOJORECOMP_TOMLPLUSPLUS_ROOT
-    "${MOJORECOMP_ROOT}/thirdparty/XenonRecomp-src/thirdparty/tomlplusplus/include")
+    "${MOJORECOMP_ROOT}/thirdparty/work/XenonRecomp/thirdparty/tomlplusplus/include")
 
 set(MOJORECOMP_VERSION_FILE "${MOJORECOMP_ROOT}/version.toml")
 if(NOT EXISTS "${MOJORECOMP_VERSION_FILE}")
@@ -96,28 +96,29 @@ if(BUILD_TESTING)
     set_tests_properties(RenderPolicy PROPERTIES TIMEOUT 10 LABELS "gpu")
 endif()
 
-set(MOJORECOMP_VULKAN_HEADERS "${MOJORECOMP_ROOT}/thirdparty/vulkan-headers/include")
-set(MOJORECOMP_SDL3_ROOT "${MOJORECOMP_ROOT}/thirdparty/sdl3")
+set(MOJORECOMP_VULKAN_HEADERS "${MOJORECOMP_ROOT}/thirdparty/Vulkan-Headers/include")
+set(MOJORECOMP_SDL3_SOURCE "${MOJORECOMP_ROOT}/thirdparty/SDL")
+set(MOJORECOMP_SDL3_BUILD "${MOJORECOMP_ROOT}/thirdparty/build/SDL")
 set(PPC_DIR "${MOJORECOMP_ROOT}/ppc" CACHE PATH "XenonRecomp output directory")
-set(XENON_ROOT "${MOJORECOMP_ROOT}/thirdparty/XenonRecomp-src" CACHE PATH
-    "Pinned XenonRecomp checkout")
-set(XENOS_ROOT "${MOJORECOMP_ROOT}/thirdparty/XenosRecomp-src" CACHE PATH
-    "Pinned XenosRecomp checkout")
+set(XENON_ROOT "${MOJORECOMP_ROOT}/thirdparty/work/XenonRecomp" CACHE PATH
+    "MojoRecomp-patched XenonRecomp work tree")
+set(XENOS_ROOT "${MOJORECOMP_ROOT}/thirdparty/work/XenosRecomp" CACHE PATH
+    "MojoRecomp-patched XenosRecomp work tree")
 
 if(WIN32 AND
-   EXISTS "${MOJORECOMP_SDL3_ROOT}/include/SDL3/SDL.h" AND
-   EXISTS "${MOJORECOMP_SDL3_ROOT}/lib/SDL3-static.lib")
+   EXISTS "${MOJORECOMP_SDL3_SOURCE}/include/SDL3/SDL.h" AND
+   EXISTS "${MOJORECOMP_SDL3_BUILD}/SDL3-static.lib")
     add_library(mojorecomp_sdl3 STATIC IMPORTED GLOBAL)
     set_target_properties(mojorecomp_sdl3 PROPERTIES
-        IMPORTED_LOCATION "${MOJORECOMP_SDL3_ROOT}/lib/SDL3-static.lib"
-        INTERFACE_INCLUDE_DIRECTORIES "${MOJORECOMP_SDL3_ROOT}/include")
+        IMPORTED_LOCATION "${MOJORECOMP_SDL3_BUILD}/SDL3-static.lib"
+        INTERFACE_INCLUDE_DIRECTORIES "${MOJORECOMP_SDL3_SOURCE}/include")
     target_link_libraries(mojorecomp_sdl3 INTERFACE
         kernel32 user32 gdi32 winmm imm32 ole32 oleaut32 version uuid
         advapi32 setupapi shell32 hid dinput8)
     set(MOJORECOMP_HAS_SDL3 ON)
 endif()
 
-set(XENON_BUILD "${XENON_ROOT}/build-win")
+set(XENON_BUILD "${MOJORECOMP_ROOT}/thirdparty/build/XenonRecomp")
 set(XENON_FMT "${XENON_BUILD}/thirdparty/fmt/fmt.lib")
 set(XENON_XXHASH "${XENON_BUILD}/thirdparty/xxHash/cmake_unofficial/xxhash.lib")
 set(CLANG_BUILTINS
@@ -130,9 +131,9 @@ set(MOJORECOMP_FFMPEG_LIBDIR "" CACHE PATH "Optional directory containing libavc
 # now rebuilds the same narrow source set from the pinned public FFmpeg fork/commit
 # through tools/ffmpeg-rexglue, removing the old opaque archived-library dependency.
 set(MOJORECOMP_REXGLUE_FFMPEG_ROOT
-    "${MOJORECOMP_ROOT}/thirdparty/ffmpeg-src")
+    "${MOJORECOMP_ROOT}/thirdparty/FFmpeg")
 set(MOJORECOMP_REXGLUE_FFMPEG_LIBDIR
-    "${MOJORECOMP_ROOT}/thirdparty/ffmpeg-build")
+    "${MOJORECOMP_ROOT}/thirdparty/build/FFmpeg")
 if(NOT MOJORECOMP_FFMPEG_ROOT AND
    EXISTS "${MOJORECOMP_REXGLUE_FFMPEG_ROOT}/libavcodec/avcodec.h")
     set(MOJORECOMP_FFMPEG_ROOT "${MOJORECOMP_REXGLUE_FFMPEG_ROOT}")

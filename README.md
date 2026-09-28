@@ -35,7 +35,8 @@ Mind over Mutant has a launcher entry but no playable runtime or release date ye
 - 1x, 2x, and 3x internal resolution scaling
 - 4:3, 16:9, 16:10, 21:9, and 32:9 aspect ratios
 - FXAA and anisotropic texture filtering
-- Original game languages and an optional Brazilian Portuguese localization pack
+- Original game languages and an optional Brazilian Portuguese Localization Pack
+- Versioned runtime and Localization Pack management with integrity checks, repair, and rollback
 - Separate game files, saves, settings, cache, logs, and support reports
 
 ## Requirements
@@ -58,16 +59,37 @@ Mind over Mutant has a launcher entry but no playable runtime or release date ye
 
 No additional platform ports are currently announced.
 
-## Setup
+## Getting started
 
-1. Extract the MojoRecomp release.
+For normal use, download only the **MojoRecomp Launcher** portable ZIP. The separate runtime package is managed automatically by the launcher.
+
+1. Download and extract `MojoRecomp-Launcher-<version>-windows-x64-portable.zip`.
 2. Open `mojorecomp-launcher.exe`.
-3. Choose a location for the `MojoRecomp-Games` library.
+3. Choose where to create your `MojoRecomp-Games` library.
 4. Select **Crash of the Titans** and click **SET UP**.
-5. Select your `.iso` file and wait for extraction and validation to finish.
-6. Click **PLAY**.
+5. Choose your supported Xbox 360 `.iso` file.
+6. Wait while the launcher prepares the required runtime, extracts the game, and validates the installation.
+7. Click **PLAY**.
 
-The launcher does not modify the ISO. You can move the game library later from **Launcher Settings**.
+The launcher downloads and verifies the required `runtime.cot` component automatically when it is missing. The ISO itself is never modified. After setup, the game and its active runtime can be used without repeating the ISO import.
+
+The game library can be moved later from **Launcher Settings**. Saves remain in the Windows Saved Games folder and are not moved with the library.
+
+## Updates
+
+The launcher checks the configured update catalog when it starts. Available updates are shown in the title bar and on the **Versions** page, where you can also run a manual check.
+
+MojoRecomp updates are split into independent components:
+
+| Component | Update behavior |
+| --- | --- |
+| MojoRecomp Launcher | Downloads and verifies the new portable launcher package. Close the running launcher before replacing the current launcher files. |
+| Game runtime | Downloads, verifies, and activates the new version without reinstalling the game. The game must be closed while updating. |
+| Localization Pack | Downloads and verifies independently from the runtime. Apply or reinstall it from **Game Settings** when the launcher indicates that it is required. |
+
+Runtime and Localization Pack updates are installed into versioned component directories. Interrupted installations are recovered safely, and the previous version can be rolled back from **Versions** after an update.
+
+An internet connection is needed to check for and download new or missing managed components. A previously installed game with a valid active runtime can continue to launch when the update service is unavailable.
 
 ## Languages
 
@@ -79,7 +101,7 @@ The launcher does not modify the ISO. You can move the game library later from *
 | Español | Original game files |
 | Italiano | Original game files |
 | Nederlands | Original game files |
-| Português Brasileiro | Optional MojoRecomp localization pack with English voices |
+| Português Brasileiro | Optional MojoRecomp Localization Pack with English voices |
 
 Available original languages depend on the ISO region. The launcher identifies localization packs that still need to be installed.
 
@@ -170,7 +192,7 @@ Some OBS and Streamlabs Vulkan capture hooks can corrupt the runtime during star
 
 ## Distribution
 
-The official package is a portable Windows x64 application. Crash of the Titans also has a separately versioned runtime component containing the native runtime, its required DLLs, and the ISO extraction utility. The current pre-release launcher retains its embedded bootstrap until the public HTTPS component feed has been validated; once a verified `runtime.cot` component is active, it is the preferred runtime source.
+The normal user download is the portable Windows x64 launcher. Game runtimes and Localization Packs are distributed as separately versioned components and are downloaded, verified, installed, repaired, and rolled back through the launcher. The standalone runtime asset exists for component delivery and does not need to be downloaded manually for normal setup.
 
 Release packages are written to the ignored `.release\` directory with the portable launcher, runtime component, update catalog, checksums, and one versioned LGPL corresponding-source archive covering the replaceable FFmpeg and libmspack libraries.
 
@@ -186,14 +208,20 @@ launcher/     Tauri, Rust, Svelte, and TypeScript launcher
 patches/      Maintained dependency patches
 runtime/      Native runtime, renderer, audio, input, and tests
 tools/        Analysis and recompilation tools
-thirdparty/   Local dependencies and toolchains (not tracked)
+thirdparty/   Pinned source submodules plus local build/toolchain state
+```
+
+Clone with submodules, or initialize them in an existing clone:
+
+```bat
+git submodule update --init --recursive
 ```
 
 Place a development copy of `default.xex` in the ignored `game\` directory. These scripts cover the development workflow:
 
 | Script | Purpose |
 | --- | --- |
-| `setup.bat` | Downloads, patches, and builds the pinned development dependencies |
+| `setup.bat` | Initializes, patches, and builds the pinned development dependencies |
 | `tools\analyze.bat` | Analyzes the XEX and refreshes the switch-table data |
 | `tools\recompile.bat` | Translates the game code into local C++ sources |
 | `build-smoke.bat` | Builds the runtime and runs a basic mapping and link check |
