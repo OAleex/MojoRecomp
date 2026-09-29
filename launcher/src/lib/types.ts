@@ -80,6 +80,14 @@ export type ComponentUpdateStatus = {
   published: string | null;
   notes_url: string | null;
   last_action: string | null;
+  releases: ComponentReleaseStatus[];
+};
+
+export type ComponentReleaseStatus = {
+  version: string;
+  published: string;
+  notes_url: string;
+  size: number;
 };
 
 export type UpdateOverview = {

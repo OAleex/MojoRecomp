@@ -420,6 +420,39 @@ pub fn plan_updates(
     Ok(plans)
 }
 
+pub fn compatible_releases_for_component(
+    catalog: &UpdateCatalog,
+    installed: &[InstalledComponent],
+    launcher_version: &str,
+    component_id: &str,
+) -> Result<Vec<ComponentRelease>, String> {
+    validate_catalog(catalog)?;
+    let launcher = Version::parse(launcher_version)
+        .map_err(|_| "Installed launcher version is not valid semantic versioning".to_string())?;
+    let installed_versions = installed
+        .iter()
+        .filter(|component| component.healthy)
+        .filter_map(|component| {
+            Version::parse(&component.version)
+                .ok()
+                .map(|version| (component.id.as_str(), version))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut releases = catalog
+        .releases
+        .iter()
+        .filter(|release| release.id == component_id)
+        .filter(|release| is_compatible(release, &launcher, &installed_versions))
+        .cloned()
+        .collect::<Vec<_>>();
+    releases.sort_by(|left, right| {
+        Version::parse(&right.version)
+            .ok()
+            .cmp(&Version::parse(&left.version).ok())
+    });
+    Ok(releases)
+}
+
 fn is_compatible(
     release: &ComponentRelease,
     launcher: &Version,
@@ -461,24 +494,105 @@ fn is_compatible(
 }
 
 pub fn fetch_catalog(url: &str) -> Result<UpdateCatalog, String> {
-    validate_resolved_public_https_url(url)?;
+    let source_url = validate_resolved_public_https_url(url)?;
     ensure_tls_crypto_provider()?;
     let client = reqwest::blocking::Client::builder()
         .redirect(public_https_redirect_policy())
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(30))
+        .user_agent(concat!("MojoRecomp-Launcher/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| format!("Could not initialize update client: {error}"))?;
     let response = client
         .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .and_then(|response| response.error_for_status())
         .map_err(|error| format!("Could not download update catalog: {error}"))?;
     validate_resolved_public_https_url(response.url().as_str())?;
-    let text = response
-        .text()
-        .map_err(|error| format!("Could not read update catalog: {error}"))?;
+    let text = if is_github_release_feed_url(&source_url) {
+        let releases = response
+            .json::<Vec<GitHubReleaseEntry>>()
+            .map_err(|error| format!("Could not read GitHub release feed: {error}"))?;
+        let asset_url = newest_github_catalog_asset_url(&releases).ok_or_else(|| {
+            "No published GitHub release or pre-release contains update-catalog.toml".to_string()
+        })?;
+        validate_resolved_public_https_url(&asset_url)?;
+        let asset_response = client
+            .get(&asset_url)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|error| format!("Could not download update catalog asset: {error}"))?;
+        validate_resolved_public_https_url(asset_response.url().as_str())?;
+        asset_response
+            .text()
+            .map_err(|error| format!("Could not read update catalog asset: {error}"))?
+    } else {
+        response
+            .text()
+            .map_err(|error| format!("Could not read update catalog: {error}"))?
+    };
     parse_and_validate_catalog(&text)
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseEntry {
+    #[serde(default)]
+    draft: bool,
+    published_at: Option<String>,
+    created_at: Option<String>,
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+fn is_github_release_feed_url(url: &reqwest::Url) -> bool {
+    if !url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("api.github.com"))
+    {
+        return false;
+    }
+    let segments = url
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    segments.len() == 4
+        && segments[0] == "repos"
+        && segments[1].len() > 0
+        && segments[2].len() > 0
+        && segments[3] == "releases"
+}
+
+fn newest_github_catalog_asset_url(releases: &[GitHubReleaseEntry]) -> Option<String> {
+    releases
+        .iter()
+        .filter(|release| !release.draft)
+        .filter_map(|release| {
+            let asset = release
+                .assets
+                .iter()
+                .find(|asset| asset.name == "update-catalog.toml")?;
+            Some((
+                release
+                    .published_at
+                    .as_deref()
+                    .or(release.created_at.as_deref())
+                    .unwrap_or(""),
+                asset.browser_download_url.as_str(),
+            ))
+        })
+        .max_by(|left, right| left.0.cmp(right.0))
+        .map(|(_, url)| url.to_string())
 }
 
 fn ensure_tls_crypto_provider() -> Result<(), String> {
@@ -1527,7 +1641,15 @@ impl ComponentStore {
         write_toml_atomic(&staging.join("installation.toml"), &manifest)?;
 
         let previous = read_toml_optional::<ActiveComponent>(&self.active_path(&release.id))?
-            .map(|state| state.active_version);
+            .and_then(|state| {
+                if state.active_version == release.version {
+                    state
+                        .previous_version
+                        .filter(|version| version != &release.version)
+                } else {
+                    Some(state.active_version)
+                }
+            });
         let journal = UpdateJournal {
             schema_version: INSTALL_SCHEMA_VERSION,
             id: release.id.clone(),
@@ -2139,6 +2261,58 @@ mod tests {
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
+    #[test]
+    fn github_release_feed_accepts_prerelease_and_release_catalog_assets() {
+        let feed = reqwest::Url::parse(
+            "https://api.github.com/repos/OAleex/MojoRecomp/releases?per_page=30",
+        )
+        .expect("valid GitHub feed URL");
+        assert!(is_github_release_feed_url(&feed));
+
+        let releases: Vec<GitHubReleaseEntry> = serde_json::from_str(
+            r#"[
+                {
+                    "draft": false,
+                    "prerelease": false,
+                    "published_at": "2026-09-20T12:00:00Z",
+                    "created_at": "2026-09-20T11:00:00Z",
+                    "assets": [{
+                        "name": "update-catalog.toml",
+                        "browser_download_url": "https://github.com/OAleex/MojoRecomp/releases/download/v0.9.0/update-catalog.toml"
+                    }]
+                },
+                {
+                    "draft": false,
+                    "prerelease": true,
+                    "published_at": "2026-09-29T12:00:00Z",
+                    "created_at": "2026-09-29T11:00:00Z",
+                    "assets": [{
+                        "name": "update-catalog.toml",
+                        "browser_download_url": "https://github.com/OAleex/MojoRecomp/releases/download/v1.0.0/update-catalog.toml"
+                    }]
+                },
+                {
+                    "draft": true,
+                    "prerelease": false,
+                    "published_at": "2026-09-30T12:00:00Z",
+                    "created_at": "2026-09-30T11:00:00Z",
+                    "assets": [{
+                        "name": "update-catalog.toml",
+                        "browser_download_url": "https://github.com/OAleex/MojoRecomp/releases/download/v1.1.0/update-catalog.toml"
+                    }]
+                }
+            ]"#,
+        )
+        .expect("valid GitHub releases JSON");
+
+        assert_eq!(
+            newest_github_catalog_asset_url(&releases).as_deref(),
+            Some(
+                "https://github.com/OAleex/MojoRecomp/releases/download/v1.0.0/update-catalog.toml"
+            )
+        );
+    }
+
     fn valid_catalog() -> String {
         r#"
 schema_version = 1
@@ -2447,6 +2621,59 @@ min_launcher = "1.0.0"
     }
 
     #[test]
+    fn planner_exposes_missing_runtime_as_downloadable() {
+        let catalog = parse_and_validate_catalog(&valid_catalog()).expect("catalog");
+        let installed = vec![InstalledComponent {
+            id: "launcher".into(),
+            version: "1.0.0".into(),
+            healthy: true,
+        }];
+        let plans = plan_updates(&catalog, &installed, "1.0.0").expect("plans");
+        let runtime = plans
+            .iter()
+            .find(|plan| plan.id == "runtime.cot")
+            .expect("runtime plan");
+
+        assert_eq!(runtime.state, PlanState::Available);
+        assert!(runtime.installed_version.is_none());
+        assert!(runtime.latest_version.is_some());
+        assert!(runtime.download_url.is_some());
+    }
+
+    #[test]
+    fn compatible_release_history_is_sorted_newest_first() {
+        let mut catalog = parse_and_validate_catalog(&valid_catalog()).expect("catalog");
+        let mut older = catalog
+            .releases
+            .iter()
+            .find(|release| release.id == "runtime.cot")
+            .expect("runtime release")
+            .clone();
+        older.version = "0.1.0".into();
+        older.url = "https://example.com/cot-runtime-0.1.0.zip".into();
+        older.notes_url = "https://example.com/releases/cot-runtime-0.1.0".into();
+        older.published = "2026-08-01".into();
+        catalog.releases.push(older);
+
+        let installed = vec![InstalledComponent {
+            id: "launcher".into(),
+            version: "1.0.0".into(),
+            healthy: true,
+        }];
+        let releases =
+            compatible_releases_for_component(&catalog, &installed, "1.0.0", "runtime.cot")
+                .expect("compatible releases");
+
+        assert_eq!(
+            releases
+                .iter()
+                .map(|release| release.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0.2.0", "0.1.0"]
+        );
+    }
+
+    #[test]
     fn staged_download_hashes_while_writing_and_rejects_size_or_hash_mismatch() {
         let root = test_root("download");
         fs::create_dir_all(&root).expect("root");
@@ -2499,6 +2726,32 @@ min_launcher = "1.0.0"
         assert_eq!(active.active_version, "0.3.0");
         assert_eq!(active.previous_version.as_deref(), Some("0.2.0"));
         assert!(store.version_root("runtime.cot", "0.2.0").is_dir());
+        store.rollback("runtime.cot").expect("rollback");
+        assert_eq!(
+            store.active_status("runtime.cot").unwrap().unwrap().version,
+            "0.2.0"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reinstalling_active_version_preserves_previous_version() {
+        let root = test_root("reinstall");
+        let store = ComponentStore::new(root.join("components"));
+        let first = create_runtime_package(&store, "0.2.0", b"runtime-v2", b"ffmpeg-v2");
+        store.install_staged(&first).expect("install first");
+        let second = create_runtime_package(&store, "0.3.0", b"runtime-v3", b"ffmpeg-v3");
+        store.install_staged(&second).expect("install second");
+
+        let reinstall =
+            create_runtime_package(&store, "0.3.0", b"runtime-v3-new", b"ffmpeg-v3-new");
+        store
+            .install_staged(&reinstall)
+            .expect("reinstall active version");
+
+        let active: ActiveComponent = read_toml(&store.active_path("runtime.cot")).expect("active");
+        assert_eq!(active.active_version, "0.3.0");
+        assert_eq!(active.previous_version.as_deref(), Some("0.2.0"));
         store.rollback("runtime.cot").expect("rollback");
         assert_eq!(
             store.active_status("runtime.cot").unwrap().unwrap().version,

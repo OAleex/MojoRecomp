@@ -5,7 +5,11 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { assertCanonicalProjectLicense } from "./project-license.mjs";
 import {
+  isGitHubReleaseFeedUrl,
+  launcherHistoryFromCatalog,
+  newestGitHubReleaseAssetUrl,
   normalizedHttpsBase,
+  runtimeHistoryFromCatalog,
   validatePublicHttpsUrl,
   validateReleaseChannel,
   validateReleaseDate,
@@ -14,6 +18,7 @@ import {
 const launcherRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const projectRoot = resolve(launcherRoot, "..");
 const releaseRoot = resolve(projectRoot, ".release");
+const releaseHistoryCachePath = resolve(projectRoot, ".private/release-history/update-catalog.toml");
 const productionRoot = process.env.MOJORECOMP_PRODUCTION_ROOT
   ? resolve(process.env.MOJORECOMP_PRODUCTION_ROOT)
   : resolve(projectRoot, "../game/production");
@@ -106,6 +111,113 @@ function runProgram(program, args, cwd) {
     fail(`${program} failed (${result.status}): ${(result.stderr || result.stdout).trim()}`);
   }
   return result.stdout.trim();
+}
+
+async function previousReleaseHistory(catalogUrl, launcherVersion, runtimeVersion) {
+  const catalogs = [];
+  try {
+    if (catalogUrl) {
+      const requestOptions = () => ({
+        redirect: "follow",
+        cache: "no-store",
+        signal: AbortSignal.timeout(5000),
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "MojoRecomp-release-builder",
+        },
+      });
+      const response = await fetch(catalogUrl, requestOptions());
+      if (response.ok) {
+        validatePublicHttpsUrl(response.url, "resolved previous update catalog URL");
+        if (isGitHubReleaseFeedUrl(catalogUrl)) {
+          const assetUrl = newestGitHubReleaseAssetUrl(
+            await response.json(),
+            "update-catalog.toml",
+          );
+          if (assetUrl) {
+            const assetResponse = await fetch(assetUrl, requestOptions());
+            if (assetResponse.ok) {
+              validatePublicHttpsUrl(assetResponse.url, "resolved previous update catalog asset URL");
+              catalogs.push(await assetResponse.text());
+            } else {
+              console.warn(`Previous public update catalog asset is unavailable (${assetResponse.status}).`);
+            }
+          } else {
+            console.warn("No published GitHub release or pre-release contains update-catalog.toml yet.");
+          }
+        } else {
+          catalogs.push(await response.text());
+        }
+      } else {
+        console.warn(`Previous public update catalog is unavailable (${response.status}).`);
+      }
+    }
+  } catch (error) {
+    console.warn(`Previous public update catalog could not be read: ${error.message}`);
+  }
+  const cached = await readFile(releaseHistoryCachePath, "utf8").catch(() => null);
+  if (cached) catalogs.push(cached);
+
+  const launcherSeen = new Set();
+  const runtimeSeen = new Set();
+  const launcherHistory = [];
+  const runtimeHistory = [];
+  for (const catalog of catalogs) {
+    for (const release of launcherHistoryFromCatalog(catalog, launcherVersion)) {
+      if (launcherSeen.has(release.version)) continue;
+      launcherSeen.add(release.version);
+      launcherHistory.push(release);
+    }
+    for (const release of runtimeHistoryFromCatalog(catalog, runtimeVersion)) {
+      if (runtimeSeen.has(release.version)) continue;
+      runtimeSeen.add(release.version);
+      runtimeHistory.push(release);
+    }
+  }
+  console.log(`Preserving ${launcherHistory.length} previous launcher release(s) and ${runtimeHistory.length} previous COT runtime release(s) in the update catalog.`);
+  return { launcherHistory, runtimeHistory };
+}
+
+function launcherCatalogBlock(release) {
+  return `[[release]]
+id = "launcher"
+kind = "launcher"
+version = ${JSON.stringify(release.version)}
+platform = "windows"
+arch = "x86_64"
+url = ${JSON.stringify(release.url)}
+size = ${release.size}
+sha256 = ${JSON.stringify(release.sha256)}
+published = ${JSON.stringify(release.published)}
+notes_url = ${JSON.stringify(release.notesUrl)}
+package = "portable-zip"
+
+[release.compatibility]`;
+}
+
+function runtimeCatalogBlock(release) {
+  const compatibility = [
+    release.minLauncher ? `min_launcher = ${JSON.stringify(release.minLauncher)}` : "",
+    release.maxLauncher ? `max_launcher = ${JSON.stringify(release.maxLauncher)}` : "",
+  ].filter(Boolean).join("\n");
+  return `[[release]]
+id = "runtime.cot"
+kind = "runtime"
+version = ${JSON.stringify(release.version)}
+platform = "windows"
+arch = "x86_64"
+url = ${JSON.stringify(release.url)}
+size = ${release.size}
+sha256 = ${JSON.stringify(release.sha256)}
+published = ${JSON.stringify(release.published)}
+notes_url = ${JSON.stringify(release.notesUrl)}
+package = "zip"
+unpacked_size = ${release.unpackedSize}
+entrypoint = "cot-runtime.exe"
+required_files = [${release.requiredFiles.map((name) => JSON.stringify(name)).join(", ")}]
+game_id = "cot"
+
+[release.compatibility]${compatibility ? `\n${compatibility}` : ""}`;
 }
 
 async function stageCorrespondingSource({
@@ -494,45 +606,47 @@ const checksumEntries = [
 if (updateBaseUrl) {
   const catalogName = "update-catalog.toml";
   const catalogPath = resolve(releaseRoot, catalogName);
+  const { launcherHistory, runtimeHistory } = await previousReleaseHistory(
+    configuredCatalogUrl,
+    launcherVersion,
+    cotRuntimeVersion,
+  );
+  const launcherReleases = [
+    {
+      version: launcherVersion,
+      url: `${updateBaseUrl}/${archiveName}`,
+      size: (await stat(archivePath)).size,
+      sha256: archiveHash,
+      published: releaseDate,
+      notesUrl: updateNotesUrl,
+    },
+    ...launcherHistory,
+  ];
+  const runtimeReleases = [
+    {
+      version: cotRuntimeVersion,
+      url: `${updateBaseUrl}/${runtimeArchiveName}`,
+      size: runtimeArchiveSize,
+      sha256: runtimeArchiveHash,
+      published: releaseDate,
+      notesUrl: updateNotesUrl,
+      unpackedSize: runtimeUnpackedSize,
+      requiredFiles: cotRuntimeFiles.map(([, name]) => name),
+      minLauncher: launcherVersion,
+      maxLauncher: null,
+    },
+    ...runtimeHistory,
+  ];
   const catalog = `schema_version = 1
 channel = "${releaseChannel}"
 
-[[release]]
-id = "launcher"
-kind = "launcher"
-version = "${launcherVersion}"
-platform = "windows"
-arch = "x86_64"
-url = "${updateBaseUrl}/${archiveName}"
-size = ${(await stat(archivePath)).size}
-sha256 = "${archiveHash}"
-published = "${releaseDate}"
-notes_url = "${updateNotesUrl}"
-package = "portable-zip"
+${launcherReleases.map(launcherCatalogBlock).join("\n\n")}
 
-[release.compatibility]
-
-[[release]]
-id = "runtime.cot"
-kind = "runtime"
-version = "${cotRuntimeVersion}"
-platform = "windows"
-arch = "x86_64"
-url = "${updateBaseUrl}/${runtimeArchiveName}"
-size = ${runtimeArchiveSize}
-sha256 = "${runtimeArchiveHash}"
-published = "${releaseDate}"
-notes_url = "${updateNotesUrl}"
-package = "zip"
-unpacked_size = ${runtimeUnpackedSize}
-entrypoint = "cot-runtime.exe"
-required_files = [${cotRuntimeFiles.map(([, name]) => `"${name}"`).join(", ")}]
-game_id = "cot"
-
-[release.compatibility]
-min_launcher = "${launcherVersion}"
+${runtimeReleases.map(runtimeCatalogBlock).join("\n\n")}
 `;
   await writeFile(catalogPath, catalog, "utf8");
+  await mkdir(dirname(releaseHistoryCachePath), { recursive: true });
+  await writeFile(releaseHistoryCachePath, catalog, "utf8");
   checksumEntries.push({ file: catalogName, sha256: await sha256(catalogPath) });
 }
 await writeFile(

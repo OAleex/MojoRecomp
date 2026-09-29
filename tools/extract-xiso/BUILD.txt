@@ -8,14 +8,22 @@ compiler. `setup.bat` mirrors the pristine submodule into
 `thirdparty/work/extract-xiso`, applies the MojoRecomp `NO_FTP` compatibility
 patch there, and builds the patched copy.
 
-The MojoRecomp build disables the unused FTP upload path. Local ISO listing,
-extraction, creation, and rewrite behavior remain provided by the upstream tool.
+The MojoRecomp build disables the unused FTP upload path. The legacy source also
+expects BYTE_ORDER and BIG_ENDIAN macros that are not provided by this Windows
+build environment, so the CMake wrapper defines the host byte order explicitly.
+Without those definitions, the preprocessor treats both missing macros as zero,
+Xbox filesystem fields are byte-swapped, and valid large disc images are read
+from incorrect offsets. Local ISO listing, extraction, creation, and rewrite
+behavior remain provided by the upstream tool.
 
 Configure with:
 
   cmake -S tools/extract-xiso -B thirdparty/build/extract-xiso -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
-    -DEXTRACT_XISO_ROOT=thirdparty/extract-xiso
+    -DEXTRACT_XISO_ROOT=thirdparty/work/extract-xiso
+
+The patched Windows build is validated by listing and fully extracting the
+supported Crash of the Titans retail ISO.
 
 The resulting executable is:
 

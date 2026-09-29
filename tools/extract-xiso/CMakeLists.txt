@@ -20,6 +20,8 @@ target_compile_definitions(extract-xiso PRIVATE
     NDEBUG
     _CONSOLE
     NO_FTP
+    BYTE_ORDER=1234
+    BIG_ENDIAN=4321
     _CRT_SECURE_NO_WARNINGS)
 
 if(MSVC OR CMAKE_C_SIMULATE_ID STREQUAL "MSVC")

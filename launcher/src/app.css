@@ -61,14 +61,6 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .suite-name strong { font-size: 12px; letter-spacing: .01em; }
 .suite-name > span { color: #686862; font-size: 10px; }
 .launcher-version { margin-left: 3px; color: #666a6d; font: 9px/1 "Cascadia Mono", Consolas, monospace; white-space: nowrap; }
-.title-update {
-  min-height: 25px; display: inline-flex; align-items: center; gap: 7px; margin-left: 3px; padding: 0 10px;
-  border: 1px solid rgba(255, 167, 70, .28); border-radius: 999px; color: #ffd49f; background: rgba(173, 84, 16, .16);
-  cursor: pointer; font-size: 9px; font-weight: 700; transition: background .15s ease, border-color .15s ease;
-}
-.title-update:hover { border-color: rgba(255, 177, 83, .5); background: rgba(196, 94, 17, .25); }
-.title-update > span { width: 6px; height: 6px; border-radius: 50%; background: #ff9b35; box-shadow: 0 0 9px rgba(255, 143, 36, .7); }
-.title-update:disabled { opacity: .42; cursor: default; }
 .window-controls { align-self: stretch; display: flex; margin-left: auto; }
 .window-controls button { width: 44px; height: 100%; padding: 0; display: grid; place-items: center; border: 0; background: transparent; cursor: pointer; transition: background .15s ease; }
 .window-controls button:hover { background: rgba(255,255,255,.08); }
@@ -98,6 +90,7 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
 .rail-game img { width: 40px; height: 40px; border-radius: 10px; object-fit: cover; }
 .rail-status { position: absolute; right: 4px; bottom: 4px; width: 8px; height: 8px; border-radius: 50%; background: #5b5b56; border: 2px solid #0b0b0a; }
 .rail-status.ready { background: var(--accent-bright); box-shadow: 0 0 9px rgba(var(--theme-rgb),.55); }
+.rail-update-badge { position: absolute; right: 1px; top: 1px; display: grid; width: 16px; height: 16px; place-items: center; border: 2px solid #0b0b0a; border-radius: 50%; background: #ff9b35; color: #17100a; font-size: 10px; font-weight: 900; line-height: 1; box-shadow: 0 0 9px rgba(255,143,36,.55); }
 .rail-help {
   width: 44px; height: 44px; display: grid; place-items: center; padding: 0;
   border: 1px solid transparent; border-radius: 12px; color: #81858a; background: transparent;
@@ -156,9 +149,10 @@ button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px s
   padding: 3px; border: 1px solid rgba(255,255,255,.08); border-radius: 9px;
   background: rgba(5,12,17,.76); box-shadow: 0 10px 24px rgba(0,0,0,.2); backdrop-filter: blur(14px);
 }
-.game-section-tabs button { min-width: 88px; height: 31px; padding: 0 14px; border: 0; border-radius: 6px; color: #777d81; background: transparent; cursor: pointer; font-size: 9px; font-weight: 750; }
+.game-section-tabs button { position: relative; min-width: 88px; height: 31px; padding: 0 14px; border: 0; border-radius: 6px; color: #777d81; background: transparent; cursor: pointer; font-size: 9px; font-weight: 750; }
 .game-section-tabs button:hover { color: #d8dbdb; background: rgba(255,255,255,.04); }
 .game-section-tabs button.active { color: #f2f5f5; background: rgba(var(--theme-rgb),.14); box-shadow: inset 0 0 0 1px rgba(var(--theme-rgb),.18); }
+.versions-tab-badge { position: absolute; top: -5px; right: -5px; display: grid; width: 16px; height: 16px; place-items: center; border: 2px solid #081016; border-radius: 50%; background: #ff9b35; box-shadow: 0 0 9px rgba(255,143,36,.55); color: #17100a; font-size: 9px; font-weight: 900; line-height: 1; }
 .game-home { position: relative; height: 100%; padding: clamp(72px, 10vh, 92px) clamp(36px, 5vw, 72px) clamp(34px, 5.4vh, 64px); display: grid; grid-template-columns: minmax(360px, 1fr) minmax(320px, 390px); grid-template-rows: 1fr; gap: 30px; }
 .game-switch-view { animation: game-switch-in .34s cubic-bezier(.2,.7,.2,1) both; }
 .game-identity { align-self: start; max-width: 610px; animation: fade-up .45s ease both; }
@@ -312,17 +306,22 @@ select:focus { border-color: #506b80; }
 .settings-footer > span { margin-right: auto; color: #67655f; font-size: 9px; }
 .versions-panel { max-width: 1180px; margin: 0 auto; }
 .versions-view { padding-top: 70px; }
+.versions-tab { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+.versions-tab-badge { display: inline-grid; width: 15px; height: 15px; place-items: center; border-radius: 50%; background: #ff9b35; color: #17100a; font-size: 9px; font-weight: 900; line-height: 1; box-shadow: 0 0 8px rgba(255,143,36,.5); }
 .versions-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding: 18px 0 16px; }
 .versions-toolbar h2 { margin: 5px 0 5px; color: #deded9; font-size: 18px; font-weight: 650; }
 .versions-toolbar p { max-width: 700px; margin: 0; color: #74777a; font-size: 9px; line-height: 1.55; }
-.version-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.version-component-stack { display: grid; gap: 22px; }
+.version-component-section { min-width: 0; }
 .version-card { min-width: 0; padding: 17px; border: 1px solid rgba(255,255,255,.08); border-radius: 9px; background: rgba(12,16,19,.92); transition: border-color .18s ease, background .18s ease, box-shadow .18s ease; }
 .version-card.focused { border-color: rgba(var(--theme-rgb),.46); box-shadow: 0 0 0 1px rgba(var(--theme-rgb),.08), 0 12px 30px rgba(0,0,0,.2); }
 .version-card.update-available { border-color: rgba(255,156,68,.34); background: linear-gradient(145deg, rgba(83,43,15,.27), rgba(12,16,19,.94)); }
 .version-card.not-installed { opacity: .72; }
+.version-card.not-installed.update-available { opacity: 1; }
 .version-card-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #74797b; font-size: 8px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .version-card-heading b { color: var(--accent-bright); font-size: 8px; letter-spacing: .04em; }
 .version-card.update-available .version-card-heading b { color: #ffc17e; }
+.version-card.update-available .version-card-heading b::before { content: "!"; display: inline-grid; width: 14px; height: 14px; margin-right: 5px; place-items: center; border-radius: 50%; background: #ff9b35; color: #17100a; font-size: 9px; font-weight: 900; line-height: 1; vertical-align: -2px; }
 .version-card h3 { margin: 12px 0 15px; overflow: hidden; color: #deded9; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
 .version-numbers { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .version-numbers > div { min-width: 0; padding: 10px; border-radius: 7px; background: rgba(255,255,255,.026); }
@@ -331,6 +330,31 @@ select:focus { border-color: #506b80; }
 .version-numbers strong { overflow: hidden; color: #d6d7d3; font: 600 10px/1.2 "Cascadia Mono", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .version-card > p { min-height: 28px; margin: 13px 0 0; color: #797d7f; font-size: 9px; line-height: 1.5; }
 .version-card .button-row { margin-top: 13px; }
+.latest-version-card { border-color: rgba(var(--theme-rgb),.22); background: linear-gradient(135deg, rgba(var(--theme-rgb),.09), rgba(12,16,19,.95) 58%); }
+.latest-version-card.update-available { border-color: rgba(255,156,68,.38); background: linear-gradient(135deg, rgba(83,43,15,.27), rgba(12,16,19,.95) 58%); }
+.latest-release-badge { display: inline-flex; margin-top: 13px; padding: 5px 8px; border: 1px solid rgba(var(--theme-rgb),.26); border-radius: 5px; color: var(--accent-bright); background: rgba(var(--theme-rgb),.08); font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.launcher-version-section .latest-version-card,
+.launcher-version-section .latest-version-card.update-available {
+  border-color: rgba(var(--launcher-rgb), .34);
+  background: linear-gradient(135deg, rgba(var(--launcher-rgb), .12), rgba(12,16,19,.96) 58%);
+  box-shadow: inset 0 1px 0 rgba(var(--launcher-secondary-rgb), .035), 0 0 26px rgba(var(--launcher-rgb), .075);
+}
+.launcher-version-section .latest-release-badge {
+  border-color: rgba(var(--launcher-rgb), .3);
+  color: var(--launcher-accent-bright);
+  background: rgba(var(--launcher-rgb), .09);
+}
+.launcher-version-section .version-card-heading > span { color: rgba(var(--launcher-secondary-rgb), .68); }
+.component-release-overview { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; }
+.component-release-copy { min-width: 0; flex: 1 1 auto; }
+.component-release-copy h3 { margin-bottom: 7px; font-size: 20px; }
+.component-release-copy p { max-width: 650px; margin: 11px 0 0; color: #797d7f; font-size: 9px; line-height: 1.5; }
+.component-release-copy small { display: block; margin-top: 10px; color: #646a6e; font-size: 8px; }
+.component-release-copy small strong { color: #b7bdbe; font: 600 9px/1 "Cascadia Mono", Consolas, monospace; }
+.release-meta { display: flex; flex-wrap: wrap; gap: 7px 14px; color: #747b7e; font-size: 8px; }
+.release-meta span + span::before { content: ""; display: inline-block; width: 3px; height: 3px; margin: 0 9px 2px 0; border-radius: 50%; background: #525a5e; }
+.component-release-actions { min-width: 190px; display: flex; flex-direction: column; align-items: stretch; gap: 7px; }
+.component-release-actions button { width: 100%; }
 .component-progress { margin-top: 13px; padding: 10px; border: 1px solid rgba(var(--theme-rgb),.14); border-radius: 7px; background: rgba(var(--theme-rgb),.04); }
 .component-progress > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .component-progress strong { color: #aeb5b7; font-size: 8px; font-weight: 650; }
@@ -338,17 +362,29 @@ select:focus { border-color: #506b80; }
 .component-progress .progress-track { margin-top: 8px; }
 .release-history { margin-top: 14px; }
 .release-history-heading { padding: 0 2px 9px; }
+.version-component-section > .release-history-heading { margin-top: 12px; }
 .release-history-heading span, .release-history-heading strong { display: block; }
 .release-history-heading span { color: #6e7274; font-size: 8px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 .release-history-heading strong { margin-top: 4px; color: #bfc0bc; font-size: 10px; }
 .version-table { overflow: hidden; border: 1px solid rgba(255,255,255,.08); border-radius: 7px; background: #0d1114; }
-.version-row { min-height: 42px; display: grid; grid-template-columns: 150px 1fr 150px 150px; align-items: center; gap: 12px; padding: 0 14px; border-top: 1px solid rgba(255,255,255,.055); color: #8b8e90; font-size: 9px; }
+.version-row { min-height: 42px; display: grid; grid-template-columns: 120px minmax(120px,1fr) 150px 120px minmax(170px,auto); align-items: center; gap: 12px; padding: 0 14px; border-top: 1px solid rgba(255,255,255,.055); color: #8b8e90; font-size: 9px; }
 .version-row:first-child { border-top: 0; }
 .version-row strong { color: #d4d4d0; font: 600 10px/1 "Cascadia Mono", Consolas, monospace; }
 .version-row > span:first-child { display: flex; align-items: center; gap: 7px; }
 .version-row i { width: 7px; height: 7px; border-radius: 50%; background: #555b5f; }
 .version-row i.installed { background: var(--accent); }
+.version-row.active-version { background: rgba(var(--theme-rgb),.045); }
+.version-row-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.version-row-actions .primary-button,
+.version-row-actions .secondary-button { min-height: 30px; padding: 0 10px; font-size: 8px; }
+.version-current-label { min-width: 68px; min-height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0 10px; border: 1px solid rgba(var(--theme-rgb),.18); border-radius: 7px; color: #8fa9b8; background: rgba(var(--theme-rgb),.055); font-size: 8px; font-weight: 750; }
+.version-notes-button { min-height: 30px; padding: 0 9px; border: 0; color: #858d90; background: transparent; cursor: pointer; font-size: 8px; font-weight: 700; }
+.version-notes-button:hover { color: #d5dbdd; }
+.version-empty { grid-template-columns: 1fr; min-height: 52px; color: #666c6f; }
 .version-head { min-height: 34px; color: #686c70; background: #151a1f; font-size: 8px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
+.optional-version-section { padding-top: 2px; }
+.optional-component-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.optional-version-card { background: rgba(12,16,19,.78); }
 .versions-footer { margin-top: 12px; }
 .primary-button, .secondary-button { min-height: 35px; padding: 0 13px; border-radius: 6px; cursor: pointer; font-size: 9px; font-weight: 700; transition: background .15s ease, border-color .15s ease, color .15s ease; }
 .primary-button { border: 1px solid var(--accent); color: #f1f4f6; background: var(--accent-deep); box-shadow: none; }
@@ -499,8 +535,6 @@ select:focus { border-color: #506b80; }
 .suite-name strong { font-size: 13px; }
 .suite-name > span { font-size: 11px; }
 .launcher-version { font-size: 11px; }
-.title-update { min-height: 30px; padding: 0 11px; font-size: 11px; }
-
 .game-section-tabs button { min-width: 94px; height: 36px; font-size: 11px; }
 .overline { font-size: 11px; }
 .launch-status span { font-size: 13px; }
@@ -534,12 +568,22 @@ select { min-height: 44px; font-size: 12px; }
 .version-numbers span { font-size: 10px; }
 .version-numbers strong { font-size: 12px; }
 .version-card > p { min-height: 34px; font-size: 12px; }
+.latest-release-badge { font-size: 9px; }
+.component-release-copy h3 { font-size: 23px; }
+.component-release-copy p { font-size: 12px; }
+.component-release-copy small,
+.release-meta { font-size: 10px; }
+.component-release-copy small strong { font-size: 11px; }
 .component-progress strong,
 .component-progress span { font-size: 10px; }
 .release-history-heading span { font-size: 10px; }
 .release-history-heading strong { font-size: 12px; }
 .version-row { min-height: 48px; font-size: 11px; }
 .version-row strong { font-size: 12px; }
+.version-row-actions .primary-button,
+.version-row-actions .secondary-button,
+.version-notes-button,
+.version-current-label { font-size: 10px; }
 .version-head { min-height: 40px; font-size: 10px; }
 
 .primary-button, .secondary-button { min-height: 40px; padding: 0 16px; font-size: 11px; }
@@ -584,8 +628,10 @@ select { min-height: 44px; font-size: 12px; }
   .game-logo { width: min(47vw, 470px); }
   .field-grid { grid-template-columns: 1fr; }
   .diagnostic-options { grid-template-columns: 1fr; }
-  .version-summary-grid { grid-template-columns: 1fr; }
-  .version-row { grid-template-columns: 120px 1fr 110px 120px; }
+  .optional-component-grid { grid-template-columns: 1fr; }
+  .component-release-overview { align-items: stretch; }
+  .component-release-actions { min-width: 170px; }
+  .version-row { grid-template-columns: 100px minmax(100px,1fr) 120px 100px minmax(150px,auto); }
   .wide-field { grid-column: auto; }
 }
 @media (max-height: 700px) {

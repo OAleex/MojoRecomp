@@ -432,6 +432,14 @@ fn progress_percent(done: u64, total: u64, when_empty: u8, cap: u8) -> u8 {
 }
 
 #[derive(Clone, Serialize)]
+struct ComponentReleaseStatus {
+    version: String,
+    published: String,
+    notes_url: String,
+    size: u64,
+}
+
+#[derive(Clone, Serialize)]
 struct ComponentUpdateStatus {
     id: String,
     kind: String,
@@ -445,6 +453,7 @@ struct ComponentUpdateStatus {
     published: Option<String>,
     notes_url: Option<String>,
     last_action: Option<String>,
+    releases: Vec<ComponentReleaseStatus>,
 }
 
 #[derive(Serialize)]
@@ -2104,29 +2113,11 @@ async fn import_game_iso(
     if game.playable {
         let component_id = format!("runtime.{}", game.id);
         let store = game_component_store()?;
-        let runtime_ready = runtime_component_is_ready(&store, &component_id)?;
-        if !runtime_ready {
-            let suite = parsed_suite_manifest()?;
-            if !suite.update_catalog.trim().is_empty() {
-                if let Err(error) =
-                    install_component_update(component_id, state.clone(), app.clone()).await
-                {
-                    if embedded_cot_bootstrap_available() && game.id == "cot" {
-                        append_launcher_log(&format!(
-                            "Runtime component download failed; using the transitional embedded COT bootstrap: {error}"
-                        ));
-                    } else {
-                        return Err(format!(
-                            "The required game runtime could not be downloaded: {error}"
-                        ));
-                    }
-                }
-            } else if !embedded_cot_bootstrap_available() || game.id != "cot" {
-                return Err(
-                    "The required game runtime is not installed, and no download source is configured"
-                        .into(),
-                );
-            }
+        if !runtime_component_is_ready(&store, &component_id)? {
+            return Err(
+                "The required game runtime is not installed. Open Versions and install a runtime before setting up the game."
+                    .into(),
+            );
         }
     }
 
@@ -3093,6 +3084,7 @@ fn local_component_statuses(
         published: None,
         notes_url: None,
         last_action: launcher_store.last_action_state("launcher"),
+        releases: Vec::new(),
     }];
     for game in manifests {
         let id = format!("runtime.{}", game.id);
@@ -3119,6 +3111,7 @@ fn local_component_statuses(
             last_action: active
                 .and_then(|status| status.last_action)
                 .or_else(|| game_store.last_action_state(&id)),
+            releases: Vec::new(),
         });
     }
     let language_id = "language.cot.pt-br";
@@ -3142,6 +3135,7 @@ fn local_component_statuses(
             last_action: active
                 .last_action
                 .or_else(|| game_store.last_action_state(language_id)),
+            releases: Vec::new(),
         });
     }
     Ok(statuses)
@@ -3196,31 +3190,44 @@ fn component_statuses_from_catalog(
     let game_store = game_component_store()?;
     let installed = installed_update_components(manifests, catalog)?;
     let plans = updates::plan_updates(catalog, &installed, env!("CARGO_PKG_VERSION"))?;
-    let mut statuses = plans
-        .into_iter()
-        .map(|plan| {
-            let last_action = match &plan.kind {
-                updates::ComponentKind::Launcher => launcher_store.last_action_state(&plan.id),
-                updates::ComponentKind::Runtime | updates::ComponentKind::Language => {
-                    game_store.last_action_state(&plan.id)
-                }
-            };
-            ComponentUpdateStatus {
-                id: plan.id.clone(),
-                kind: component_kind_name(&plan.kind).into(),
-                game_id: plan.game_id,
-                locale: plan.locale,
-                installed_version: plan.installed_version,
-                latest_version: plan.latest_version,
-                state: plan_state_name(&plan.state).into(),
-                download_url: plan.download_url,
-                size: plan.size,
-                published: plan.published,
-                notes_url: plan.notes_url,
-                last_action,
+    let mut statuses = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let last_action = match &plan.kind {
+            updates::ComponentKind::Launcher => launcher_store.last_action_state(&plan.id),
+            updates::ComponentKind::Runtime | updates::ComponentKind::Language => {
+                game_store.last_action_state(&plan.id)
             }
+        };
+        let releases = updates::compatible_releases_for_component(
+            catalog,
+            &installed,
+            env!("CARGO_PKG_VERSION"),
+            &plan.id,
+        )?
+        .into_iter()
+        .map(|release| ComponentReleaseStatus {
+            version: release.version,
+            published: release.published,
+            notes_url: release.notes_url,
+            size: release.size,
         })
-        .collect::<Vec<_>>();
+        .collect();
+        statuses.push(ComponentUpdateStatus {
+            id: plan.id.clone(),
+            kind: component_kind_name(&plan.kind).into(),
+            game_id: plan.game_id,
+            locale: plan.locale,
+            installed_version: plan.installed_version,
+            latest_version: plan.latest_version,
+            state: plan_state_name(&plan.state).into(),
+            download_url: plan.download_url,
+            size: plan.size,
+            published: plan.published,
+            notes_url: plan.notes_url,
+            last_action,
+            releases,
+        });
+    }
 
     let local = local_component_statuses(manifests)?;
     for status in local {
@@ -3236,33 +3243,41 @@ fn select_component_release(
     manifests: &[GameManifest],
     catalog: &updates::UpdateCatalog,
     component_id: &str,
+    requested_version: Option<&str>,
+    allow_current: bool,
 ) -> Result<updates::ComponentRelease, String> {
     let installed = installed_update_components(manifests, catalog)?;
-    let plans = updates::plan_updates(catalog, &installed, env!("CARGO_PKG_VERSION"))?;
-    let plan = plans
+    let compatible = updates::compatible_releases_for_component(
+        catalog,
+        &installed,
+        env!("CARGO_PKG_VERSION"),
+        component_id,
+    )?;
+    let release = match requested_version {
+        Some(version) => compatible
+            .iter()
+            .find(|release| release.version == version)
+            .cloned()
+            .ok_or_else(|| {
+                format!("Component {component_id} version {version} is not available or compatible")
+            })?,
+        None => compatible
+            .first()
+            .cloned()
+            .ok_or_else(|| format!("Component {component_id} has no compatible release"))?,
+    };
+    let installed_component = installed
         .iter()
-        .find(|plan| plan.id == component_id)
-        .ok_or_else(|| format!("Component is not present in the update catalog: {component_id}"))?;
-    if !matches!(
-        plan.state,
-        updates::PlanState::UpdateAvailable
-            | updates::PlanState::Available
-            | updates::PlanState::Corrupted
-    ) {
+        .find(|component| component.id == component_id);
+    let installing_current = installed_component
+        .is_some_and(|component| component.healthy && component.version == release.version);
+    if installing_current && !(allow_current && release.kind == updates::ComponentKind::Runtime) {
         return Err(format!(
-            "Component {component_id} does not require an update"
+            "Component {component_id} version {} is already active",
+            release.version
         ));
     }
-    let version = plan
-        .latest_version
-        .as_deref()
-        .ok_or_else(|| format!("Component {component_id} has no compatible release"))?;
-    catalog
-        .releases
-        .iter()
-        .find(|release| release.id == component_id && release.version == version)
-        .cloned()
-        .ok_or_else(|| format!("Catalog release disappeared for {component_id} {version}"))
+    Ok(release)
 }
 
 fn ensure_component_game_stopped(
@@ -3341,6 +3356,8 @@ async fn check_component_updates(
 #[tauri::command]
 async fn install_component_update(
     component_id: String,
+    version: Option<String>,
+    reinstall: bool,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<ComponentUpdateResult, String> {
@@ -3360,7 +3377,13 @@ async fn install_component_update(
             catalog.channel
         ));
     }
-    let release = select_component_release(&state.manifests, &catalog, &component_id)?;
+    let release = select_component_release(
+        &state.manifests,
+        &catalog,
+        &component_id,
+        version.as_deref(),
+        reinstall,
+    )?;
     let store = match &release.kind {
         updates::ComponentKind::Launcher => launcher_component_store()?,
         updates::ComponentKind::Runtime | updates::ComponentKind::Language => {

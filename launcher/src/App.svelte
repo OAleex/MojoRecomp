@@ -6,6 +6,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import mojoRecompIcon from "../src-tauri/icons/icon.ico?url";
   import type {
+    ComponentReleaseStatus,
     ComponentUpdateProgress,
     ComponentUpdateResult,
     ComponentUpdateStatus,
@@ -87,6 +88,8 @@
   $: selectedLogo = selectedId === "mom" ? "/art/mom-logo.png" : "/art/cot-logo.png";
   $: selectedIcon = selectedId === "mom" ? "/art/mom-icon.png" : "/art/cot-icon.png";
   $: selectedLanguage = LANGUAGE_OPTIONS.find((entry) => entry.profile === settings?.localization.profile) ?? LANGUAGE_OPTIONS[0];
+  $: launcherReleases = launcherComponent?.releases ?? [];
+  $: selectedRuntimeReleases = selectedRuntimeComponent?.releases ?? [];
   $: navigationLocked = setupBusy || localizationBusy || libraryBusy || updateBusy;
   $: firstLaunchPending = launcherStorage !== null && !launcherStorage.configured;
   $: gameSettingsDirty = !!settings && settingsFingerprint(settings) !== savedSettingsFingerprint;
@@ -104,10 +107,31 @@
   $: selectedLanguageComponents = updates?.components.filter(
     (component) => component.kind === "language" && component.game_id === selectedId
   ) ?? [];
-  $: actionableUpdates = updates?.components.filter(
-    (component) => component.state === "update_available" || component.state === "corrupted"
-  ) ?? [];
-  $: updateCount = actionableUpdates.length;
+  function componentHasDownload(component: ComponentUpdateStatus) {
+    return !!component.latest_version && !!component.download_url;
+  }
+
+  function componentNeedsAttention(component: ComponentUpdateStatus | null) {
+    if (!component) return false;
+    if (component.state === "update_available" || component.state === "corrupted" || component.state === "repair_unavailable") {
+      return true;
+    }
+    if (component.kind === "runtime" && (component.state === "available" || component.state === "not_installed")) {
+      return true;
+    }
+    return component.kind === "launcher"
+      && (component.state === "available" || component.state === "not_installed")
+      && componentHasDownload(component);
+  }
+
+  function gameNeedsAttention(gameId: string) {
+    if (!games.find((game) => game.id === gameId)?.playable) return false;
+    return updates?.components.some(
+      (component) => component.game_id === gameId && componentNeedsAttention(component)
+    ) ?? false;
+  }
+
+  $: versionsNeedsAttention = componentNeedsAttention(launcherComponent) || gameNeedsAttention(selectedId);
 
   async function openGame(id: string) {
     if (navigationLocked || firstLaunchPending) return;
@@ -125,17 +149,6 @@
     versionFocus = null;
     activeView = "versions";
     if (!updates) await checkUpdates();
-  }
-
-  async function openAvailableUpdates() {
-    if (navigationLocked || firstLaunchPending || updateCount === 0) return;
-    const target = actionableUpdates[0] ?? null;
-    if (!target) return;
-    activeView = "versions";
-    if (target.game_id && target.game_id !== selectedId) {
-      await selectGame(target.game_id);
-    }
-    versionFocus = target.id;
   }
 
   function openLauncherSettings() {
@@ -232,8 +245,28 @@
     if (loadedLocalization) localizationStatus = loadedLocalization;
   }
 
+  async function ensureSelectedRuntimeReady(action: string): Promise<boolean> {
+    if (!selected?.playable) return true;
+    const overview = await checkUpdates();
+    const runtime = overview?.components.find((component) => component.id === `runtime.${selected.id}`)
+      ?? selectedRuntimeComponent;
+    const runtimeReady = !!runtime?.installed_version
+      && runtime.state !== "corrupted"
+      && runtime.state !== "repair_unavailable"
+      && runtime.state !== "not_installed"
+      && runtime.state !== "available";
+    if (!runtimeReady) {
+      activeView = "versions";
+      versionFocus = `runtime.${selected.id}`;
+      showNotice(`Install a game runtime from Versions before ${action}.`, "warning");
+      return false;
+    }
+    return true;
+  }
+
   async function importIso() {
     if (!selected || selected.id !== "cot") return;
+    if (!await ensureSelectedRuntimeReady("setting up the game")) return;
     setupBusy = true;
     setupProgress = {
       game_id: selected.id,
@@ -298,6 +331,7 @@
 
   async function play() {
     if (!selected || !settings || process.running) return;
+    if (!await ensureSelectedRuntimeReady("starting the game")) return;
     if (settings.localization.profile === "pt-BR" && !localizationStatus?.overlay_ready) {
       showNotice("Install the selected Localization Pack in Settings before starting the game.", "error");
       return;
@@ -508,19 +542,26 @@
     await runAction(() => invoke<void>("open_license_notices"));
   }
 
-  async function checkUpdates() {
+  async function checkUpdates(): Promise<UpdateOverview | null> {
     checkingUpdates = true;
     const value = await run(() => invoke<UpdateOverview>("check_component_updates"));
     checkingUpdates = false;
     if (value) updates = value;
+    return value;
   }
 
-  async function installComponentUpdate(component: ComponentUpdateStatus) {
+  async function installComponentUpdate(
+    component: ComponentUpdateStatus,
+    reinstall = false,
+    version: string | null = null
+  ) {
     if (updateBusy) return;
     updateBusy = true;
     versionFocus = component.id;
     const result = await run(() => invoke<ComponentUpdateResult>("install_component_update", {
-      componentId: component.id
+      componentId: component.id,
+      version,
+      reinstall
     }));
     updateBusy = false;
     if (!result) return;
@@ -533,9 +574,31 @@
       showNotice("Verified launcher package is ready. Close the launcher before replacing it.", "warning");
     } else if (component.state === "corrupted") {
       showNotice("Component repaired successfully.");
+    } else if (!component.installed_version) {
+      showNotice("Component installed successfully.");
+    } else if (reinstall || version === component.installed_version) {
+      showNotice("Component reinstalled successfully.");
+    } else if (version && version !== component.latest_version) {
+      showNotice(component.kind === "runtime"
+        ? `Runtime ${version} is now active.`
+        : `Component version ${version} is ready.`);
     } else {
       showNotice("Component updated successfully.");
     }
+  }
+
+  async function installRuntimeRelease(release: ComponentReleaseStatus) {
+    if (!selectedRuntimeComponent) return;
+    await installComponentUpdate(
+      selectedRuntimeComponent,
+      release.version === selectedRuntimeComponent.installed_version,
+      release.version
+    );
+  }
+
+  async function installLauncherRelease(release: ComponentReleaseStatus) {
+    if (!launcherComponent || release.version === launcherComponent.installed_version) return;
+    await installComponentUpdate(launcherComponent, false, release.version);
   }
 
   async function rollbackComponentUpdate(component: ComponentUpdateStatus) {
@@ -566,7 +629,7 @@
     if (component.last_action === "failed") return "Update failed";
     if (component.last_action === "rolled_back") return "Rolled back";
     if (component.state === "update_available") return "Update available";
-    if (component.state === "available") return "Available";
+    if (component.state === "available") return component.kind === "language" ? "Available" : "Download available";
     if (component.state === "incompatible") return "Incompatible";
     if (component.state === "not_installed") return "Not installed";
     if (component.last_action === "recovered") return "Recovered";
@@ -592,9 +655,16 @@
     }
     if (component.last_action === "rolled_back") return "The previous component version is active again.";
     if (component.state === "update_available") return "A newer compatible component release is available.";
-    if (component.state === "available") return "This optional component can be installed.";
+    if (component.state === "available") {
+      if (component.kind === "runtime") return "This required game runtime is not installed. Download it to set up and play the game.";
+      if (component.kind === "language") return "This optional Localization Pack can be installed.";
+      return "This component can be downloaded.";
+    }
     if (component.state === "incompatible") return "No compatible update is available.";
-    if (component.state === "not_installed") return "This component is not installed.";
+    if (component.state === "not_installed") {
+      if (component.kind === "runtime") return "This required game runtime is not installed.";
+      return "This component is not installed.";
+    }
     if (component.last_action === "recovered") return "An interrupted update was recovered and verified.";
     if (component.last_action === "installed") return "The verified component update is installed.";
     return "This component is up to date.";
@@ -604,16 +674,82 @@
     return !!component
       && !!updates?.configured
       && !updates.error
+      && componentHasDownload(component)
       && (component.state === "update_available"
         || component.state === "available"
+        || component.state === "not_installed"
         || component.state === "corrupted");
+  }
+
+  function componentCanReinstall(component: ComponentUpdateStatus | null) {
+    return !!component
+      && component.kind === "runtime"
+      && component.state === "up_to_date"
+      && !!component.installed_version
+      && !!updates?.configured
+      && !updates.error
+      && componentHasDownload(component);
   }
 
   function componentActionLabel(component: ComponentUpdateStatus) {
     if (component.state === "corrupted") return "Repair";
-    if (component.kind === "language" && component.state === "available") return "Install";
+    if (!component.installed_version) return component.kind === "language" ? "Install" : "Download";
     if (component.kind === "launcher") return "Download verified update";
     return "Update";
+  }
+
+  function latestRuntimeActionLabel(component: ComponentUpdateStatus) {
+    if (component.state === "corrupted") return `Repair ${component.latest_version ?? "runtime"}`;
+    if (!component.installed_version) return `Download ${component.latest_version ?? "latest"}`;
+    if (component.state === "update_available") return `Update to ${component.latest_version ?? "latest"}`;
+    return `Reinstall ${component.latest_version ?? component.installed_version}`;
+  }
+
+  function latestLauncherActionLabel(component: ComponentUpdateStatus) {
+    if (component.state === "corrupted") return `Repair ${component.latest_version ?? "launcher"}`;
+    if (component.state === "update_available") return `Download ${component.latest_version ?? "latest"}`;
+    return component.last_action === "ready_manual" ? "Open verified package" : "Up to date";
+  }
+
+  function launcherReleaseActionLabel(release: ComponentReleaseStatus) {
+    if (release.version === launcherComponent?.installed_version) return "Current";
+    return "Download";
+  }
+
+  function runtimeReleaseActionLabel(release: ComponentReleaseStatus) {
+    if (release.version === selectedRuntimeComponent?.installed_version) return "Reinstall";
+    return "Install";
+  }
+
+  function latestReleaseBadgeLabel() {
+    if (checkingUpdates && !updates) return "Checking releases";
+    if (updates?.error) return "Release status";
+    if (updates && !updates.configured) return "Local status";
+    return "Latest release";
+  }
+
+  function latestReleaseHeadline(component: ComponentUpdateStatus | null) {
+    if (checkingUpdates && !updates) return "Checking releases...";
+    if (updates?.error) return "Update information unavailable";
+    if (updates && !updates.configured) return "No release catalog configured";
+    return component?.latest_version ?? "No compatible release";
+  }
+
+  function releaseHistoryEmptyMessage(kind: "launcher" | "runtime") {
+    if (checkingUpdates && !updates) return "Checking release history...";
+    if (updates?.error) return "Release history is unavailable while the update check is failing.";
+    if (updates && !updates.configured) return "No update catalog is configured for this launcher build.";
+    return kind === "launcher"
+      ? "No compatible launcher releases are available from the update catalog."
+      : "No compatible runtime releases are available from the update catalog.";
+  }
+
+  function formatReleaseDate(value: string | null) {
+    if (!value) return "Unknown date";
+    const parsed = new Date(`${value}T00:00:00`);
+    return Number.isNaN(parsed.getTime())
+      ? value
+      : parsed.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
   }
 
   function humanBytes(value: number | null) {
@@ -786,11 +922,6 @@
       <div class="suite-name" data-tauri-drag-region><strong>MojoRecomp</strong><span>Launcher</span></div>
       <span class="launcher-version" data-tauri-drag-region>v{launcherComponent?.installed_version ?? "1.0.0"}</span>
     </div>
-    {#if updateCount > 0}
-      <button type="button" class="title-update" onclick={openAvailableUpdates} disabled={navigationLocked || firstLaunchPending}>
-        <span></span>{updateCount === 1 ? "Update available" : `${updateCount} updates`}
-      </button>
-    {/if}
     <div class="window-controls">
       <button type="button" aria-label="Minimize" title="Minimize" onclick={minimizeWindow}><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5h10" /></svg></button>
       <button type="button" aria-label="Maximize or restore" title="Maximize or restore" onclick={toggleMaximizeWindow}><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx=".5" /></svg></button>
@@ -814,6 +945,7 @@
           >
             <img src={game.id === "mom" ? "/art/mom-icon.png" : "/art/cot-icon.png"} alt="" />
             <span class:ready={game.installed && game.playable} class="rail-status"></span>
+            {#if gameNeedsAttention(game.id)}<span class="rail-update-badge" aria-hidden="true">!</span>{/if}
           </button>
         {/each}
       </div>
@@ -849,7 +981,10 @@
       {#if selected && (activeView === "game" || activeView === "versions")}
         <nav class="game-section-tabs" aria-label={`${selected.name} pages`}>
           <button type="button" class:active={activeView === "game"} onclick={() => showView("game")}>Overview</button>
-          <button type="button" class:active={activeView === "versions"} onclick={openVersions}>Versions</button>
+          <button type="button" class:active={activeView === "versions"} class="versions-tab" onclick={openVersions}>
+            Versions
+            {#if versionsNeedsAttention}<span class="versions-tab-badge" aria-hidden="true">!</span>{/if}
+          </button>
         </nav>
       {/if}
 
@@ -980,82 +1115,136 @@
               <button type="button" class="secondary-button" onclick={checkUpdates} disabled={checkingUpdates || updateBusy}>{checkingUpdates ? "Checking..." : "Check updates"}</button>
             </div>
 
-            <div class="version-summary-grid">
-              <article class:update-available={launcherComponent?.state === "update_available" || launcherComponent?.state === "corrupted"} class:focused={versionFocus === "launcher"} class="version-card">
-                <div class="version-card-heading"><span>Launcher</span><b>{updates?.error ? "Check failed" : componentStatusLabel(launcherComponent)}</b></div>
-                <h3>MojoRecomp Launcher</h3>
-                <div class="version-numbers"><div><span>Current</span><strong>{launcherComponent?.installed_version ?? "1.0.0"}</strong></div><div><span>Latest</span><strong>{launcherComponent?.latest_version ?? "-"}</strong></div></div>
-                <p>{componentDescription(launcherComponent)}</p>
-                {#if updateProgress?.component_id === "launcher"}
-                  <div class="component-progress"><div><strong>{updateProgress.detail}</strong><span>{updateProgress.progress}%</span></div><div class="progress-track"><span style:width={updateProgress.progress + "%"}></span></div></div>
-                {/if}
-                <div class="button-row">
-                  {#if launcherComponent?.last_action === "ready_manual"}
-                    <button type="button" class="primary-button" onclick={openLauncherUpdateFolder}>Open verified package</button>
-                  {:else if componentCanInstall(launcherComponent)}
-                    <button type="button" class="primary-button" onclick={() => launcherComponent && installComponentUpdate(launcherComponent)} disabled={updateBusy}>{launcherComponent ? componentActionLabel(launcherComponent) : "Update"}</button>
-                  {/if}
-                  {#if launcherComponent?.notes_url}<button type="button" class="secondary-button" onclick={() => openUpdateUrl(launcherComponent?.notes_url ?? null)}>Release notes</button>{/if}
-                </div>
-              </article>
-
-              <article class:update-available={selectedRuntimeComponent?.state === "update_available" || selectedRuntimeComponent?.state === "corrupted"} class:focused={versionFocus === selectedRuntimeComponent?.id} class:not-installed={!selectedRuntimeComponent?.installed_version} class="version-card">
-                <div class="version-card-heading"><span>Game runtime</span><b>{updates?.error ? "Check failed" : componentStatusLabel(selectedRuntimeComponent)}</b></div>
-                <h3>{selected.name}</h3>
-                <div class="version-numbers"><div><span>Current</span><strong>{selectedRuntimeComponent?.installed_version ?? "-"}</strong></div><div><span>Latest</span><strong>{selectedRuntimeComponent?.latest_version ?? "-"}</strong></div></div>
-                <p>{componentDescription(selectedRuntimeComponent)}</p>
-                {#if updateProgress?.component_id === selectedRuntimeComponent?.id}
-                  <div class="component-progress"><div><strong>{updateProgress.detail}</strong><span>{updateProgress.progress}%</span></div><div class="progress-track"><span style:width={updateProgress.progress + "%"}></span></div></div>
-                {/if}
-                <div class="button-row">
-                  {#if componentCanInstall(selectedRuntimeComponent)}
-                    <button type="button" class="primary-button" onclick={() => selectedRuntimeComponent && installComponentUpdate(selectedRuntimeComponent)} disabled={updateBusy}>{selectedRuntimeComponent ? componentActionLabel(selectedRuntimeComponent) : "Update"}</button>
-                  {/if}
-                  {#if selectedRuntimeComponent?.last_action === "installed"}<button type="button" class="secondary-button" onclick={() => selectedRuntimeComponent && rollbackComponentUpdate(selectedRuntimeComponent)} disabled={updateBusy}>Rollback</button>{/if}
-                  {#if selectedRuntimeComponent?.notes_url}<button type="button" class="secondary-button" onclick={() => openUpdateUrl(selectedRuntimeComponent?.notes_url ?? null)}>Release notes</button>{/if}
-                </div>
-              </article>
-
-              {#each selectedLanguageComponents as component}
-                <article class:update-available={component.state === "update_available" || component.state === "corrupted"} class:focused={versionFocus === component.id} class:not-installed={!component.installed_version} class="version-card">
-                  <div class="version-card-heading"><span>Localization Pack</span><b>{updates?.error ? "Check failed" : componentStatusLabel(component)}</b></div>
-                  <h3>{component.locale ?? component.id}</h3>
-                  <div class="version-numbers"><div><span>Current</span><strong>{component.installed_version ?? "-"}</strong></div><div><span>Latest</span><strong>{component.latest_version ?? "-"}</strong></div></div>
-                  <p>{componentDescription(component)}</p>
-                  {#if updateProgress?.component_id === component.id}
+            <div class="version-component-stack">
+              <section class="version-component-section launcher-version-section">
+                <article class:update-available={componentNeedsAttention(launcherComponent)} class:focused={versionFocus === "launcher"} class="version-card latest-version-card">
+                  <div class="version-card-heading"><span>MojoRecomp Launcher</span><b>{updates?.error ? "Check failed" : componentStatusLabel(launcherComponent)}</b></div>
+                  <div class="latest-release-badge">{latestReleaseBadgeLabel()}</div>
+                  <div class="component-release-overview">
+                    <div class="component-release-copy">
+                      <h3>{latestReleaseHeadline(launcherComponent)}</h3>
+                      {#if launcherComponent?.latest_version && !updates?.error}
+                        <div class="release-meta">
+                          <span>{formatReleaseDate(launcherComponent.published)}</span>
+                          <span>{humanBytes(launcherComponent.size)}</span>
+                        </div>
+                      {/if}
+                      <p>{componentDescription(launcherComponent)}</p>
+                      <small>Current launcher: <strong>{launcherComponent?.installed_version ?? "1.0.0"}</strong></small>
+                    </div>
+                    <div class="component-release-actions">
+                      {#if launcherComponent?.last_action === "ready_manual"}
+                        <button type="button" class="primary-button" onclick={openLauncherUpdateFolder}>Open verified package</button>
+                      {:else if componentCanInstall(launcherComponent)}
+                        <button type="button" class="primary-button" onclick={() => launcherComponent && installComponentUpdate(launcherComponent)} disabled={updateBusy}>{launcherComponent ? latestLauncherActionLabel(launcherComponent) : "Download"}</button>
+                      {/if}
+                      {#if launcherComponent?.notes_url}<button type="button" class="secondary-button" onclick={() => openUpdateUrl(launcherComponent?.notes_url ?? null)}>Release notes</button>{/if}
+                    </div>
+                  </div>
+                  {#if updateProgress?.component_id === "launcher"}
                     <div class="component-progress"><div><strong>{updateProgress.detail}</strong><span>{updateProgress.progress}%</span></div><div class="progress-track"><span style:width={updateProgress.progress + "%"}></span></div></div>
                   {/if}
-                  <div class="button-row">
-                    {#if componentCanInstall(component)}<button type="button" class="primary-button" onclick={() => installComponentUpdate(component)} disabled={updateBusy}>{componentActionLabel(component)}</button>{/if}
-                    {#if component.last_action === "installed"}<button type="button" class="secondary-button" onclick={() => rollbackComponentUpdate(component)} disabled={updateBusy}>Rollback</button>{/if}
-                    {#if component.notes_url}<button type="button" class="secondary-button" onclick={() => openUpdateUrl(component.notes_url)}>Release notes</button>{/if}
-                  </div>
                 </article>
-              {/each}
-            </div>
 
-            <section class="release-history">
-              <div class="release-history-heading"><div><span>Component status</span><strong>{selected.name}</strong></div></div>
-              <div class="version-table" role="table" aria-label="Component versions">
-                <div class="version-row version-head" role="row"><span>Status</span><span>Component</span><span>Version</span><span>Package</span></div>
-                {#if selectedRuntimeComponent}
-                  <div class="version-row" role="row">
-                    <span data-label="Status"><i class:installed={!!selectedRuntimeComponent.installed_version}></i>{componentStatusLabel(selectedRuntimeComponent)}</span>
-                    <strong data-label="Component">Runtime</strong>
-                    <span data-label="Version">{selectedRuntimeComponent.installed_version ?? "-"}</span>
-                    <span data-label="Package">{humanBytes(selectedRuntimeComponent.size)}</span>
+                <div class="release-history-heading"><div><span>Available launcher versions</span><strong>MojoRecomp Launcher</strong></div></div>
+                <div class="version-table" role="table" aria-label="Available launcher versions">
+                  <div class="version-row version-head" role="row"><span>Status</span><span>Version</span><span>Released</span><span>Package</span><span>Action</span></div>
+                  {#each launcherReleases as release, index}
+                    <div class:active-version={release.version === launcherComponent?.installed_version} class="version-row" role="row">
+                      <span data-label="Status"><i class:installed={release.version === launcherComponent?.installed_version}></i>{release.version === launcherComponent?.installed_version ? "Current" : index === 0 ? "Latest" : "Available"}</span>
+                      <strong data-label="Version">{release.version}</strong>
+                      <span data-label="Released">{formatReleaseDate(release.published)}</span>
+                      <span data-label="Package">{humanBytes(release.size)}</span>
+                      <div class="version-row-actions" data-label="Action">
+                        {#if release.version === launcherComponent?.installed_version}
+                          <span class="version-current-label">Current</span>
+                        {:else}
+                          <button type="button" class="primary-button" onclick={() => installLauncherRelease(release)} disabled={updateBusy}>{launcherReleaseActionLabel(release)}</button>
+                        {/if}
+                        <button type="button" class="version-notes-button" onclick={() => openUpdateUrl(release.notes_url)}>Notes</button>
+                      </div>
+                    </div>
+                  {:else}
+                    <div class="version-row version-empty" role="row"><span>{releaseHistoryEmptyMessage("launcher")}</span></div>
+                  {/each}
+                </div>
+              </section>
+
+              <section class="version-component-section runtime-version-section">
+                <article class:update-available={componentNeedsAttention(selectedRuntimeComponent)} class:focused={versionFocus === selectedRuntimeComponent?.id} class:not-installed={!selectedRuntimeComponent?.installed_version} class="version-card latest-version-card">
+                  <div class="version-card-heading"><span>{selected.name} Runtime</span><b>{updates?.error ? "Check failed" : componentStatusLabel(selectedRuntimeComponent)}</b></div>
+                  <div class="latest-release-badge">{latestReleaseBadgeLabel()}</div>
+                  <div class="component-release-overview">
+                    <div class="component-release-copy">
+                      <h3>{latestReleaseHeadline(selectedRuntimeComponent)}</h3>
+                      {#if selectedRuntimeComponent?.latest_version && !updates?.error}
+                        <div class="release-meta">
+                          <span>{formatReleaseDate(selectedRuntimeComponent.published)}</span>
+                          <span>{humanBytes(selectedRuntimeComponent.size)}</span>
+                        </div>
+                      {/if}
+                      <p>{componentDescription(selectedRuntimeComponent)}</p>
+                      <small>Active runtime: <strong>{selectedRuntimeComponent?.installed_version ?? "None"}</strong></small>
+                    </div>
+                    <div class="component-release-actions">
+                      {#if componentCanInstall(selectedRuntimeComponent)}
+                        <button type="button" class="primary-button" onclick={() => selectedRuntimeComponent && installComponentUpdate(selectedRuntimeComponent)} disabled={updateBusy}>{selectedRuntimeComponent ? latestRuntimeActionLabel(selectedRuntimeComponent) : "Download"}</button>
+                      {:else if componentCanReinstall(selectedRuntimeComponent)}
+                        <button type="button" class="secondary-button" onclick={() => selectedRuntimeComponent && installComponentUpdate(selectedRuntimeComponent, true, selectedRuntimeComponent.latest_version)} disabled={updateBusy}>{selectedRuntimeComponent ? latestRuntimeActionLabel(selectedRuntimeComponent) : "Reinstall"}</button>
+                      {/if}
+                      {#if selectedRuntimeComponent?.notes_url}<button type="button" class="secondary-button" onclick={() => openUpdateUrl(selectedRuntimeComponent?.notes_url ?? null)}>Release notes</button>{/if}
+                      {#if selectedRuntimeComponent?.last_action === "installed"}<button type="button" class="secondary-button" onclick={() => selectedRuntimeComponent && rollbackComponentUpdate(selectedRuntimeComponent)} disabled={updateBusy}>Rollback</button>{/if}
+                    </div>
                   </div>
-                {/if}
-                {#each selectedLanguageComponents as component}
-                  <div class="version-row" role="row">
-                    <span data-label="Status"><i class:installed={!!component.installed_version}></i>{componentStatusLabel(component)}</span>
-                    <strong data-label="Component">{component.locale ?? "Language"}</strong>
-                    <span data-label="Version">{component.installed_version ?? "-"}</span>
-                    <span data-label="Package">{humanBytes(component.size)}</span>
+                  {#if updateProgress?.component_id === selectedRuntimeComponent?.id}
+                    <div class="component-progress"><div><strong>{updateProgress.detail}</strong><span>{updateProgress.progress}%</span></div><div class="progress-track"><span style:width={updateProgress.progress + "%"}></span></div></div>
+                  {/if}
+                </article>
+
+                <div class="release-history-heading"><div><span>Available runtime versions</span><strong>{selected.name}</strong></div></div>
+                <div class="version-table" role="table" aria-label="Available runtime versions">
+                  <div class="version-row version-head" role="row"><span>Status</span><span>Version</span><span>Released</span><span>Package</span><span>Action</span></div>
+                  {#each selectedRuntimeReleases as release, index}
+                    <div class:active-version={release.version === selectedRuntimeComponent?.installed_version} class="version-row" role="row">
+                      <span data-label="Status"><i class:installed={release.version === selectedRuntimeComponent?.installed_version}></i>{release.version === selectedRuntimeComponent?.installed_version ? "Active" : index === 0 ? "Latest" : "Available"}</span>
+                      <strong data-label="Version">{release.version}</strong>
+                      <span data-label="Released">{formatReleaseDate(release.published)}</span>
+                      <span data-label="Package">{humanBytes(release.size)}</span>
+                      <div class="version-row-actions" data-label="Action">
+                        <button type="button" class={release.version === selectedRuntimeComponent?.installed_version ? "secondary-button" : "primary-button"} onclick={() => installRuntimeRelease(release)} disabled={updateBusy}>{runtimeReleaseActionLabel(release)}</button>
+                        <button type="button" class="version-notes-button" onclick={() => openUpdateUrl(release.notes_url)}>Notes</button>
+                      </div>
+                    </div>
+                  {:else}
+                    <div class="version-row version-empty" role="row"><span>{releaseHistoryEmptyMessage("runtime")}</span></div>
+                  {/each}
+                </div>
+              </section>
+
+              {#if selectedLanguageComponents.length > 0}
+                <section class="version-component-section optional-version-section">
+                  <div class="release-history-heading"><div><span>Optional components</span><strong>Localization Packs</strong></div></div>
+                  <div class="optional-component-grid">
+                    {#each selectedLanguageComponents as component}
+                      <article class:update-available={componentNeedsAttention(component)} class:focused={versionFocus === component.id} class:not-installed={!component.installed_version} class="version-card optional-version-card">
+                        <div class="version-card-heading"><span>Localization Pack</span><b>{updates?.error ? "Check failed" : componentStatusLabel(component)}</b></div>
+                        <h3>{component.locale ?? component.id}</h3>
+                        <div class="version-numbers"><div><span>Current</span><strong>{component.installed_version ?? "-"}</strong></div><div><span>Latest</span><strong>{component.latest_version ?? "-"}</strong></div></div>
+                        <p>{componentDescription(component)}</p>
+                        {#if updateProgress?.component_id === component.id}
+                          <div class="component-progress"><div><strong>{updateProgress.detail}</strong><span>{updateProgress.progress}%</span></div><div class="progress-track"><span style:width={updateProgress.progress + "%"}></span></div></div>
+                        {/if}
+                        <div class="button-row">
+                          {#if componentCanInstall(component)}<button type="button" class="primary-button" onclick={() => installComponentUpdate(component)} disabled={updateBusy}>{componentActionLabel(component)}</button>{/if}
+                          {#if component.last_action === "installed"}<button type="button" class="secondary-button" onclick={() => rollbackComponentUpdate(component)} disabled={updateBusy}>Rollback</button>{/if}
+                          {#if component.notes_url}<button type="button" class="secondary-button" onclick={() => openUpdateUrl(component.notes_url)}>Release notes</button>{/if}
+                        </div>
+                      </article>
+                    {/each}
                   </div>
-                {/each}
-              </div>
-            </section>
+                </section>
+              {/if}
+            </div>
           </section>
         </section>
       {:else if activeView === "launcher-settings"}

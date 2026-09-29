@@ -61,33 +61,35 @@ No additional platform ports are currently announced.
 
 ## Getting started
 
-For normal use, download only the **MojoRecomp Launcher** portable ZIP. The separate runtime package is managed automatically by the launcher.
+For normal use, download only the **MojoRecomp Launcher** portable ZIP. Game runtimes are managed through the launcher's **Versions** page and are installed only when the user chooses a version to download.
 
 1. Download and extract `MojoRecomp-Launcher-<version>-windows-x64-portable.zip`.
 2. Open `mojorecomp-launcher.exe`.
 3. Choose where to create your `MojoRecomp-Games` library.
-4. Select **Crash of the Titans** and click **SET UP**.
-5. Choose your supported Xbox 360 `.iso` file.
-6. Wait while the launcher prepares the required runtime, extracts the game, and validates the installation.
-7. Click **PLAY**.
+4. Select **Crash of the Titans** and open **Versions**.
+5. Download and activate a compatible game runtime. The latest compatible release is highlighted, and older compatible runtime releases remain available when they are present in the update catalog.
+6. Return to **Overview** and click **SET UP**.
+7. Choose your supported Xbox 360 `.iso` file.
+8. Wait while the launcher extracts the game and validates the installation.
+9. Click **PLAY**.
 
-The launcher downloads and verifies the required `runtime.cot` component automatically when it is missing. The ISO itself is never modified. After setup, the game and its active runtime can be used without repeating the ISO import.
+`SET UP` and `PLAY` never download a runtime implicitly. If the required `runtime.cot` component is missing or unusable, the launcher directs you to **Versions** so you can choose and install a runtime explicitly. The ISO itself is never modified. After setup, the game and its active runtime can be used without repeating the ISO import.
 
 The game library can be moved later from **Launcher Settings**. Saves remain in the Windows Saved Games folder and are not moved with the library.
 
 ## Updates
 
-The launcher checks the configured update catalog when it starts. Available updates are shown in the title bar and on the **Versions** page, where you can also run a manual check.
+The launcher checks the configured update catalog when it starts. Components that need attention are marked on the affected game and on the **Versions** tab, where you can also run a manual check.
 
 MojoRecomp updates are split into independent components:
 
 | Component | Update behavior |
 | --- | --- |
-| MojoRecomp Launcher | Downloads and verifies the new portable launcher package. Close the running launcher before replacing the current launcher files. |
-| Game runtime | Downloads, verifies, and activates the new version without reinstalling the game. The game must be closed while updating. |
+| MojoRecomp Launcher | **Versions** highlights the latest launcher release and retains older compatible launcher releases when they are present in the catalog. The selected portable package is downloaded and verified; close the running launcher before replacing the current launcher files. |
+| Game runtime | **Versions** shows the latest compatible release and any retained older compatible releases. The user explicitly chooses which runtime to download, verify, and activate. The game must be closed while changing versions. |
 | Localization Pack | Downloads and verifies independently from the runtime. Apply or reinstall it from **Game Settings** when the launcher indicates that it is required. |
 
-Runtime and Localization Pack updates are installed into versioned component directories. Interrupted installations are recovered safely, and the previous version can be rolled back from **Versions** after an update.
+Runtime and Localization Pack updates are installed into versioned component directories. Interrupted installations are recovered safely. Launcher and runtime releases can be selected explicitly from **Versions**; runtime rollback can also restore the previous active version after an update.
 
 An internet connection is needed to check for and download new or missing managed components. A previously installed game with a valid active runtime can continue to launch when the update service is unavailable.
 
@@ -192,7 +194,7 @@ Some OBS and Streamlabs Vulkan capture hooks can corrupt the runtime during star
 
 ## Distribution
 
-The normal user download is the portable Windows x64 launcher. Game runtimes and Localization Packs are distributed as separately versioned components and are downloaded, verified, installed, repaired, and rolled back through the launcher. The standalone runtime asset exists for component delivery and does not need to be downloaded manually for normal setup.
+The normal user download is the portable Windows x64 launcher. Game runtimes and Localization Packs are distributed as separately versioned components and are downloaded, verified, installed, repaired, and rolled back through the launcher. Runtime selection and installation are explicit user actions on the **Versions** page; users do not need to download runtime ZIPs manually outside the launcher.
 
 Release packages are written to the ignored `.release\` directory with the portable launcher, runtime component, update catalog, checksums, and one versioned LGPL corresponding-source archive covering the replaceable FFmpeg and libmspack libraries.
 
