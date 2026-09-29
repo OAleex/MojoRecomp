@@ -35,6 +35,7 @@
 #include "../kernel/klog.h"
 #include "../host/host_paths.h"
 #include "../host/system_font_atlas.h"
+#include "../subtitles/subtitle_runtime.h"
 #include "pm4.h"
 #include "shader_cache.h"
 #include "shader_translator.h"
@@ -9931,11 +9932,19 @@ bool PrepareDebugOverlayAssets()
     {
         const uint32_t cellX = (i % kOverlayAtlasColumns) * kOverlayCellSize;
         const uint32_t cellY = (i / kOverlayAtlasColumns) * kOverlayCellSize;
-        g_overlayGlyphs[i].u0 = float(cellX) / float(kOverlayAtlasWidth);
-        g_overlayGlyphs[i].v0 = float(cellY) / float(kOverlayAtlasHeight);
-        g_overlayGlyphs[i].u1 = float(cellX + kOverlayCellSize) /
+        // Sample from texel centers rather than the exact cell boundary. The
+        // atlas has adjacent glyph cells and uses linear filtering, so sampling
+        // on a boundary can blend coverage from the neighboring glyph. This was
+        // mostly invisible at the original debug-overlay size but became obvious
+        // as small black fragments around the larger outlined subtitles.
+        constexpr float kGlyphUvInset = 0.5f;
+        g_overlayGlyphs[i].u0 = (float(cellX) + kGlyphUvInset) /
                                 float(kOverlayAtlasWidth);
-        g_overlayGlyphs[i].v1 = float(cellY + kOverlayCellSize) /
+        g_overlayGlyphs[i].v0 = (float(cellY) + kGlyphUvInset) /
+                                float(kOverlayAtlasHeight);
+        g_overlayGlyphs[i].u1 = (float(cellX + kOverlayCellSize) - kGlyphUvInset) /
+                                float(kOverlayAtlasWidth);
+        g_overlayGlyphs[i].v1 = (float(cellY + kOverlayCellSize) - kGlyphUvInset) /
                                 float(kOverlayAtlasHeight);
         g_overlayGlyphs[i].advance = fontAtlas.advances[i];
     }
@@ -10322,11 +10331,88 @@ void AppendDebugOverlayText(std::vector<OverlayVertex>& vertices,
     }
 }
 
+std::array<float, 4> SubtitleSpeakerColor(std::string_view speaker)
+{
+    // Speaker-specific colors can be added here later. Unknown/new speakers
+    // deliberately fall back to the MojoRecomp blue so untranslated or newly
+    // catalogued dialogue always has a coherent default treatment.
+    (void)speaker;
+    return {92.0f / 255.0f, 202.0f / 255.0f, 1.0f, 1.0f};
+}
+
+void AppendOutlinedSubtitleText(std::vector<OverlayVertex>& vertices,
+                                const char* text, float x, float y, float scale,
+                                float resolutionScale,
+                                const std::array<float, 4>& color)
+{
+    if (!text || !*text)
+        return;
+
+    const std::array<float, 4> outline{0.02f, 0.025f, 0.02f, 0.97f};
+    const std::array<float, 4> shadow{0.0f, 0.0f, 0.0f, 0.72f};
+    const float radius = std::max(1.5f, 3.0f * resolutionScale);
+    const float shadowOffset = std::max(2.0f, 4.0f * resolutionScale);
+
+    // A separate drop shadow gives the subtitle a little depth while the
+    // eight-direction outline keeps it readable over Crash's very bright,
+    // saturated scenery without needing a backing plate.
+    AppendDebugOverlayText(vertices, text, x + shadowOffset, y + shadowOffset,
+                           scale, shadow);
+    static constexpr std::array<std::array<float, 2>, 8> directions{{
+        {{-1.0f,  0.0f}}, {{ 1.0f,  0.0f}}, {{ 0.0f, -1.0f}}, {{ 0.0f,  1.0f}},
+        {{-0.70710678f, -0.70710678f}}, {{ 0.70710678f, -0.70710678f}},
+        {{-0.70710678f,  0.70710678f}}, {{ 0.70710678f,  0.70710678f}},
+    }};
+    for (const auto& direction : directions)
+    {
+        AppendDebugOverlayText(vertices, text,
+                               x + direction[0] * radius,
+                               y + direction[1] * radius,
+                               scale, outline);
+    }
+    AppendDebugOverlayText(vertices, text, x, y, scale, color);
+}
+
+std::vector<std::string> WrapOverlayText(std::string_view text, float scale,
+                                         float maxWidth)
+{
+    std::vector<std::string> lines;
+    std::string current;
+    size_t position = 0;
+    while (position < text.size())
+    {
+        while (position < text.size() && text[position] == ' ')
+            ++position;
+        if (position >= text.size())
+            break;
+        const size_t end = text.find(' ', position);
+        const std::string_view word = text.substr(
+            position, end == std::string_view::npos ? text.size() - position : end - position);
+        std::string candidate = current;
+        if (!candidate.empty())
+            candidate.push_back(' ');
+        candidate.append(word);
+        if (!current.empty() && DebugOverlayTextWidth(candidate.c_str(), scale) > maxWidth)
+        {
+            lines.push_back(std::move(current));
+            current.assign(word);
+        }
+        else
+            current = std::move(candidate);
+        position = end == std::string_view::npos ? text.size() : end + 1u;
+    }
+    if (!current.empty())
+        lines.push_back(std::move(current));
+    return lines;
+}
+
 bool DrawDebugOverlay(uint32_t imageIndex, VkImageLayout currentLayout)
 {
     const auto snapshot = mojorecomp::debug::GetOverlaySnapshot();
     const auto text = mojorecomp::debug::BuildOverlayText(snapshot);
-    if (!text.visible || imageIndex >= g_swapViews.size() ||
+    const auto subtitle = mojorecomp::subtitles::GetSnapshot();
+    const bool subtitleVisible = subtitle.visible && subtitle.text[0];
+    if ((!text.visible && !subtitleVisible) || imageIndex >= g_swapViews.size() ||
         !g_swapViews[imageIndex])
         return false;
     if (!EnsureDebugOverlayResources())
@@ -10343,25 +10429,96 @@ bool DrawDebugOverlay(uint32_t imageIndex, VkImageLayout currentLayout)
     const float shadowOffset = std::max(1.0f, 1.5f * scale);
 
     std::vector<OverlayVertex> vertices;
-    vertices.reserve(1536);
+    vertices.reserve(4096);
     const float leftY = float(g_outputExtent.height) - margin - glyphHeight;
-    AppendDebugOverlayText(vertices, text.left.data(), margin + shadowOffset,
-                           leftY + shadowOffset, scale, shadow);
-    AppendDebugOverlayText(vertices, text.left.data(), margin, leftY,
-                           scale, watermark);
+    if (text.visible)
+    {
+        AppendDebugOverlayText(vertices, text.left.data(), margin + shadowOffset,
+                               leftY + shadowOffset, scale, shadow);
+        AppendDebugOverlayText(vertices, text.left.data(), margin, leftY,
+                               scale, watermark);
+    }
 
     const float bottomY = float(g_outputExtent.height) - margin - glyphHeight;
-    for (uint32_t i = 0; i < text.rightCount; ++i)
+    if (text.visible)
     {
-        const char* line = text.right[i].data();
-        const float width = DebugOverlayTextWidth(line, scale);
-        const float x = std::max(margin,
-            float(g_outputExtent.width) - margin - width);
-        const float y = bottomY -
-            float(text.rightCount - 1u - i) * lineAdvance;
-        AppendDebugOverlayText(vertices, line, x + shadowOffset,
-                               y + shadowOffset, scale, shadow);
-        AppendDebugOverlayText(vertices, line, x, y, scale, foreground);
+        for (uint32_t i = 0; i < text.rightCount; ++i)
+        {
+            const char* line = text.right[i].data();
+            const float width = DebugOverlayTextWidth(line, scale);
+            const float x = std::max(margin,
+                float(g_outputExtent.width) - margin - width);
+            const float y = bottomY -
+                float(text.rightCount - 1u - i) * lineAdvance;
+            AppendDebugOverlayText(vertices, line, x + shadowOffset,
+                                   y + shadowOffset, scale, shadow);
+            AppendDebugOverlayText(vertices, line, x, y, scale, foreground);
+        }
+    }
+
+    if (subtitleVisible)
+    {
+        // Subtitle styling is intentionally independent from the debug overlay.
+        // The selected "Mojo Blue" treatment targets a native ~32 px Segoe UI
+        // Semibold appearance at 1080p and scales from output height. Width is
+        // constrained to a centered 16:9-safe region so 21:9 output gains image
+        // at the sides instead of turning dialogue into extremely long lines.
+        const float subtitleResolutionScale = std::clamp(
+            float(g_outputExtent.height) / 1080.0f, 0.60f, 2.50f);
+        const float subtitleScale = 1.60f * subtitleResolutionScale;
+        const float subtitleGlyphHeight = float(kOverlayCellSize) * subtitleScale;
+        const float safeWidth = std::min(float(g_outputExtent.width),
+                                         float(g_outputExtent.height) * (16.0f / 9.0f));
+        const float subtitleMaxWidth = safeWidth * 0.74f;
+        const float subtitleAdvance = 26.0f * subtitleScale;
+        const float subtitleBottom = float(g_outputExtent.height) -
+            112.0f * subtitleResolutionScale - subtitleGlyphHeight;
+        const std::array<float, 4> subtitleForeground{
+            248.0f / 255.0f, 251.0f / 255.0f, 1.0f, 1.0f};
+        const std::string speakerPrefix = subtitle.speaker[0]
+            ? std::string(subtitle.speaker.data()) + ": " : std::string{};
+        const auto speakerColor = SubtitleSpeakerColor(subtitle.speaker.data());
+
+        std::string combined;
+        if (subtitle.speaker[0])
+        {
+            combined.assign(subtitle.speaker.data());
+            combined.append(": ");
+        }
+        combined.append(subtitle.text.data());
+        const auto lines = WrapOverlayText(combined, subtitleScale, subtitleMaxWidth);
+        for (size_t i = 0; i < lines.size(); ++i)
+        {
+            const auto& line = lines[i];
+            const float width = DebugOverlayTextWidth(line.c_str(), subtitleScale);
+            const float x = (float(g_outputExtent.width) - width) * 0.5f;
+            const float y = subtitleBottom -
+                float(lines.size() - 1u - i) * subtitleAdvance;
+
+            if (i == 0 && !speakerPrefix.empty() &&
+                line.size() >= speakerPrefix.size() &&
+                line.compare(0, speakerPrefix.size(), speakerPrefix) == 0)
+            {
+                const std::string body = line.substr(speakerPrefix.size());
+                const float prefixWidth = DebugOverlayTextWidth(
+                    speakerPrefix.c_str(), subtitleScale);
+                AppendOutlinedSubtitleText(vertices, speakerPrefix.c_str(), x, y,
+                                           subtitleScale, subtitleResolutionScale,
+                                           speakerColor);
+                if (!body.empty())
+                {
+                    AppendOutlinedSubtitleText(vertices, body.c_str(), x + prefixWidth, y,
+                                               subtitleScale, subtitleResolutionScale,
+                                               subtitleForeground);
+                }
+            }
+            else
+            {
+                AppendOutlinedSubtitleText(vertices, line.c_str(), x, y,
+                                           subtitleScale, subtitleResolutionScale,
+                                           subtitleForeground);
+            }
+        }
     }
     if (vertices.empty())
         return false;

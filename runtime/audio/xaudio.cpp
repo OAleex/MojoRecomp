@@ -364,6 +364,12 @@ bool SubmitHostAudioFrame(const be<uint32_t>* frame)
     constexpr float kSurround = 0.70710678f;
     constexpr float kLfe = 0.0f;
     constexpr float kScale = 0.58578644f;
+    std::array<float, kChannelSamples> subtitleCenter{};
+    for (uint32_t sample = 0; sample < kChannelSamples; ++sample)
+        subtitleCenter[sample] = GuestRenderSample(frame, 2, sample);
+    mojorecomp::audio::XmaDecoderObserveRenderCenter(
+        subtitleCenter.data(), kChannelSamples, kRenderFrequency);
+
     float peak = 0.0f;
     uint32_t nonZero = 0;
     std::array<double, kRenderChannels> sumSquares{};

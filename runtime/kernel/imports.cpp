@@ -9,6 +9,7 @@
 #include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -32,9 +33,11 @@
 #include "../cpu/guest_fiber.h"
 #include "../gpu/pm4.h"
 #include "../host/input.h"
+#include "../subtitles/subtitle_runtime.h"
 #include "guestcall.h"
 #include "heap.h"
 #include "memory.h"
+#include "rcf_diagnostics.h"
 #include "unimplemented.h"
 #include "vfs.h"
 #include "xex_loader.h"
@@ -49,6 +52,19 @@ struct MojoLastIndirectCallRecord
 };
 
 thread_local MojoLastIndirectCallRecord g_mojoLastIndirectCallRecord;
+
+bool HasRcfExtension(std::string_view path)
+{
+    if (path.size() < 4)
+        return false;
+    const auto lower = [](char value) {
+        return value >= 'A' && value <= 'Z' ? char(value - 'A' + 'a') : value;
+    };
+    const size_t at = path.size() - 4;
+    return path[at] == '.' && lower(path[at + 1]) == 'r' &&
+           lower(path[at + 2]) == 'c' && lower(path[at + 3]) == 'f';
+}
+
 }
 
 extern "C" void MojoRecompTraceIndirectCall(uint32_t target, uint32_t lr, uint32_t object)
@@ -1880,10 +1896,54 @@ uint32_t NtReadFile_x(uint32_t handle, uint32_t event, uint32_t apcRoutine,
         if (offset != 0xFFFFFFFFFFFFFFFEull)
             Seek64(file->fp, static_cast<int64_t>(offset), SEEK_SET);
     }
+    const int64_t readStart = Tell64(file->fp);
     const size_t got = std::fread(buffer, 1, length, file->fp);
     const uint32_t status = got == 0 && length != 0 ? kStatusEndOfFile : kStatusSuccess;
     iosb->Status = status;
     iosb->Information = static_cast<uint32_t>(got);
+    const bool subtitleTracking = mojorecomp::subtitles::NeedsAudioSourceTracking(
+        file->guestPath);
+    if (subtitleTracking && HasRcfExtension(file->guestPath))
+    {
+        mojorecomp::rcfdiag::EntryMatch entry;
+        std::string indexError;
+        const bool mapped = readStart >= 0 && mojorecomp::rcfdiag::FindEntry(
+            file->hostPath, static_cast<uint64_t>(readStart), entry, indexError);
+        if (mapped)
+        {
+            const uint32_t guestDestination = g_guestMemory.MapVirtual(buffer);
+            const uint32_t physicalDestination = guestDestination & 0x1FFFFFFFu;
+            if (guestDestination && got)
+            {
+                std::string logicalAsset;
+                uint32_t preferredStream = 0;
+                if (subtitleTracking)
+                {
+                    mojorecomp::rcfdiag::ResolveRsdSourceInfo(
+                        file->hostPath, entry, logicalAsset, preferredStream);
+                }
+                mojorecomp::rcfdiag::RecordLoadedRange(
+                    entry, static_cast<uint64_t>(readStart),
+                    physicalDestination, static_cast<uint32_t>(got),
+                    logicalAsset, preferredStream);
+                if (subtitleTracking && std::getenv("MOJORECOMP_SUBTITLE_DIAGNOSTICS"))
+                {
+                    static std::atomic<uint32_t> subtitleTrackReports{0};
+                    const uint32_t report = subtitleTrackReports.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (report < 32)
+                    {
+                        KLOG("Subtitle source tracked: archive='%s' entry='%s' asset='%s' "
+                             "id=%08X stream=%u phys=%08X got=%zu relative=%llu\n",
+                             file->guestPath.c_str(), entry.name.c_str(),
+                             logicalAsset.c_str(), entry.id, preferredStream,
+                             physicalDestination, got,
+                             static_cast<unsigned long long>(uint64_t(readStart) - entry.offset));
+                    }
+                }
+            }
+        }
+    }
     SignalHandleEvent(event);
     QueueCurrentThreadApc(apcRoutine, apcContext, iosb);
     return status;

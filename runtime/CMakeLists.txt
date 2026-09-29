@@ -94,6 +94,16 @@ if(BUILD_TESTING)
     add_executable(MojoRecompRenderPolicyTest tests/render_policy_test.cpp)
     add_test(NAME RenderPolicy COMMAND MojoRecompRenderPolicyTest)
     set_tests_properties(RenderPolicy PROPERTIES TIMEOUT 10 LABELS "gpu")
+    add_executable(MojoRecompDialogueCatalogTest
+        tests/dialogue_catalog_test.cpp
+        subtitles/dialogue_catalog.cpp)
+    add_test(NAME DialogueCatalog COMMAND MojoRecompDialogueCatalogTest)
+    set_tests_properties(DialogueCatalog PROPERTIES TIMEOUT 10 LABELS "subtitles")
+    add_executable(MojoRecompRcfDiagnosticsTest
+        tests/rcf_diagnostics_test.cpp
+        kernel/rcf_diagnostics.cpp)
+    add_test(NAME RcfDiagnostics COMMAND MojoRecompRcfDiagnosticsTest)
+    set_tests_properties(RcfDiagnostics PROPERTIES TIMEOUT 10 LABELS "kernel;diagnostics")
 endif()
 
 set(MOJORECOMP_VULKAN_HEADERS "${MOJORECOMP_ROOT}/thirdparty/Vulkan-Headers/include")
@@ -295,6 +305,7 @@ set(MOJORECOMP_KERNEL_SOURCES
     kernel/heap.cpp
     kernel/klog.cpp
     kernel/imports.cpp
+    kernel/rcf_diagnostics.cpp
     kernel/unimplemented.cpp
     kernel/xex_loader.cpp
     kernel/vfs.cpp
@@ -308,6 +319,8 @@ set(MOJORECOMP_KERNEL_SOURCES
     host/window.cpp
     audio/xaudio.cpp
     audio/xma_decoder.cpp
+    subtitles/dialogue_catalog.cpp
+    subtitles/subtitle_runtime.cpp
     cpu/timebase.cpp
     cpu/guest_thread.cpp
     cpu/guest_fiber.cpp

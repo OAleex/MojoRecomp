@@ -10,9 +10,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 
 #include "../kernel/klog.h"
 #include "../kernel/memory.h"
+#include "../kernel/rcf_diagnostics.h"
+#include "../subtitles/subtitle_runtime.h"
 
 #ifndef MOJORECOMP_HAS_FFMPEG
 #define MOJORECOMP_HAS_FFMPEG 0
@@ -46,6 +49,10 @@ constexpr uint32_t kSamplesPerFrame = 512;
 constexpr uint32_t kOutputBlockBytes = 256;
 constexpr uint32_t kDecoderStartPadding = 192;
 constexpr int kSampleRates[4] = {24000, 32000, 44100, 48000};
+constexpr uint32_t kSubtitleFingerprintSamples = 4096;
+constexpr float kSubtitleFingerprintRmsThreshold = 0.050f;
+constexpr float kSubtitleCorrelationThreshold = 0.60f;
+std::array<std::atomic<bool>, kContextCount> g_subtitleActive{};
 
 uint32_t LoadGuestWord(uint32_t guest, uint32_t word)
 {
@@ -299,6 +306,24 @@ struct DecoderState {
     bool carryValid{};
     uint32_t streamIndex{};
     bool streamIndexValid{};
+    std::string subtitleAsset;
+    uint32_t subtitlePreferredStream{};
+    uint64_t subtitleDecodedSamples{};
+    std::array<float, kSubtitleFingerprintSamples> subtitleFingerprint{};
+    uint32_t subtitleFingerprintCount{};
+    uint64_t subtitleFingerprintAssetStart{};
+    uint64_t subtitleFingerprintSearchStart{};
+    uint64_t subtitleFingerprintSearchEnd{};
+    double subtitleFingerprintEnergy{};
+    bool subtitleFingerprintCapturing{};
+    bool subtitleFingerprintReady{};
+    std::array<float, kSubtitleFingerprintSamples> subtitleMixRing{};
+    uint32_t subtitleMixWrite{};
+    uint32_t subtitleMixCount{};
+    uint64_t subtitleMixSamplesObserved{};
+    bool subtitleSyncLocked{};
+    int64_t subtitleMixAssetZeroSample{};
+    float subtitleBestCorrelation{};
 
     bool EnsureCodec(int rate, int ch)
     {
@@ -322,6 +347,24 @@ struct DecoderState {
         carryValid = false;
         streamIndex = 0;
         streamIndexValid = false;
+        if (!subtitleAsset.empty())
+            mojorecomp::subtitles::OnXmaPlaybackReset(subtitleAsset);
+        subtitleAsset.clear();
+        subtitlePreferredStream = 0;
+        subtitleDecodedSamples = 0;
+        subtitleFingerprintCount = 0;
+        subtitleFingerprintAssetStart = 0;
+        subtitleFingerprintSearchStart = 0;
+        subtitleFingerprintSearchEnd = 0;
+        subtitleFingerprintEnergy = 0.0;
+        subtitleFingerprintCapturing = false;
+        subtitleFingerprintReady = false;
+        subtitleMixWrite = 0;
+        subtitleMixCount = 0;
+        subtitleMixSamplesObserved = 0;
+        subtitleSyncLocked = false;
+        subtitleMixAssetZeroSample = 0;
+        subtitleBestCorrelation = 0.0f;
         return true;
     }
 
@@ -334,10 +377,30 @@ struct DecoderState {
 
     void Reset()
     {
+        if (!subtitleAsset.empty())
+            mojorecomp::subtitles::OnXmaPlaybackReset(subtitleAsset);
         if (codecContext) avcodec_free_context(&codecContext);
         sampleRate = channels = 0;
         pcmAt = pcmBytes = 0;
         carryValid = false;
+        streamIndex = 0;
+        streamIndexValid = false;
+        subtitleAsset.clear();
+        subtitlePreferredStream = 0;
+        subtitleDecodedSamples = 0;
+        subtitleFingerprintCount = 0;
+        subtitleFingerprintAssetStart = 0;
+        subtitleFingerprintSearchStart = 0;
+        subtitleFingerprintSearchEnd = 0;
+        subtitleFingerprintEnergy = 0.0;
+        subtitleFingerprintCapturing = false;
+        subtitleFingerprintReady = false;
+        subtitleMixWrite = 0;
+        subtitleMixCount = 0;
+        subtitleMixSamplesObserved = 0;
+        subtitleSyncLocked = false;
+        subtitleMixAssetZeroSample = 0;
+        subtitleBestCorrelation = 0.0f;
     }
 
     ~DecoderState()
@@ -349,6 +412,156 @@ struct DecoderState {
 };
 
 std::array<DecoderState, kContextCount> g_states;
+
+void ResetSubtitleSyncState(DecoderState& state)
+{
+    state.subtitleDecodedSamples = 0;
+    state.subtitleFingerprintCount = 0;
+    state.subtitleFingerprintAssetStart = 0;
+    state.subtitleFingerprintSearchStart = 0;
+    state.subtitleFingerprintSearchEnd = 0;
+    state.subtitleFingerprintEnergy = 0.0;
+    state.subtitleFingerprintCapturing = false;
+    state.subtitleFingerprintReady = false;
+    state.subtitleMixWrite = 0;
+    state.subtitleMixCount = 0;
+    state.subtitleMixSamplesObserved = 0;
+    state.subtitleSyncLocked = false;
+    state.subtitleMixAssetZeroSample = 0;
+    state.subtitleBestCorrelation = 0.0f;
+}
+
+float ReadLogicalPcmChannel0(const DecoderState& state, uint32_t channels,
+                             uint32_t sample)
+{
+    const uint32_t at = sample * channels * 2u;
+    const uint16_t bits = (uint16_t(state.pcm[at]) << 8) |
+                          uint16_t(state.pcm[at + 1]);
+    return float(static_cast<int16_t>(bits)) / 32768.0f;
+}
+
+void CaptureSubtitleFingerprint(DecoderState& state, const ContextView& c,
+                                uint32_t contextId)
+{
+    if (state.subtitleAsset.empty() || !state.streamIndexValid ||
+        state.streamIndex != state.subtitlePreferredStream ||
+        state.subtitleFingerprintReady)
+        return;
+
+    const uint32_t channels = c.Stereo() ? 2u : 1u;
+    const uint64_t frameStart = state.subtitleDecodedSamples;
+    const uint64_t frameEnd = frameStart + kSamplesPerFrame;
+
+    if (!state.subtitleFingerprintCapturing &&
+        state.subtitleFingerprintSearchStart &&
+        frameEnd <= state.subtitleFingerprintSearchStart)
+    {
+        state.subtitleDecodedSamples += kSamplesPerFrame;
+        return;
+    }
+
+    uint32_t captureStartSample = 0;
+    if (!state.subtitleFingerprintCapturing &&
+        state.subtitleFingerprintSearchStart > frameStart)
+    {
+        captureStartSample = static_cast<uint32_t>(
+            std::min<uint64_t>(kSamplesPerFrame,
+                               state.subtitleFingerprintSearchStart - frameStart));
+    }
+
+    if (!state.subtitleFingerprintCapturing)
+    {
+        double sumSquares = 0.0;
+        uint32_t measured = 0;
+        for (uint32_t sample = captureStartSample; sample < kSamplesPerFrame; ++sample)
+        {
+            const float value = ReadLogicalPcmChannel0(state, channels, sample);
+            sumSquares += double(value) * double(value);
+            ++measured;
+        }
+        const float rms = measured
+            ? float(std::sqrt(sumSquares / double(measured)))
+            : 0.0f;
+        const bool insideCue = !state.subtitleFingerprintSearchEnd ||
+                               frameStart < state.subtitleFingerprintSearchEnd;
+        if (insideCue && rms >= kSubtitleFingerprintRmsThreshold)
+        {
+            state.subtitleFingerprintCapturing = true;
+            state.subtitleFingerprintAssetStart = frameStart + captureStartSample;
+            if (std::getenv("MOJORECOMP_SUBTITLE_DIAGNOSTICS"))
+            {
+                KLOG("Subtitle fingerprint start: asset='%s' ctx=%u sample=%llu ms=%llu rms=%.5f\n",
+                     state.subtitleAsset.c_str(), contextId,
+                     static_cast<unsigned long long>(state.subtitleFingerprintAssetStart),
+                     static_cast<unsigned long long>(state.subtitleFingerprintAssetStart * 1000ull /
+                                                     uint64_t(state.sampleRate)),
+                     double(rms));
+            }
+        }
+    }
+
+    if (state.subtitleFingerprintCapturing)
+    {
+        for (uint32_t sample = captureStartSample;
+             sample < kSamplesPerFrame &&
+             state.subtitleFingerprintCount < kSubtitleFingerprintSamples;
+             ++sample)
+        {
+            const float value = ReadLogicalPcmChannel0(state, channels, sample);
+            state.subtitleFingerprint[state.subtitleFingerprintCount++] = value;
+            state.subtitleFingerprintEnergy += double(value) * double(value);
+        }
+        if (state.subtitleFingerprintCount == kSubtitleFingerprintSamples)
+        {
+            state.subtitleFingerprintReady = state.subtitleFingerprintEnergy > 1e-6;
+            if (state.subtitleFingerprintReady &&
+                std::getenv("MOJORECOMP_SUBTITLE_DIAGNOSTICS"))
+            {
+                KLOG("Subtitle fingerprint ready: asset='%s' ctx=%u start_ms=%llu samples=%u\n",
+                     state.subtitleAsset.c_str(), contextId,
+                     static_cast<unsigned long long>(state.subtitleFingerprintAssetStart * 1000ull /
+                                                     uint64_t(state.sampleRate)),
+                     state.subtitleFingerprintCount);
+            }
+        }
+    }
+
+    state.subtitleDecodedSamples += kSamplesPerFrame;
+}
+
+float SubtitleCorrelation(const DecoderState& state)
+{
+    if (!state.subtitleFingerprintReady ||
+        state.subtitleMixCount < kSubtitleFingerprintSamples)
+        return 0.0f;
+
+    double referenceMean = 0.0;
+    double mixMean = 0.0;
+    for (uint32_t index = 0; index < kSubtitleFingerprintSamples; ++index)
+    {
+        referenceMean += state.subtitleFingerprint[index];
+        mixMean += state.subtitleMixRing[
+            (state.subtitleMixWrite + index) % kSubtitleFingerprintSamples];
+    }
+    referenceMean /= double(kSubtitleFingerprintSamples);
+    mixMean /= double(kSubtitleFingerprintSamples);
+
+    double dot = 0.0;
+    double referenceEnergy = 0.0;
+    double mixEnergy = 0.0;
+    for (uint32_t index = 0; index < kSubtitleFingerprintSamples; ++index)
+    {
+        const double reference = double(state.subtitleFingerprint[index]) - referenceMean;
+        const double mixed = double(state.subtitleMixRing[
+            (state.subtitleMixWrite + index) % kSubtitleFingerprintSamples]) - mixMean;
+        dot += reference * mixed;
+        referenceEnergy += reference * reference;
+        mixEnergy += mixed * mixed;
+    }
+    if (mixEnergy <= 1e-9 || referenceEnergy <= 1e-9)
+        return 0.0f;
+    return float(dot / std::sqrt(referenceEnergy * mixEnergy));
+}
 
 bool BoundaryTraceEnabled()
 {
@@ -772,6 +985,63 @@ bool DecodeOneFrame(DecoderState& state, ContextView& c, uint32_t contextId)
         state.pcmAt = 0;
         state.pcmBytes = frameBytes;
         DumpLogicalPcm(contextId, state, c);
+
+        mojorecomp::rcfdiag::LoadedRangeMatch source;
+        const uint32_t physicalInput = c.InputPtr(current) & 0x1FFFFFFFu;
+        if (state.streamIndexValid && physicalInput &&
+            mojorecomp::rcfdiag::FindRecentLoadedRange(physicalInput, source))
+        {
+            if (state.streamIndex == source.preferredStream && !source.logicalAsset.empty())
+            {
+                if (state.subtitleAsset != source.logicalAsset)
+                {
+                    if (!state.subtitleAsset.empty())
+                        mojorecomp::subtitles::OnXmaPlaybackReset(state.subtitleAsset);
+                    g_subtitleActive[contextId].store(false, std::memory_order_release);
+                    state.subtitleAsset.clear();
+                    state.subtitlePreferredStream = source.preferredStream;
+                    ResetSubtitleSyncState(state);
+
+                    if (mojorecomp::subtitles::HasAudioAsset(source.logicalAsset))
+                    {
+                        state.subtitleAsset = source.logicalAsset;
+                        uint64_t cueStartMs = 0;
+                        uint64_t cueEndMs = 0;
+                        if (mojorecomp::subtitles::GetFirstCueTiming(
+                                state.subtitleAsset, cueStartMs, cueEndMs))
+                        {
+                            state.subtitleFingerprintSearchStart =
+                                cueStartMs * uint64_t(state.sampleRate) / 1000ull;
+                            state.subtitleFingerprintSearchEnd =
+                                cueEndMs * uint64_t(state.sampleRate) / 1000ull;
+                        }
+                        g_subtitleActive[contextId].store(true, std::memory_order_release);
+                        if (std::getenv("MOJORECOMP_SUBTITLE_DIAGNOSTICS"))
+                        {
+                            KLOG("Subtitle source armed: asset='%s' ctx=%u stream=%u cue=%llu-%llu ms\n",
+                                 state.subtitleAsset.c_str(), contextId, state.streamIndex,
+                                 static_cast<unsigned long long>(cueStartMs),
+                                 static_cast<unsigned long long>(cueEndMs));
+                        }
+                    }
+                }
+            }
+        }
+        else if (std::getenv("MOJORECOMP_SUBTITLE_DIAGNOSTICS") &&
+                 contextId < 3 && physicalInput)
+        {
+            static std::atomic<uint32_t> subtitleSourceMissReports{0};
+            const uint32_t report = subtitleSourceMissReports.fetch_add(
+                1, std::memory_order_relaxed);
+            if (report < 32)
+            {
+                KLOG("Subtitle XMA source miss: ctx=%u phys=%08X streamvalid=%u stream=%u\n",
+                     contextId, physicalInput, state.streamIndexValid ? 1u : 0u,
+                     state.streamIndex);
+            }
+        }
+
+        CaptureSubtitleFingerprint(state, c, contextId);
     }
     else
     {
@@ -803,6 +1073,7 @@ void XmaDecoderReset(uint32_t contextId)
 {
 #if MOJORECOMP_HAS_FFMPEG
     if (contextId >= kContextCount) return;
+    g_subtitleActive[contextId].store(false, std::memory_order_release);
     std::lock_guard lock(g_states[contextId].mutex);
     g_states[contextId].Reset();
 #else
@@ -822,7 +1093,9 @@ bool XmaDecoderWork(uint32_t contextId, uint32_t contextGuest)
     DecoderState& state = g_states[contextId];
     std::lock_guard lock(state.mutex);
     ContextView c(contextGuest);
-    if (!c.OutputValid() || !c.OutputBlocks() || !c.OutputPtr()) return false;
+    if (!c.OutputBlocks() || !c.OutputPtr()) return false;
+
+    if (!c.OutputValid()) return false;
 
 
     const uint32_t capacity = c.OutputBlocks() * kOutputBlockBytes;
@@ -909,6 +1182,102 @@ bool XmaDecoderWork(uint32_t contextId, uint32_t contextGuest)
 
     c.Store();
     return didWork;
+#endif
+}
+
+void XmaDecoderObserveRenderCenter(const float* samples, uint32_t sampleCount,
+                                   uint32_t sampleRate)
+{
+#if MOJORECOMP_HAS_FFMPEG
+    if (!samples || !sampleCount || !sampleRate)
+        return;
+
+    for (uint32_t contextId = 0; contextId < kContextCount; ++contextId)
+    {
+        if (!g_subtitleActive[contextId].load(std::memory_order_acquire))
+            continue;
+        DecoderState& state = g_states[contextId];
+        std::unique_lock lock(state.mutex, std::try_to_lock);
+        if (!lock.owns_lock())
+            continue;
+        if (state.subtitleAsset.empty())
+        {
+            g_subtitleActive[contextId].store(false, std::memory_order_release);
+            continue;
+        }
+
+        if (state.sampleRate != int(sampleRate))
+            continue;
+
+        for (uint32_t sample = 0; sample < sampleCount; ++sample)
+        {
+            state.subtitleMixRing[state.subtitleMixWrite] = samples[sample];
+            state.subtitleMixWrite =
+                (state.subtitleMixWrite + 1u) % kSubtitleFingerprintSamples;
+            state.subtitleMixCount = std::min<uint32_t>(
+                state.subtitleMixCount + 1u, kSubtitleFingerprintSamples);
+            ++state.subtitleMixSamplesObserved;
+        }
+
+        if (!state.subtitleFingerprintReady)
+            continue;
+
+        if (!state.subtitleSyncLocked &&
+            state.subtitleMixCount == kSubtitleFingerprintSamples)
+        {
+            const float correlation = SubtitleCorrelation(state);
+            if (correlation > state.subtitleBestCorrelation)
+            {
+                state.subtitleBestCorrelation = correlation;
+                if (std::getenv("MOJORECOMP_SUBTITLE_DIAGNOSTICS") &&
+                    (correlation >= 0.20f || correlation + 0.05f >= kSubtitleCorrelationThreshold))
+                {
+                    KLOG("Subtitle PCM correlation: asset='%s' ctx=%u corr=%.4f mix_ms=%llu\n",
+                         state.subtitleAsset.c_str(), contextId, double(correlation),
+                         static_cast<unsigned long long>(
+                             state.subtitleMixSamplesObserved * 1000ull / sampleRate));
+                }
+            }
+
+            if (correlation >= kSubtitleCorrelationThreshold)
+            {
+                const int64_t matchedMixStart = int64_t(state.subtitleMixSamplesObserved) -
+                                                int64_t(kSubtitleFingerprintSamples);
+                state.subtitleMixAssetZeroSample = matchedMixStart -
+                    int64_t(state.subtitleFingerprintAssetStart);
+                state.subtitleSyncLocked = true;
+                if (std::getenv("MOJORECOMP_SUBTITLE_DIAGNOSTICS"))
+                {
+                    KLOG("Subtitle PCM sync lock: asset='%s' ctx=%u corr=%.4f "
+                         "fingerprint_ms=%llu mix_ms=%llu zero_delay_ms=%lld\n",
+                         state.subtitleAsset.c_str(), contextId, double(correlation),
+                         static_cast<unsigned long long>(
+                             state.subtitleFingerprintAssetStart * 1000ull / sampleRate),
+                         static_cast<unsigned long long>(
+                             state.subtitleMixSamplesObserved * 1000ull / sampleRate),
+                         static_cast<long long>(
+                             state.subtitleMixAssetZeroSample * 1000ll /
+                             int64_t(sampleRate)));
+                }
+            }
+        }
+
+        if (state.subtitleSyncLocked)
+        {
+            const int64_t assetSample = int64_t(state.subtitleMixSamplesObserved) -
+                                        state.subtitleMixAssetZeroSample;
+            if (assetSample >= 0)
+            {
+                mojorecomp::subtitles::OnXmaPlaybackPosition(
+                    state.subtitleAsset, state.streamIndex, sampleRate,
+                    static_cast<uint64_t>(assetSample));
+            }
+        }
+    }
+#else
+    (void)samples;
+    (void)sampleCount;
+    (void)sampleRate;
 #endif
 }
 

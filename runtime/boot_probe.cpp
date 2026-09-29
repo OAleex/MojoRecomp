@@ -42,6 +42,7 @@ extern "C" void MojoRecompGetLastIndirectCall(uint32_t* target, uint32_t* lr,
 #include "kernel/vfs.h"
 #include "kernel/xex_loader.h"
 #include "mojorecomp_version.h"
+#include "subtitles/subtitle_runtime.h"
 
 namespace {
 
@@ -952,6 +953,7 @@ int main(int argc, char** argv) {
         VfsSetUserRoot((options.configPath->parent_path() / "userdata").string());
     else
         VfsSetUserRoot((xex.parent_path().parent_path() / "userdata").string());
+    mojorecomp::subtitles::Initialize();
     const uint64_t imageEnd = uint64_t(image.base) + image.size;
     std::size_t copied = 0;
     for (const auto& section : image.sections) {
