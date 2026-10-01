@@ -122,7 +122,11 @@ bool CollapseTiledDrawsEnabled()
 {
     static const bool enabled = [] {
         const char* value = std::getenv("MOJORECOMP_COLLAPSE_TILED_DRAWS");
-        return !value || !*value || value[0] != '0';
+        // Keep the old collapsed-tile path available only as an explicit
+        // diagnostic. Xenos / ReXGlue execute each predicated Type-3 packet
+        // according to BIN_SELECT & BIN_MASK; collapsing three EDRAM replays
+        // into the first tile changes that command-stream semantics.
+        return value && value[0] && value[0] != '0';
     }();
     return enabled;
 }
@@ -1367,33 +1371,10 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
                 break;
         }
     }
-    // When collapsing Crash's three EDRAM tile replays into one logical host
-    // raster pass, the first replay must contain *all* raster work, not only the
-    // draws whose bin mask intersects tile 0. Normally Xenos packet predication
-    // filters those draws here, before VkPresenter ever sees them; then the host
-    // skips tile 1/2 as redundant replays and geometry that lives exclusively in
-    // those bins disappears completely. Treat raster-only packets in the first
-    // scene tile as if their bin predicate passed. Observable side effects (waits,
-    // stores, events, interrupts, resolves, etc.) keep the real predicate.
-    bool collapseFirstTileRaster = false;
-    if ((header & 1u) && CollapseTiledDrawsEnabled() &&
-        (opcode == 0x22 || opcode == 0x36 ||
-         (opcode == 0x5A && CollapseSceneExtentsEnabled())))
-    {
-        const uint64_t frame = g_frames + 1;
-        const uint32_t mode = g_registers[xenos::kRbModeControl] & 7u;
-        uint32_t tileIndex = UINT32_MAX;
-        // The first host replay represents the complete logical scene, so every
-        // draw packet belonging to this scene window must execute even if its
-        // Xenos bin predicate targets only tile 1/2. Keep this override limited
-        // to DRAW packets; forcing the surrounding predicated state can mutate
-        // the active tile/window before the draw and black out the scene.
-        collapseFirstTileRaster = (mode == 4 || mode == 5) &&
-                                  IsSceneTileWindow(tileIndex) && tileIndex == 0;
-    }
-    const bool predicated = (header & 1u) &&
-                            ((g_binMask & g_binSelect) == 0) &&
-                            !collapseFirstTileRaster;
+    // ReXGlue / Xenia Type-3 semantics: when the packet predicate bit is set,
+    // execute the packet iff at least one selected bin is enabled by the mask.
+    // Do not promote a draw from another EDRAM tile into the current replay.
+    const bool predicated = (header & 1u) && ((g_binMask & g_binSelect) == 0);
     if (predicated)
     {
         ++g_packets;
@@ -1429,8 +1410,7 @@ uint32_t ExecutePacket(uint8_t* base, const Source& fetch, uint32_t position,
             draw.packetPosition = packetPosition;
             draw.packetDepth = static_cast<uint32_t>(std::max(depth, 0));
             draw.packetHeader = header;
-            draw.predicateForced = collapseFirstTileRaster &&
-                                   ((g_binMask & g_binSelect) == 0);
+            draw.predicateForced = false;
             draw.predicated = (header & 1u) != 0;
             draw.binMask = g_binMask;
             draw.binSelect = g_binSelect;

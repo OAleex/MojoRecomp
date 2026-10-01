@@ -17,6 +17,10 @@ void PollHotkeys() {}
 DebugOverlaySnapshot GetOverlaySnapshot() noexcept { return {}; }
 }
 
+namespace mojorecomp::subtitles {
+SubtitleSnapshot GetSnapshot() { return {}; }
+}
+
 static void Require(bool value, const char* message)
 {
     if (!value) throw std::runtime_error(message);
@@ -531,6 +535,74 @@ static void CheckResolveVertexCoordinates()
                 x0, y0, x1, y1) == ResolveRectDecode::Valid && x0 == 480 && x1 == 544,
             "physical screen scissor maps to logical destination");
     std::puts("PASS: physical screen scissor 64..128 maps to logical 480..544");
+
+    // Crash's depth sweep uses a local 0..448 resolve rectangle for every
+    // physical EDRAM replay, while RB_COPY_DEST_BASE advances by 32x32 tiled
+    // macrotiles. Keep the generic Xenia rectangle decode above untouched, but
+    // verify that the host-EDRAM reconstruction layer can join tile 1/2 onto a
+    // depth snapshot that tile 0 already established in the same frame.
+    g_snapshots.clear();
+    constexpr uint32_t depthBase = 0x0A2A5000u;
+    const uint64_t resolveFrame = g_frames.load(std::memory_order_relaxed) + 1;
+    ResolveSnapshot seed{};
+    seed.key = depthBase;
+    seed.width = 1280;
+    seed.height = 720;
+    seed.depth = true;
+    seed.depthFloat24 = false;
+    seed.format = kDepthUnormFormat;
+    seed.frameSeen = resolveFrame;
+    seed.copies = 1;
+    g_snapshots.push_back(seed);
+
+    regs[xenos::kPaScScreenScissorTl] = 0;
+    regs[xenos::kPaScScreenScissorBr] = 1280u | (720u << 16);
+    regs[xenos::kRbCopyControl] = 4;
+    const float localDepthVertices[] = {0, 0, 448, 0, 448, 720};
+    CopySwapped(guest.base + 0xA0001000u,
+                reinterpret_cast<const uint8_t*>(localDepthVertices),
+                sizeof(localDepthVertices), 2);
+    for (uint32_t tile = 1; tile < 3; ++tile)
+    {
+        const uint32_t left = tile * 416u;
+        regs[xenos::kPaScWindowScissorTl] = left;
+        regs[xenos::kPaScWindowScissorBr] = (left + 448u) | (720u << 16);
+        regs[xenos::kPaScWindowOffset] = (0u - left) & 0x7FFFu;
+        regs[xenos::kRbCopyDestBase] = depthBase + MacroTileOffset(left, 0, 1280);
+
+        ResolveVertexBounds raw{};
+        uint32_t dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;
+        const auto decoded = DecodeResolveRectFromVertices(
+            guest.base, regs.data(), 1280, 720, dx0, dy0, dx1, dy1, &raw);
+        if (tile == 1)
+            Require(decoded == ResolveRectDecode::Valid && dx0 == 416 && dx1 == 448,
+                    "generic Xenia depth tile 1 remains narrowly clipped");
+        else
+            Require(decoded == ResolveRectDecode::Empty,
+                    "generic Xenia depth tile 2 remains empty");
+
+        uint32_t recoveredKey = 0;
+        Require(RecoverPhasedDepthResolve(
+                    regs.data(), 1280, 720, raw, kDepthUnormFormat, false,
+                    resolveFrame, regs[xenos::kRbCopyDestBase],
+                    dx0, dy0, dx1, dy1, recoveredKey),
+                "recover same-frame phased depth resolve");
+        Require(recoveredKey == depthBase && dx0 == left && dy0 == 0 &&
+                    dx1 == std::min(left + 448u, 1280u) && dy1 == 720,
+                "phased depth resolve logical destination");
+
+        VkImageCopy recoveredCopy{};
+        Require(ResolveCopyRegion(regs.data(), dx0, dy0, dx1, dy1, recoveredCopy) &&
+                    recoveredCopy.srcOffset.x == 0 && recoveredCopy.srcOffset.y == 0 &&
+                    recoveredCopy.dstOffset.x == int32_t(left) &&
+                    recoveredCopy.dstOffset.y == 0 &&
+                    recoveredCopy.extent.width == std::min(448u, 1280u - left) &&
+                    recoveredCopy.extent.height == 720,
+                "phased depth resolve physical-to-logical copy");
+        std::printf("PASS: phased depth tile=%u physical=0..%u logical=%u..%u key=%08X\n",
+                    tile, recoveredCopy.extent.width, dx0, dx1, recoveredKey);
+    }
+    g_snapshots.clear();
 }
 
 int main(int argc, char** argv)
@@ -726,7 +798,7 @@ int main(int argc, char** argv)
             const VkPipeline pipeline = GetPipeline(vs, ps, primitive, 15,
                                                      0x00010001u, 0x00010001u, 0, 0, 0, 4,
                                                      false, VK_SAMPLE_COUNT_1_BIT,
-                                                     kDepthUnormFormat);
+                                                     kDepthUnormFormat, false);
             Require(pipeline != VK_NULL_HANDLE, "texture pipeline");
             const VkDeviceSize shared = UploadShared(regs.data(), sampleScales);
             Require(shared != VK_WHOLE_SIZE, "shared upload");

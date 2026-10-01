@@ -1,5 +1,6 @@
 #include <cstdio>
 
+#include "../gpu/primitive_utils.h"
 #include "../gpu/render_policy.h"
 
 namespace {
@@ -14,6 +15,8 @@ int Fail(const char* message)
 
 int main()
 {
+    using mojorecomp::gpu::RectangleStripSources;
+    using mojorecomp::gpu::UsesSeparateBackfaceStencil;
     using mojorecomp::gpu::ShouldApplyConfiguredAspect;
     using mojorecomp::gpu::ShouldEnableAnisotropy;
     using mojorecomp::gpu::HasRecentPhysicalTileContent;
@@ -24,6 +27,23 @@ int main()
     using mojorecomp::gpu::ShouldPreserveNativePresentation;
     using mojorecomp::gpu::ShouldUseLogicalFirstTile;
     using mojorecomp::gpu::TextureSource;
+
+    // Xenos RECTLIST front/back classification follows the cyclic order of its
+    // three guest vertices. Host strip expansion must preserve that winding for
+    // every possible choice of the longest (diagonal) edge.
+    if (RectangleStripSources(2, 0, 1) != std::array<uint32_t, 3>{2, 0, 1} ||
+        RectangleStripSources(0, 1, 2) != std::array<uint32_t, 3>{0, 1, 2} ||
+        RectangleStripSources(1, 0, 2) != std::array<uint32_t, 3>{1, 2, 0})
+        return Fail("rectangle-list expansion reversed guest winding");
+
+    // BACKFACE_ENABLE is ignored for non-polygonal Xenos primitives. This is
+    // especially important for RECTLIST passes: their host triangle expansion
+    // must not accidentally select the guest back-face stencil function.
+    constexpr uint32_t kBackfaceEnable = 1u << 7;
+    if (UsesSeparateBackfaceStencil(false, kBackfaceEnable) ||
+        !UsesSeparateBackfaceStencil(true, kBackfaceEnable) ||
+        UsesSeparateBackfaceStencil(true, 0))
+        return Fail("back-face stencil state escaped polygonal primitives");
 
     mojorecomp::texture_abi::Fetch2D fetch{};
     fetch.mipMin = 0;
