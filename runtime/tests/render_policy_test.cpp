@@ -27,6 +27,28 @@ int main()
     using mojorecomp::gpu::ShouldPreserveNativePresentation;
     using mojorecomp::gpu::ShouldUseLogicalFirstTile;
     using mojorecomp::gpu::TextureSource;
+    using mojorecomp::gpu::EdramDepthTransferMode;
+    using mojorecomp::gpu::SelectEdramDepthTransferMode;
+    using mojorecomp::gpu::ApplyStencilBitPlane;
+
+    if (SelectEdramDepthTransferMode(true) !=
+            EdramDepthTransferMode::ShaderStencilExport ||
+        SelectEdramDepthTransferMode(false) !=
+            EdramDepthTransferMode::FixedFunctionBitPlanes)
+        return Fail("EDRAM depth transfer did not select the portable stencil fallback");
+
+    // The fallback clears the destination stencil, then sets each source bit
+    // with fixed-function REPLACE and a one-bit write mask. Exhaust all byte
+    // values so stale destination bits or an incorrect reference cannot hide.
+    for (uint32_t source = 0; source <= 0xFFu; ++source)
+    {
+        uint8_t reconstructed = 0;
+        for (uint32_t bit = 0; bit < 8; ++bit)
+            reconstructed = ApplyStencilBitPlane(reconstructed,
+                                                  static_cast<uint8_t>(source), bit);
+        if (reconstructed != source)
+            return Fail("fixed-function EDRAM stencil reconstruction lost bits");
+    }
 
     // Xenos RECTLIST front/back classification follows the cyclic order of its
     // three guest vertices. Host strip expansion must preserve that winding for

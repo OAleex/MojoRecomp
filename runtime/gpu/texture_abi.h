@@ -95,6 +95,13 @@ inline uint32_t LinearRgba8MipPitchPixels(uint32_t width)
     return RoundUp(RoundUp(width, 32u) * 4u, 256u) / 4u;
 }
 
+inline uint32_t LinearR8MipPitchPixels(uint32_t width)
+{
+    // R8 uses the same 32-texel and 256-byte Xenos linear alignment rules,
+    // but each texel occupies one byte rather than four.
+    return RoundUp(RoundUp(width, 32u), 256u);
+}
+
 inline uint32_t LinearRgba8MipStorageHeight(uint32_t height)
 {
     return RoundUp(height, 32u);
@@ -188,6 +195,67 @@ inline bool BuildLinearRgba8MipLayout(
             return false;
         levels[levelCount++] = {level, width, height,
                                 LinearRgba8MipPitchPixels(width),
+                                static_cast<uint32_t>(byteOffset),
+                                offsetX, offsetY, true};
+    }
+    return levelCount == hostMipLevels;
+}
+
+inline bool BuildLinearR8MipLayout(
+    const Fetch2D& fetch, uint32_t hostMipLevels,
+    std::array<LinearRgba8MipLayout, 16>& levels,
+    uint32_t& levelCount, bool& authoredMips)
+{
+    levelCount = 0;
+    authoredMips = false;
+    if (!hostMipLevels || hostMipLevels > levels.size() ||
+        !fetch.width || !fetch.height)
+        return false;
+
+    const uint32_t basePitch = fetch.pitch ? fetch.pitch : fetch.width;
+    if (basePitch < fetch.width)
+        return false;
+    levels[levelCount++] = {0u, fetch.width, fetch.height, basePitch,
+                            0u, 0u, 0u, false};
+
+    authoredMips = hostMipLevels > 1u && fetch.mipKey != 0u;
+    if (!authoredMips)
+        return true;
+
+    const uint32_t widthPow2 = NextPowerOfTwo(fetch.width);
+    const uint32_t heightPow2 = NextPowerOfTwo(fetch.height);
+    const bool baseWiderThanTall = widthPow2 > heightPow2;
+    uint64_t byteOffset = 0;
+    uint32_t packedMipBase = 1u;
+
+    for (; packedMipBase < hostMipLevels; ++packedMipBase)
+    {
+        const uint32_t width = widthPow2 >> packedMipBase
+            ? widthPow2 >> packedMipBase : 1u;
+        const uint32_t height = heightPow2 >> packedMipBase
+            ? heightPow2 >> packedMipBase : 1u;
+        if (fetch.packedMips && (width < height ? width : height) <= 16u)
+            break;
+
+        if (byteOffset > UINT32_MAX)
+            return false;
+        const uint32_t pitchPixels = LinearR8MipPitchPixels(width);
+        levels[levelCount++] = {packedMipBase, width, height, pitchPixels,
+                                static_cast<uint32_t>(byteOffset), 0u, 0u, true};
+        byteOffset += uint64_t(pitchPixels) * LinearRgba8MipStorageHeight(height);
+    }
+
+    for (uint32_t level = packedMipBase; level < hostMipLevels; ++level)
+    {
+        const uint32_t width = widthPow2 >> level ? widthPow2 >> level : 1u;
+        const uint32_t height = heightPow2 >> level ? heightPow2 >> level : 1u;
+        uint32_t offsetX = 0, offsetY = 0;
+        if (!PackedMipOffset(width, height, level - packedMipBase,
+                             baseWiderThanTall,
+                             offsetX, offsetY) || byteOffset > UINT32_MAX)
+            return false;
+        levels[levelCount++] = {level, width, height,
+                                LinearR8MipPitchPixels(width),
                                 static_cast<uint32_t>(byteOffset),
                                 offsetX, offsetY, true};
     }

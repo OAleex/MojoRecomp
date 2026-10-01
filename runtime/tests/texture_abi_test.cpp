@@ -140,6 +140,35 @@ int main()
         mips[9].offsetX != 4u || mips[9].offsetY != 0u)
         return 22;
 
-    std::puts("PASS: descriptor banks, fetch decode, and Xenos linear RGBA8 packed mip layout");
+    // Episode 9 uses linear R8 masks with authored packed mip chains. This is
+    // the exact fetch captured when the renderer previously gated every draw.
+    const uint32_t episode9R8Fetch[6] = {
+        0x02000002u, 0x0C21A002u, 0x000FE07Fu,
+        0x01001400u, 0x00000100u, 0x0C222A00u};
+    const auto episode9R8 = Decode(episode9R8Fetch);
+    if (episode9R8.format != 2u || episode9R8.width != 128u ||
+        episode9R8.height != 128u || episode9R8.mipMax != 4u ||
+        episode9R8.mipKey != 0x0C222000u || !episode9R8.packedMips)
+        return 24;
+    mipCount = 0;
+    authored = false;
+    if (!BuildLinearR8MipLayout(episode9R8, 5u, mips, mipCount, authored) ||
+        !authored || mipCount != 5u)
+        return 25;
+    const uint32_t expectedR8Width[5] = {128u, 64u, 32u, 16u, 8u};
+    const uint32_t expectedR8Offset[5] = {0u, 0u, 0x4000u, 0x6000u, 0x6000u};
+    const uint32_t expectedR8X[5] = {0u, 0u, 0u, 16u, 8u};
+    for (uint32_t level = 0; level < 5u; ++level)
+    {
+        const auto& mip = mips[level];
+        if (mip.width != expectedR8Width[level] ||
+            mip.height != expectedR8Width[level] ||
+            mip.pitchPixels != 256u ||
+            mip.byteOffset != expectedR8Offset[level] ||
+            mip.offsetX != expectedR8X[level] || mip.offsetY != 0u)
+            return 26 + static_cast<int>(level);
+    }
+
+    std::puts("PASS: descriptor banks, fetch decode, and Xenos linear RGBA8/R8 packed mip layouts");
     return 0;
 }

@@ -137,6 +137,8 @@ uint64_t g_sceneStitchLastIndexedFrame = 0;
 // frame numbers across separate headless runs.
 std::atomic<uint64_t> g_indexHashEventFrame{0};
 std::atomic<uint64_t> g_indexHashCaptureFrame{0};
+thread_local const char* g_texturePrepareFailure = "none";
+thread_local uint32_t g_texturePrepareFailureSlot = UINT32_MAX;
 std::atomic<uint32_t> g_indexHashCaptureSnapshotKey{UINT32_MAX};
 
 using PerfClock = std::chrono::steady_clock;
@@ -1371,7 +1373,10 @@ struct ResolveSnapshot
     bool presentValid = false;
 };
 
-std::vector<ResolveSnapshot> g_snapshots;
+// Creation helpers return pointers that remain live while later texture slots
+// or MRT attachments may create more resources. A vector invalidates every
+// such pointer when it grows; deque preserves element addresses on push_back.
+std::deque<ResolveSnapshot> g_snapshots;
 constexpr size_t kMaxResolveSnapshots = 32;
 
 constexpr uint32_t kSnapshotCoverageTile = 32;
@@ -1473,7 +1478,7 @@ struct ColorBacking
     uint64_t lastWriteGeneration = 0;
 };
 
-std::vector<ColorBacking> g_colorBackings;
+std::deque<ColorBacking> g_colorBackings;
 uint64_t g_activeColorSurfaceKey = UINT64_MAX;
 uint64_t g_activeColor1SurfaceKey = UINT64_MAX;
 uint32_t g_activeColorInfo = UINT32_MAX;
@@ -1504,7 +1509,7 @@ struct DepthBacking
     bool initialized = false;
 };
 
-std::vector<DepthBacking> g_depthBackings;
+std::deque<DepthBacking> g_depthBackings;
 uint64_t g_activeDepthSurfaceKey = UINT64_MAX;
 bool g_activeDepthEnabled = false;
 
@@ -1542,6 +1547,13 @@ VkDescriptorSetLayout g_edramTransferSetLayout = VK_NULL_HANDLE;
 VkDescriptorPool g_edramTransferPool = VK_NULL_HANDLE;
 VkPipelineLayout g_edramTransferPipelineLayout = VK_NULL_HANDLE;
 VkShaderModule g_edramTransferVs = VK_NULL_HANDLE;
+enum class EdramTransferPass : uint8_t
+{
+    Color,
+    DepthStencilExport,
+    DepthOnly,
+    StencilBitPlanes,
+};
 struct EdramTransferPipeline
 {
     EdramOwnerKind sourceKind = EdramOwnerKind::None;
@@ -1555,6 +1567,7 @@ struct EdramTransferPipeline
     bool sourceDepthFloat24 = false;
     bool destDepthFloat24 = false;
     VkFormat destDepthFormat = VK_FORMAT_UNDEFINED;
+    EdramTransferPass pass = EdramTransferPass::Color;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkShaderModule ps = VK_NULL_HANDLE;
 };
@@ -3251,7 +3264,13 @@ bool CreateColorBacking(uint32_t surfaceInfo, uint32_t info, ColorBacking*& out)
     if (out)
         return true;
     if (g_colorBackings.size() >= 16)
+    {
+        static uint32_t reports = 0;
+        if (reports++ < 32)
+            KLOG("Vulkan EDRAM color backing capacity reached: key=%016llX count=%zu\n",
+                 static_cast<unsigned long long>(key), g_colorBackings.size());
         return false;
+    }
 
     ColorBacking backing{};
     backing.key = key;
@@ -3358,7 +3377,13 @@ bool CreateDepthBacking(uint64_t key, DepthBacking*& out)
     if (out)
         return true;
     if (g_depthBackings.size() >= 16)
+    {
+        static uint32_t reports = 0;
+        if (reports++ < 32)
+            KLOG("Vulkan EDRAM depth backing capacity reached: key=%016llX count=%zu\n",
+                 static_cast<unsigned long long>(key), g_depthBackings.size());
         return false;
+    }
 
     DepthBacking backing{};
     backing.key = key;
@@ -4306,7 +4331,7 @@ VSOut main(uint id : SV_VertexID)
 
     VkPushConstantRange range{};
     range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    range.size = sizeof(uint32_t) * 4;
+    range.size = sizeof(uint32_t) * 5;
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layoutInfo.setLayoutCount = 1;
     layoutInfo.pSetLayouts = &g_edramTransferSetLayout;
@@ -4329,7 +4354,8 @@ std::string BuildEdramTransferPixelShader(EdramOwnerKind sourceKind,
                                           uint32_t sourcePitchTiles,
                                           uint32_t destPitchTiles,
                                           bool sourceDepthFloat24,
-                                          bool destDepthFloat24)
+                                          bool destDepthFloat24,
+                                          EdramTransferPass pass)
 {
     const uint32_t srcSamples = uint32_t(sourceSamples);
     const uint32_t dstSamples = uint32_t(destSamples);
@@ -4351,6 +4377,7 @@ struct TransferPush {
     uint sourcePitchTiles;
     uint destBaseTiles;
     uint destPitchTiles;
+    uint stencilBit;
 };
 [[vk::push_constant]] ConstantBuffer<TransferPush> g_Push;
 
@@ -4546,15 +4573,30 @@ uint LoadPhysical(float4 position, uint destSample)
 }
 )";
 
-    if (destKind == EdramOwnerKind::Depth)
+    if (pass == EdramTransferPass::StencilBitPlanes)
     {
-        h << "\nstruct PSOut { float depth : SV_Depth; uint stencil : SV_StencilRef; };\n"
-             "PSOut main(float4 position : SV_Position";
+        h << "\nvoid main(float4 position : SV_Position";
         if (destSamples != VK_SAMPLE_COUNT_1_BIT)
             h << ", uint sample : SV_SampleIndex";
         h << ")\n{\n    uint destSample = "
+          << (destSamples == VK_SAMPLE_COUNT_1_BIT ? "0u" : "sample") << ";\n"
+             "    uint packed = LoadPhysical(position, destSample);\n"
+             "    if ((packed & g_Push.stencilBit) == 0u) discard;\n"
+             "}\n";
+    }
+    else if (destKind == EdramOwnerKind::Depth)
+    {
+        const bool exportStencil = pass == EdramTransferPass::DepthStencilExport;
+        if (exportStencil)
+            h << "\nstruct PSOut { float depth : SV_Depth; uint stencil : SV_StencilRef; };\n";
+        h << (exportStencil ? "PSOut" : "float")
+          << " main(float4 position : SV_Position";
+        if (destSamples != VK_SAMPLE_COUNT_1_BIT)
+            h << ", uint sample : SV_SampleIndex";
+        h << ")" << (exportStencil ? "" : " : SV_Depth")
+          << "\n{\n    uint destSample = "
           << (destSamples == VK_SAMPLE_COUNT_1_BIT ? "0u" : "sample") << ";\n";
-        if (sourceKind == EdramOwnerKind::Depth &&
+        if (exportStencil && sourceKind == EdramOwnerKind::Depth &&
             sourceDepthFloat24 == destDepthFloat24)
         {
             // Same depth encoding: only the physical pixel/sample address changes.
@@ -4575,16 +4617,17 @@ uint LoadPhysical(float4 position, uint destSample)
         else
         {
             h << "    uint packed = LoadPhysical(position, destSample);\n"
-                 "    PSOut o;\n"
-                 "    o.stencil = packed & 255u;\n"
                  "    uint d24 = (packed >> 8) & 0xFFFFFFu;\n"
                  "#if DST_DEPTH_FLOAT24\n"
-                 "    o.depth = Float20e4To32(d24) * 0.5f;\n"
+                 "    float depth = Float20e4To32(d24) * 0.5f;\n"
                  "#else\n"
-                 "    o.depth = float(d24) / 16777215.0f;\n"
-                 "#endif\n"
-                 "    return o;\n"
-                 "}\n";
+                 "    float depth = float(d24) / 16777215.0f;\n"
+                 "#endif\n";
+            if (exportStencil)
+                h << "    PSOut o; o.depth = depth; o.stencil = packed & 255u; return o;\n";
+            else
+                h << "    return depth;\n";
+            h << "}\n";
         }
     }
     else
@@ -4626,7 +4669,8 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
                                                 uint32_t destPitchTiles,
                                                 bool sourceDepthFloat24,
                                                 bool destDepthFloat24,
-                                                VkFormat destDepthFormat)
+                                                VkFormat destDepthFormat,
+                                                EdramTransferPass pass)
 {
     for (auto& rec : g_edramTransferPipelines)
         if (rec.sourceKind == sourceKind && rec.destKind == destKind &&
@@ -4637,7 +4681,7 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
             rec.destPitchTiles == destPitchTiles &&
             rec.sourceDepthFloat24 == sourceDepthFloat24 &&
             rec.destDepthFloat24 == destDepthFloat24 &&
-            rec.destDepthFormat == destDepthFormat)
+            rec.destDepthFormat == destDepthFormat && rec.pass == pass)
             return rec.pipeline ? &rec : nullptr;
 
     if (!EnsureEdramTransferInfrastructure())
@@ -4648,12 +4692,6 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
              uint32_t(destSamples));
         return nullptr;
     }
-    if (destKind == EdramOwnerKind::Depth && !g_shaderStencilExport)
-    {
-        KLOG("Vulkan EDRAM color->depth transfer needs shader stencil export\n");
-        return nullptr;
-    }
-
     const std::string hlsl = BuildEdramTransferPixelShader(sourceKind, destKind,
                                                            sourceSamples, destSamples,
                                                            sourceGuestSamples,
@@ -4661,11 +4699,11 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
                                                            sourcePitchTiles,
                                                            destPitchTiles,
                                                            sourceDepthFloat24,
-                                                           destDepthFloat24);
+                                                           destDepthFloat24, pass);
     std::vector<uint8_t> psSpv;
     std::string err;
     if (!ShaderTranslator::CompileHostHlsl(hlsl, false, psSpv, err,
-                                           destKind == EdramOwnerKind::Depth))
+                                           pass == EdramTransferPass::DepthStencilExport))
     {
         if (const char* dumpDir = std::getenv("MOJORECOMP_EDRAM_TRANSFER_SHADER_DUMP_DIR");
             dumpDir && *dumpDir)
@@ -4703,6 +4741,7 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
     rec.sourceDepthFloat24 = sourceDepthFloat24;
     rec.destDepthFloat24 = destDepthFloat24;
     rec.destDepthFormat = destDepthFormat;
+    rec.pass = pass;
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     moduleInfo.codeSize = psSpv.size();
     moduleInfo.pCode = reinterpret_cast<const uint32_t*>(psSpv.data());
@@ -4749,11 +4788,29 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
     }
 
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    if (destKind == EdramOwnerKind::Depth)
+    if (pass == EdramTransferPass::DepthStencilExport ||
+        pass == EdramTransferPass::DepthOnly)
     {
         depth.depthTestEnable = VK_TRUE;
         depth.depthWriteEnable = VK_TRUE;
         depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        depth.stencilTestEnable = pass == EdramTransferPass::DepthStencilExport;
+        if (depth.stencilTestEnable)
+        {
+            // SV_StencilRef supplies the replacement value, while the fixed-
+            // function stencil state must still admit every fragment and write
+            // all eight bits. A zero-initialized VkStencilOpState compares NEVER.
+            depth.front.failOp = VK_STENCIL_OP_REPLACE;
+            depth.front.passOp = VK_STENCIL_OP_REPLACE;
+            depth.front.depthFailOp = VK_STENCIL_OP_REPLACE;
+            depth.front.compareOp = VK_COMPARE_OP_ALWAYS;
+            depth.front.compareMask = 0xFFu;
+            depth.front.writeMask = 0xFFu;
+            depth.back = depth.front;
+        }
+    }
+    else if (pass == EdramTransferPass::StencilBitPlanes)
+    {
         depth.stencilTestEnable = VK_TRUE;
         depth.front.failOp = VK_STENCIL_OP_REPLACE;
         depth.front.passOp = VK_STENCIL_OP_REPLACE;
@@ -4764,9 +4821,16 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
         depth.back = depth.front;
     }
 
-    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const VkDynamicState dynamicStates[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+    };
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = uint32_t(std::size(dynamicStates));
+    dynamic.dynamicStateCount = pass == EdramTransferPass::StencilBitPlanes
+        ? uint32_t(std::size(dynamicStates)) : 2u;
     dynamic.pDynamicStates = dynamicStates;
 
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -5028,8 +5092,13 @@ VkDescriptorSet EnsureEdramTransferDescriptor(const EdramOwner& owner)
     ai.descriptorPool = g_edramTransferPool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &g_edramTransferSetLayout;
-    if (p_vkAllocateDescriptorSets(g_device, &ai, descriptor) != VK_SUCCESS)
+    const VkResult result = p_vkAllocateDescriptorSets(g_device, &ai, descriptor);
+    if (result != VK_SUCCESS)
+    {
+        KLOG("Vulkan EDRAM transfer descriptor allocation failed (%d): kind=%u key=%016llX\n",
+             result, uint32_t(owner.kind), static_cast<unsigned long long>(owner.key));
         return VK_NULL_HANDLE;
+    }
 
     VkDescriptorImageInfo images[2]{};
     VkWriteDescriptorSet writes[2]{};
@@ -5189,14 +5258,44 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
         source.kind == EdramOwnerKind::Depth && ((source.info >> 16) & 1u) != 0;
     const bool destDepthFloat24 =
         dest.kind == EdramOwnerKind::Depth && ((dest.info >> 16) & 1u) != 0;
+    const auto depthTransferMode = mojorecomp::gpu::SelectEdramDepthTransferMode(
+        g_shaderStencilExport);
+    const EdramTransferPass mainPass = dest.kind == EdramOwnerKind::Color
+        ? EdramTransferPass::Color
+        : (depthTransferMode == mojorecomp::gpu::EdramDepthTransferMode::ShaderStencilExport
+            ? EdramTransferPass::DepthStencilExport
+            : EdramTransferPass::DepthOnly);
     EdramTransferPipeline* pipeline = GetEdramTransferPipeline(
         source.kind, dest.kind, source.samples, dest.samples,
         source.guestSamples, dest.guestSamples,
         source.pitchTiles, dest.pitchTiles,
         sourceDepthFloat24, destDepthFloat24,
-        dest.kind == EdramOwnerKind::Depth ? dest.format : VK_FORMAT_UNDEFINED);
+        dest.kind == EdramOwnerKind::Depth ? dest.format : VK_FORMAT_UNDEFINED,
+        mainPass);
+    const VkPipeline mainPipeline = pipeline ? pipeline->pipeline : VK_NULL_HANDLE;
+    EdramTransferPipeline* stencilPipeline = nullptr;
+    if (dest.kind == EdramOwnerKind::Depth &&
+        depthTransferMode == mojorecomp::gpu::EdramDepthTransferMode::FixedFunctionBitPlanes)
+    {
+        static bool fallbackReported = false;
+        if (!fallbackReported)
+        {
+            fallbackReported = true;
+            KLOG("Vulkan EDRAM depth transfer fallback active: fixed-function stencil bit planes\n");
+        }
+        stencilPipeline = GetEdramTransferPipeline(
+            source.kind, dest.kind, source.samples, dest.samples,
+            source.guestSamples, dest.guestSamples,
+            source.pitchTiles, dest.pitchTiles,
+            sourceDepthFloat24, destDepthFloat24, dest.format,
+            EdramTransferPass::StencilBitPlanes);
+    }
+    const VkPipeline stencilBitPlanePipeline = stencilPipeline
+        ? stencilPipeline->pipeline : VK_NULL_HANDLE;
     const VkDescriptorSet descriptor = EnsureEdramTransferDescriptor(sourceOwner);
-    if (!pipeline || !descriptor)
+    if (!mainPipeline || !descriptor ||
+        (depthTransferMode == mojorecomp::gpu::EdramDepthTransferMode::FixedFunctionBitPlanes &&
+         dest.kind == EdramOwnerKind::Depth && !stencilBitPlanePipeline))
         return false;
 
     EndColorRendering();
@@ -5248,7 +5347,7 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     CmdSetViewportCached(g_commandBuffer, viewport);
-    CmdBindGraphicsPipelineCached(g_commandBuffer, pipeline->pipeline);
+    CmdBindGraphicsPipelineCached(g_commandBuffer, mainPipeline);
     CmdBindDescriptorSetsCached(g_commandBuffer, g_edramTransferPipelineLayout,
                                 0, 1, &descriptor);
     struct TransferPush
@@ -5257,7 +5356,8 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
         uint32_t sourcePitchTiles;
         uint32_t destBaseTiles;
         uint32_t destPitchTiles;
-    } push{source.baseTiles, source.pitchTiles, dest.baseTiles, dest.pitchTiles};
+        uint32_t stencilBit;
+    } push{source.baseTiles, source.pitchTiles, dest.baseTiles, dest.pitchTiles, 0};
     p_vkCmdPushConstants(g_commandBuffer, g_edramTransferPipelineLayout,
                          VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 
@@ -5274,6 +5374,41 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
             uint64_t(rect.extent.width) * uint64_t(rect.extent.height);
         CmdSetScissorCached(g_commandBuffer, ScaleRectToInternal(rect));
         p_vkCmdDraw(g_commandBuffer, 3, 1, 0, 0);
+    }
+
+    if (stencilBitPlanePipeline)
+    {
+        VkClearAttachment clear{};
+        clear.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        clear.clearValue.depthStencil.stencil = 0;
+        for (const VkRect2D& rect : rects)
+        {
+            if (!rect.extent.width || !rect.extent.height)
+                continue;
+            VkClearRect clearRect{};
+            clearRect.rect = ScaleRectToInternal(rect);
+            clearRect.layerCount = 1;
+            p_vkCmdClearAttachments(g_commandBuffer, 1, &clear, 1, &clearRect);
+        }
+
+        CmdBindGraphicsPipelineCached(g_commandBuffer, stencilBitPlanePipeline);
+        p_vkCmdSetStencilReference(g_commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFu);
+        p_vkCmdSetStencilCompareMask(g_commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFFu);
+        for (uint32_t bit = 0; bit < 8; ++bit)
+        {
+            push.stencilBit = 1u << bit;
+            p_vkCmdSetStencilWriteMask(g_commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                       push.stencilBit);
+            p_vkCmdPushConstants(g_commandBuffer, g_edramTransferPipelineLayout,
+                                 VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+            for (const VkRect2D& rect : rects)
+            {
+                if (!rect.extent.width || !rect.extent.height)
+                    continue;
+                CmdSetScissorCached(g_commandBuffer, ScaleRectToInternal(rect));
+                p_vkCmdDraw(g_commandBuffer, 3, 1, 0, 0);
+            }
+        }
     }
     p_vkCmdEndRendering(g_commandBuffer);
 
@@ -8093,12 +8228,147 @@ bool UpdateGuestR8Texture(GuestTexture& texture, const uint8_t* source, uint32_t
     return true;
 }
 
+bool UpdateGuestR8MipTexture(
+    GuestTexture& texture, uint8_t* guestBase,
+    const mojorecomp::texture_abi::Fetch2D& fetch,
+    const std::array<mojorecomp::texture_abi::LinearRgba8MipLayout, 16>& layout,
+    uint32_t sourceCount, bool authoredMips, uint32_t hostMipLevels,
+    size_t stagedBytes, uint64_t sourceHash)
+{
+    if (texture.sourceHash == sourceHash)
+        return true;
+
+    const VkDeviceSize uploadAt = UploadAlloc(stagedBytes, 16);
+    if (uploadAt == VK_WHOLE_SIZE)
+        return false;
+    const uint32_t baseAddress = PhysicalToCached(fetch.key);
+    const uint32_t mipBase = authoredMips ? PhysicalToCached(fetch.mipKey) : 0u;
+    std::array<VkBufferImageCopy, 16> copies{};
+    size_t tightOffset = 0;
+    for (uint32_t i = 0; i < sourceCount; ++i)
+    {
+        const auto& mip = layout[i];
+        const uint32_t addressBase = mip.mipBacking ? mipBase : baseAddress;
+        const uint64_t address = uint64_t(addressBase) + mip.byteOffset;
+        for (uint32_t y = 0; y < mip.height; ++y)
+        {
+            const uint64_t rowAddress = address +
+                uint64_t(mip.offsetY + y) * mip.pitchPixels + mip.offsetX;
+            std::memcpy(g_uploadMapped + uploadAt + tightOffset + uint64_t(y) * mip.width,
+                        guestBase + static_cast<uint32_t>(rowAddress), mip.width);
+        }
+        copies[i].bufferOffset = uploadAt + tightOffset;
+        copies[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip.level, 0, 1};
+        copies[i].imageExtent = {mip.width, mip.height, 1};
+        tightOffset += size_t(mip.width) * mip.height;
+    }
+
+    const bool resumeRendering = g_rendering;
+    if (resumeRendering)
+        EndColorRendering();
+    VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toTransfer.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout = texture.layout;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = texture.image;
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hostMipLevels, 0, 1};
+    p_vkCmdPipelineBarrier(g_commandBuffer,
+                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                           1, &toTransfer);
+    p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             sourceCount, copies.data());
+
+    if (!authoredMips)
+    {
+        uint32_t mipWidth = texture.width;
+        uint32_t mipHeight = texture.height;
+        for (uint32_t level = 1; level < hostMipLevels; ++level)
+        {
+            VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            toSource.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toSource.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toSource.srcQueueFamilyIndex = toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSource.image = texture.image;
+            toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1, 0, 1};
+            p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                   1, &toSource);
+            const uint32_t nextWidth = std::max(1u, mipWidth >> 1);
+            const uint32_t nextHeight = std::max(1u, mipHeight >> 1);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0, 1};
+            blit.srcOffsets[1] = {static_cast<int32_t>(mipWidth),
+                                  static_cast<int32_t>(mipHeight), 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+            blit.dstOffsets[1] = {static_cast<int32_t>(nextWidth),
+                                  static_cast<int32_t>(nextHeight), 1};
+            p_vkCmdBlitImage(g_commandBuffer, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             1, &blit, VK_FILTER_LINEAR);
+            mipWidth = nextWidth;
+            mipHeight = nextHeight;
+        }
+    }
+
+    std::array<VkImageMemoryBarrier, 2> toSample{};
+    uint32_t toSampleCount = 0;
+    if (authoredMips || hostMipLevels == 1u)
+    {
+        auto& direct = toSample[toSampleCount++];
+        direct.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        direct.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        direct.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        direct.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        direct.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        direct.srcQueueFamilyIndex = direct.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        direct.image = texture.image;
+        direct.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hostMipLevels, 0, 1};
+    }
+    else
+    {
+        auto& generated = toSample[toSampleCount++];
+        generated.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        generated.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        generated.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        generated.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        generated.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        generated.srcQueueFamilyIndex = generated.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        generated.image = texture.image;
+        generated.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hostMipLevels - 1u, 0, 1};
+        auto& last = toSample[toSampleCount++];
+        last.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        last.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        last.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        last.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        last.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        last.srcQueueFamilyIndex = last.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        last.image = texture.image;
+        last.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, hostMipLevels - 1u, 1, 0, 1};
+    }
+    p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           0, 0, nullptr, 0, nullptr, toSampleCount, toSample.data());
+    g_perfTextureRefreshBytesR8 += stagedBytes;
+    ++g_perfTextureRefreshCount;
+    texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    texture.sourceHash = sourceHash;
+    if (resumeRendering)
+        ResumeColorRendering();
+    return true;
+}
+
 GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
                                    const mojorecomp::texture_abi::Fetch2D& fetch)
 {
     if (!guestBase || fetch.format != 2 || fetch.dimension != 1 ||
         fetch.type != 2 || fetch.tiled || fetch.endian ||
-        fetch.mipMin || fetch.mipMax ||
+        fetch.mipMin ||
         fetch.width == 0 || fetch.height == 0 ||
         fetch.width > 4096 || fetch.height > 4096)
         return nullptr;
@@ -8118,62 +8388,134 @@ GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
                       fetch.endian, fetch.minFilter, fetch.magFilter, fetch.clampX, fetch.clampY);
     }
 
-    const uint32_t sourcePitch = fetch.pitch ? fetch.pitch : fetch.width;
-    if (sourcePitch < fetch.width)
-        return nullptr;
-    const uint64_t sourceBytes64 = uint64_t(sourcePitch) * fetch.height;
-    const uint64_t byteCount64 = uint64_t(fetch.width) * fetch.height;
-    if (byteCount64 > SIZE_MAX)
-        return nullptr;
-    const size_t byteCount = static_cast<size_t>(byteCount64);
-    const uint32_t guestAddress = PhysicalToCached(fetch.key);
-    if (!GuestRangeOk(guestAddress, sourceBytes64))
-        return nullptr;
-    const uint8_t* source = guestBase + guestAddress;
-    g_perfTextureHashBytesR8 += sourceBytes64;
-    ++g_perfTextureHashCallsR8;
-    const uint64_t sourceHash = HashGuestTextureSourceBytes(source, static_cast<size_t>(sourceBytes64));
-
-    if (auto* existing = FindGuestTexture(fetch))
+    uint32_t geometricMipMax = 0;
+    for (uint32_t w = fetch.width, h = fetch.height;
+         (w > 1u || h > 1u) && geometricMipMax < 15u; ++geometricMipMax)
     {
-        if (!UpdateGuestR8Texture(*existing, source, sourcePitch, byteCount, sourceHash))
+        w = std::max(1u, w >> 1);
+        h = std::max(1u, h >> 1);
+    }
+    const uint32_t hostMipLevels = std::min(fetch.mipMax, geometricMipMax) + 1u;
+    GuestTexture* existing = FindGuestTexture(fetch);
+    const uint64_t currentFrame = g_frames.load(std::memory_order_relaxed) + 1;
+    if (existing && existing->sourceCheckFrame == currentFrame)
+        return existing;
+    std::array<mojorecomp::texture_abi::LinearRgba8MipLayout, 16> layout{};
+    uint32_t sourceCount = 0;
+    bool authoredMips = false;
+    if (!mojorecomp::texture_abi::BuildLinearR8MipLayout(
+            fetch, hostMipLevels, layout, sourceCount, authoredMips))
+        return nullptr;
+
+    const uint32_t baseAddress = PhysicalToCached(fetch.key);
+    const uint32_t mipBase = authoredMips ? PhysicalToCached(fetch.mipKey) : 0u;
+    uint64_t sourceHash = 0xBB67AE8584CAA73Bull;
+    size_t visibleSourceBytes = 0;
+    size_t stagedBytes = 0;
+    for (uint32_t i = 0; i < sourceCount; ++i)
+    {
+        const auto& mip = layout[i];
+        const uint32_t addressBase = mip.mipBacking ? mipBase : baseAddress;
+        const uint64_t address = uint64_t(addressBase) + mip.byteOffset;
+        const size_t rowBytes = mip.width;
+        if (address > UINT32_MAX || rowBytes > SIZE_MAX - stagedBytes ||
+            uint64_t(rowBytes) * mip.height > SIZE_MAX - stagedBytes)
             return nullptr;
+        stagedBytes += rowBytes * mip.height;
+        sourceHash ^= (uint64_t(mip.level) << 56) ^
+                      (uint64_t(mip.width) << 28) ^ uint64_t(mip.height);
+        for (uint32_t y = 0; y < mip.height; ++y)
+        {
+            const uint64_t rowAddress = address +
+                uint64_t(mip.offsetY + y) * mip.pitchPixels + mip.offsetX;
+            if (rowAddress > UINT32_MAX ||
+                !GuestRangeOk(static_cast<uint32_t>(rowAddress), rowBytes))
+                return nullptr;
+            const uint64_t rowHash = HashGuestTextureSourceBytes(
+                guestBase + static_cast<uint32_t>(rowAddress), rowBytes);
+            sourceHash ^= rowHash + 0x9E3779B97F4A7C15ull +
+                          (sourceHash << 6) + (sourceHash >> 2);
+            visibleSourceBytes += rowBytes;
+        }
+    }
+    g_perfTextureHashBytesR8 += visibleSourceBytes;
+    ++g_perfTextureHashCallsR8;
+
+    if (existing)
+    {
+        if (hostMipLevels == 1u)
+        {
+            const uint32_t sourcePitch = fetch.pitch ? fetch.pitch : fetch.width;
+            const uint8_t* source = guestBase + baseAddress;
+            const size_t byteCount = size_t(fetch.width) * fetch.height;
+            if (!UpdateGuestR8Texture(*existing, source, sourcePitch, byteCount, sourceHash))
+                return nullptr;
+        }
+        else if (!UpdateGuestR8MipTexture(*existing, guestBase, fetch, layout,
+                                          sourceCount, authoredMips, hostMipLevels,
+                                          stagedBytes, sourceHash))
+        {
+            return nullptr;
+        }
+        existing->sourceCheckFrame = currentFrame;
         return existing;
     }
 
-    const VkDeviceSize uploadAt = UploadAlloc(byteCount, 16);
+    const VkDeviceSize uploadAt = UploadAlloc(stagedBytes, 16);
     if (uploadAt == VK_WHOLE_SIZE)
     {
         static uint32_t r8UploadFailReports = 0;
         if (r8UploadFailReports++ < 8)
             KLOG("Vulkan guest R8 upload arena exhausted: key=%08X size=%ux%u bytes=%zu at=%llu limit=%llu\n",
-                 fetch.key, fetch.width, fetch.height, byteCount,
+                 fetch.key, fetch.width, fetch.height, stagedBytes,
                  static_cast<unsigned long long>(g_uploadAt),
                  static_cast<unsigned long long>(g_uploadLimit));
         return nullptr;
     }
-    uint8_t* upload = g_uploadMapped + uploadAt;
-    for (uint32_t y = 0; y < fetch.height; ++y)
-        std::memcpy(upload + uint64_t(y) * fetch.width,
-                    source + uint64_t(y) * sourcePitch, fetch.width);
+    std::array<VkBufferImageCopy, 16> copies{};
+    size_t tightOffset = 0;
+    for (uint32_t i = 0; i < sourceCount; ++i)
+    {
+        const auto& mip = layout[i];
+        const uint32_t addressBase = mip.mipBacking ? mipBase : baseAddress;
+        const uint64_t address = uint64_t(addressBase) + mip.byteOffset;
+        for (uint32_t y = 0; y < mip.height; ++y)
+        {
+            const uint64_t rowAddress = address +
+                uint64_t(mip.offsetY + y) * mip.pitchPixels + mip.offsetX;
+            std::memcpy(g_uploadMapped + uploadAt + tightOffset + uint64_t(y) * mip.width,
+                        guestBase + static_cast<uint32_t>(rowAddress), mip.width);
+        }
+        copies[i].bufferOffset = uploadAt + tightOffset;
+        copies[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip.level, 0, 1};
+        copies[i].imageExtent = {mip.width, mip.height, 1};
+        tightOffset += size_t(mip.width) * mip.height;
+    }
 
     GuestTexture texture{};
     texture.key = fetch.key;
     texture.width = fetch.width;
     texture.height = fetch.height;
+    texture.pitch = fetch.pitch ? fetch.pitch : fetch.width;
     texture.format = fetch.format;
     texture.swizzle = fetch.swizzle;
     texture.endian = fetch.endian;
+    texture.mipKey = fetch.mipMax ? fetch.mipKey : 0u;
+    texture.mipMax = fetch.mipMax;
+    texture.packedMips = fetch.mipMax && fetch.packedMips;
+    texture.sourceCheckFrame = currentFrame;
 
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = VK_FORMAT_R8_UNORM;
     ii.extent = {fetch.width, fetch.height, 1};
-    ii.mipLevels = 1;
+    ii.mipLevels = hostMipLevels;
     ii.arrayLayers = 1;
     ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (hostMipLevels > 1u && !authoredMips)
+        ii.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (p_vkCreateImage(g_device, &ii, nullptr, &texture.image) != VK_SUCCESS)
@@ -8204,7 +8546,7 @@ GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
     vi.format = VK_FORMAT_R8_UNORM;
     vi.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
                      VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hostMipLevels, 0, 1};
     if (p_vkCreateImageView(g_device, &vi, nullptr, &texture.view) != VK_SUCCESS)
     {
         p_vkDestroyImage(g_device, texture.image, nullptr);
@@ -8222,39 +8564,99 @@ GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
     toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     toTransfer.srcQueueFamilyIndex = toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toTransfer.image = texture.image;
-    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hostMipLevels, 0, 1};
     p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
                            1, &toTransfer);
 
-    VkBufferImageCopy copy{};
-    copy.bufferOffset = uploadAt;
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {fetch.width, fetch.height, 1};
     p_vkCmdCopyBufferToImage(g_commandBuffer, g_uploadBuffer, texture.image,
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    g_perfTextureUploadBytesR8 += byteCount;
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             sourceCount, copies.data());
+    g_perfTextureUploadBytesR8 += stagedBytes;
     ++g_perfTextureUploadCount;
 
-    VkImageMemoryBarrier toSample{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toSample.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toSample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    toSample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toSample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    toSample.srcQueueFamilyIndex = toSample.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSample.image = texture.image;
-    toSample.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (!authoredMips)
+    {
+        uint32_t mipWidth = fetch.width;
+        uint32_t mipHeight = fetch.height;
+        for (uint32_t level = 1; level < hostMipLevels; ++level)
+        {
+            VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            toSource.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toSource.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toSource.srcQueueFamilyIndex = toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSource.image = texture.image;
+            toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 1, 0, 1};
+            p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                   1, &toSource);
+            const uint32_t nextWidth = std::max(1u, mipWidth >> 1);
+            const uint32_t nextHeight = std::max(1u, mipHeight >> 1);
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1u, 0, 1};
+            blit.srcOffsets[1] = {static_cast<int32_t>(mipWidth),
+                                  static_cast<int32_t>(mipHeight), 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+            blit.dstOffsets[1] = {static_cast<int32_t>(nextWidth),
+                                  static_cast<int32_t>(nextHeight), 1};
+            p_vkCmdBlitImage(g_commandBuffer, texture.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             1, &blit, VK_FILTER_LINEAR);
+            mipWidth = nextWidth;
+            mipHeight = nextHeight;
+        }
+    }
+
+    std::array<VkImageMemoryBarrier, 2> toSample{};
+    uint32_t toSampleCount = 0;
+    if (authoredMips || hostMipLevels == 1u)
+    {
+        auto& direct = toSample[toSampleCount++];
+        direct.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        direct.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        direct.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        direct.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        direct.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        direct.srcQueueFamilyIndex = direct.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        direct.image = texture.image;
+        direct.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hostMipLevels, 0, 1};
+    }
+    else
+    {
+        auto& generated = toSample[toSampleCount++];
+        generated.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        generated.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        generated.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        generated.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        generated.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        generated.srcQueueFamilyIndex = generated.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        generated.image = texture.image;
+        generated.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, hostMipLevels - 1u, 0, 1};
+        auto& last = toSample[toSampleCount++];
+        last.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        last.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        last.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        last.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        last.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        last.srcQueueFamilyIndex = last.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        last.image = texture.image;
+        last.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, hostMipLevels - 1u, 1, 0, 1};
+    }
     p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                           0, 0, nullptr, 0, nullptr, 1, &toSample);
+                           0, 0, nullptr, 0, nullptr, toSampleCount, toSample.data());
     texture.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     texture.sourceHash = sourceHash;
     if (resumeRendering)
         ResumeColorRendering();
 
     RememberGuestTexture(fetch, texture);
-    KLOG_DIAG("Vulkan guest texture uploaded: base=%08X format=R8 size=%ux%u swizzle=RRR1\n",
-         fetch.key, fetch.width, fetch.height);
+    KLOG_DIAG("Vulkan guest texture uploaded: base=%08X format=R8 size=%ux%u "
+              "levels=%u authored=%u swizzle=RRR1\n",
+              fetch.key, fetch.width, fetch.height, hostMipLevels,
+              authoredMips ? 1u : 0u);
     return &g_guestTextures.back();
 }
 
@@ -9463,6 +9865,13 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                                     std::array<float, kTextureSlots>& sampleScales,
                                     bool includePixelShader)
 {
+    g_texturePrepareFailure = "none";
+    g_texturePrepareFailureSlot = UINT32_MAX;
+    const auto fail = [](const char* reason, uint32_t slot = UINT32_MAX) -> const TextureBundle* {
+        g_texturePrepareFailure = reason;
+        g_texturePrepareFailureSlot = slot;
+        return nullptr;
+    };
     sampleScales.fill(1.0f);
     constexpr uint64_t kFrontProbePs = 0x89B4E4C8E904ABD5ull;
     const bool probeFrontPass = includePixelShader && ps.hash == kFrontProbePs;
@@ -9491,12 +9900,14 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
         if (!shader) continue;
         if (!shader->usesTextures) continue;
         if (shader->textureSlots.empty() || shader->textureSlots.size() != shader->textureDimensions.size())
-            return nullptr;
+            return fail("shader-texture-metadata");
         for (size_t i = 0; i < shader->textureSlots.size(); ++i)
         {
             const uint32_t slot = shader->textureSlots[i];
-            if (slot >= kTextureSlots || shader->textureDimensions[i] != 1)
-                return nullptr;
+            if (slot >= kTextureSlots)
+                return fail("shader-texture-slot", slot);
+            if (shader->textureDimensions[i] != 1)
+                return fail("shader-texture-dimension", slot);
             const uint32_t* raw = regs + xenos::kFetchConstantBase + slot * 6;
             const auto fetch = mojorecomp::texture_abi::Decode(raw);
             if (reportFrontPass)
@@ -9524,7 +9935,7 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
             {
                 wanted.views[slot] = g_dummyTextures[0].view;
                 wanted.samplers[slot] = GetSnapshotSampler(fetch);
-                if (!wanted.views[slot] || !wanted.samplers[slot]) return nullptr;
+                if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("effect-dummy-view-or-sampler", slot);
                 if (reportFrontPass)
                     KLOG("[front pass] slot=%u source=dummy-effect-diagnostic\n", slot);
                 continue;
@@ -9594,7 +10005,7 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
             {
                 wanted.views[slot] = g_dummyTextures[0].view;
                 wanted.samplers[slot] = GetSnapshotSampler(fetch, sceneFeedbackSamplerMode);
-                if (!wanted.views[slot] || !wanted.samplers[slot]) return nullptr;
+                if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("scene-feedback-dummy-view-or-sampler", slot);
                 if (reportFrontPass)
                     KLOG("[front pass] slot=%u source=dummy-scene-feedback key=%08X consumerBit=%u\n",
                          slot, fetch.key, sceneFeedbackConsumerBit);
@@ -9604,7 +10015,7 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
             {
                 wanted.views[slot] = g_neutralBlurTexture.view;
                 wanted.samplers[slot] = GetSnapshotSampler(fetch);
-                if (!wanted.views[slot] || !wanted.samplers[slot]) return nullptr;
+                if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("blur-dummy-view-or-sampler", slot);
                 if (reportFrontPass)
                     KLOG("[front pass] slot=%u source=neutral-1x1 diagnostic\n", slot);
                 continue;
@@ -9630,7 +10041,7 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                     ? GetSnapshotPresentView(*snapshot, fetch)
                     : GetSnapshotView(*snapshot, fetch);
                 wanted.samplers[slot] = GetSnapshotSampler(fetch, sceneFeedbackSamplerMode);
-                if (!wanted.views[slot] || !wanted.samplers[slot]) return nullptr;
+                if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("snapshot-view-or-sampler", slot);
                 if (snapshot->depth && fetch.format != 6u &&
                     snapshot->format == kDepthFloatFormat)
                     sampleScales[slot] = 2.0f;
@@ -9647,11 +10058,11 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
             {
                 GuestTexture* guestTexture = CreateGuestR8Texture(guestBase, fetch);
                 if (!guestTexture)
-                    return nullptr;
+                    return fail("guest-r8-create", slot);
                 wanted.views[slot] = guestTexture->view;
                 wanted.samplers[slot] = GetSnapshotSampler(
                     fetch, -1, mojorecomp::gpu::TextureSource::GuestTexture);
-                if (!wanted.samplers[slot]) return nullptr;
+                if (!wanted.samplers[slot]) return fail("guest-r8-sampler", slot);
                 if (reportFrontPass)
                     KLOG("[front pass] slot=%u source=guest-r8 key=%08X\n", slot, fetch.key);
                 continue;
@@ -9663,7 +10074,7 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                 {
                     wanted.views[slot] = GetSnapshotView(*zeroSnapshot, fetch);
                     wanted.samplers[slot] = GetSnapshotSampler(fetch);
-                    if (!wanted.views[slot] || !wanted.samplers[slot]) return nullptr;
+                    if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("zero-snapshot-view-or-sampler", slot);
                     sampled[slot] = zeroSnapshot;
                     if (reportFrontPass)
                         KLOG("[front pass] slot=%u source=zero-snapshot key=%08X\n",
@@ -9672,11 +10083,11 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                 }
                 GuestTexture* guestTexture = CreateGuestRGBA8Texture(guestBase, fetch);
                 if (!guestTexture)
-                    return nullptr;
+                    return fail("guest-rgba8-create", slot);
                 wanted.views[slot] = guestTexture->view;
                 wanted.samplers[slot] = GetSnapshotSampler(
                     fetch, -1, mojorecomp::gpu::TextureSource::GuestTexture);
-                if (!wanted.samplers[slot]) return nullptr;
+                if (!wanted.samplers[slot]) return fail("guest-rgba8-sampler", slot);
                 if (reportFrontPass)
                     KLOG("[front pass] slot=%u source=guest-rgba8 key=%08X\n", slot, fetch.key);
                 continue;
@@ -9687,11 +10098,11 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                 GuestTexture* guestTexture =
                     CreateGuestBlockCompressedTexture(guestBase, fetch);
                 if (!guestTexture)
-                    return nullptr;
+                    return fail("guest-bc-create", slot);
                 wanted.views[slot] = guestTexture->view;
                 wanted.samplers[slot] = GetSnapshotSampler(
                     fetch, -1, mojorecomp::gpu::TextureSource::GuestTexture);
-                if (!wanted.samplers[slot]) return nullptr;
+                if (!wanted.samplers[slot]) return fail("guest-bc-sampler", slot);
                 if (reportFrontPass)
                     KLOG("[front pass] slot=%u source=guest-bc format=%u key=%08X\n",
                          slot, fetch.format, fetch.key);
@@ -9707,12 +10118,12 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                          slot, fetch.key, fetch.format, fetch.width, fetch.height, fetch.dimension,
                          raw[0] >> 31, (raw[1] >> 6) & 3, fetch.mipMin, fetch.mipMax,
                          raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
-                return nullptr;
+                return fail("unsupported-fetch-or-snapshot", slot);
             }
             sampled[slot] = snapshot;
             wanted.views[slot] = snapshot->view;
             wanted.samplers[slot] = GetSnapshotSampler(fetch, sceneFeedbackSamplerMode);
-            if (!wanted.samplers[slot]) return nullptr;
+            if (!wanted.samplers[slot]) return fail("generic-snapshot-sampler", slot);
             if (reportFrontPass)
                 KLOG("[front pass] slot=%u source=snapshot-generic key=%08X copies=%llu depth=%u\n",
                      slot, snapshot->key,
@@ -9721,7 +10132,7 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
         }
     }
     const TextureBundle* bundle = GetTextureBundle(wanted);
-    if (!bundle) return nullptr;
+    if (!bundle) return fail("descriptor-bundle");
     // Barriers cannot run inside this dynamic rendering instance, but don't end
     // and restart rendering merely because a shader uses textures. Most resolved
     // snapshots stay in SHADER_READ_ONLY across many draws; only break rendering
@@ -14534,7 +14945,8 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         }
 
     const uint64_t diagnosticFrame = g_frames.load(std::memory_order_relaxed) + 1;
-    if (TraceDrawFrame(diagnosticFrame))
+    const bool traceDrawFrame = TraceDrawFrame(diagnosticFrame);
+    if (traceDrawFrame)
     {
         static uint64_t lastFrame = 0;
         static uint32_t drawInFrame = 0;
@@ -15182,8 +15594,53 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     if (needsTextureDescriptors && !textures)
     {
         const uint64_t skipped = g_skippedTexture.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (skipped <= 8)
-            KLOG("Vulkan texture draw gated: unsupported fetch/metadata or descriptor allocation failure\n");
+        if (skipped <= 8 || traceDrawFrame)
+        {
+            const uint32_t slot = g_texturePrepareFailureSlot;
+            uint32_t declaredDimension = UINT32_MAX;
+            const char* shaderStage = "none";
+            for (const auto* shader : {vs, executeGuestPixelShader ? ps : nullptr})
+            {
+                if (!shader)
+                    continue;
+                for (size_t i = 0; i < shader->textureSlots.size() &&
+                                   i < shader->textureDimensions.size(); ++i)
+                    if (shader->textureSlots[i] == slot)
+                    {
+                        declaredDimension = shader->textureDimensions[i];
+                        shaderStage = shader == vs ? "VS" : "PS";
+                        break;
+                    }
+                if (declaredDimension != UINT32_MAX)
+                    break;
+            }
+            if (slot < kTextureSlots)
+            {
+                const uint32_t* raw = regs + xenos::kFetchConstantBase + slot * 6;
+                const auto fetch = mojorecomp::texture_abi::Decode(raw);
+                KLOG("[texture gate] frame=%llu reason=%s stage=%s slot=%u "
+                     "shaderDim=%u fetchDim=%u key=%08X type=%u fmt=%u size=%ux%u "
+                     "tiled=%u mips=%u..%u VS=%016llX PS=%016llX "
+                     "raw=%08X,%08X,%08X,%08X,%08X,%08X\n",
+                     static_cast<unsigned long long>(diagnosticFrame),
+                     g_texturePrepareFailure, shaderStage, slot, declaredDimension,
+                     fetch.dimension, fetch.key, fetch.type, fetch.format,
+                     fetch.width, fetch.height, fetch.tiled ? 1u : 0u,
+                     fetch.mipMin, fetch.mipMax,
+                     static_cast<unsigned long long>(vsHash),
+                     static_cast<unsigned long long>(psHash),
+                     raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+            }
+            else
+            {
+                KLOG("[texture gate] frame=%llu reason=%s slot=none "
+                     "VS=%016llX PS=%016llX\n",
+                     static_cast<unsigned long long>(diagnosticFrame),
+                     g_texturePrepareFailure,
+                     static_cast<unsigned long long>(vsHash),
+                     static_cast<unsigned long long>(psHash));
+            }
+        }
         return true;
     }
     if (fullColorMask & 0xFFF0u)

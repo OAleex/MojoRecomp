@@ -15,6 +15,29 @@ enum class TextureSource {
     GuestTexture,
 };
 
+enum class EdramDepthTransferMode {
+    ShaderStencilExport,
+    FixedFunctionBitPlanes,
+};
+
+inline EdramDepthTransferMode SelectEdramDepthTransferMode(
+    bool shaderStencilExport)
+{
+    return shaderStencilExport
+        ? EdramDepthTransferMode::ShaderStencilExport
+        : EdramDepthTransferMode::FixedFunctionBitPlanes;
+}
+
+inline uint8_t ApplyStencilBitPlane(uint8_t current, uint8_t source,
+                                    uint32_t bit)
+{
+    const uint8_t mask = static_cast<uint8_t>(1u << bit);
+    // The portable Vulkan path clears stencil first. A fragment survives the
+    // bit-plane shader only when this source bit is set; REPLACE uses reference
+    // 0xFF and a one-bit write mask, which sets exactly that bit.
+    return (source & mask) != 0 ? static_cast<uint8_t>(current | mask) : current;
+}
+
 inline bool ShouldEnableAnisotropy(
     const texture_abi::Fetch2D& fetch, TextureSource source,
     uint32_t filteringOverride, float effectiveAnisotropy)
