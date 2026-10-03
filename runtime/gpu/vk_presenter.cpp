@@ -1351,6 +1351,14 @@ struct ResolveSnapshot
     VkImageLayout packedDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint32_t packedDepthResolveEndian = 0;
     bool packedDepthInitialized = false;
+    // Numeric texture-fetch representation of k_24_8 / k_24_8_FLOAT. Xenos
+    // texture caches decode depth resolves into a normal float texture before
+    // filtering; sampling a native Vulkan depth/stencil view directly is not
+    // equivalent (and linear filtering is format-dependent).
+    VkImage sampledDepthImage = VK_NULL_HANDLE;
+    VkDeviceMemory sampledDepthMemory = VK_NULL_HANDLE;
+    VkImageView sampledDepthView = VK_NULL_HANDLE;
+    VkImageLayout sampledDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint64_t frameSeen = 0;
     uint64_t copies = 0;
     // Backing pixels remain in canonical render-target channel order. Compose
@@ -1584,31 +1592,6 @@ std::vector<DepthSnapshotPackPipeline> g_depthSnapshotPackPipelines;
 uint64_t g_edramOwnershipTransfers = 0;
 uint64_t g_edramOwnershipTiles = 0;
 uint64_t g_edramOwnershipUnsupported = 0;
-
-struct BlurRtWriteHistory
-{
-    uint64_t frame = 0;
-    uint64_t draw = 0;
-    uint64_t vs = 0;
-    uint64_t ps = 0;
-    uint64_t binMask = 0;
-    uint64_t binSelect = 0;
-    uint32_t prim = 0;
-    uint32_t count = 0;
-    uint32_t colorInfo = 0;
-    uint32_t color1Info = 0;
-    uint32_t colorMask = 0;
-    uint32_t blend = 0;
-    uint32_t depth = 0;
-    uint32_t windowTl = 0;
-    uint32_t windowBr = 0;
-    uint32_t windowOffset = 0;
-    bool indexed = false;
-    bool predicated = false;
-};
-
-std::array<BlurRtWriteHistory, 16> g_blurRtWriteHistory{};
-uint32_t g_blurRtWriteHistoryCursor = 0;
 
 ColorBacking* FindColorBacking(uint64_t key);
 ColorBacking* FindColorBacking(uint32_t surfaceInfo, uint32_t info);
@@ -2898,9 +2881,31 @@ ResolveSnapshot* FindDepthSnapshot(uint32_t key, uint32_t width, uint32_t height
     return nullptr;
 }
 
-bool CreatePackedDepthSnapshotResources(ResolveSnapshot& snapshot,
-                                        VkExtent2D internalExtent)
+bool CreateDepthSnapshotAuxResources(ResolveSnapshot& snapshot,
+                                     VkExtent2D internalExtent)
 {
+    auto cleanup = [&]() {
+        if (snapshot.sampledDepthView)
+            p_vkDestroyImageView(g_device, snapshot.sampledDepthView, nullptr);
+        if (snapshot.sampledDepthImage)
+            p_vkDestroyImage(g_device, snapshot.sampledDepthImage, nullptr);
+        if (snapshot.sampledDepthMemory)
+            p_vkFreeMemory(g_device, snapshot.sampledDepthMemory, nullptr);
+        snapshot.sampledDepthView = VK_NULL_HANDLE;
+        snapshot.sampledDepthImage = VK_NULL_HANDLE;
+        snapshot.sampledDepthMemory = VK_NULL_HANDLE;
+
+        if (snapshot.packedDepthWriteView)
+            p_vkDestroyImageView(g_device, snapshot.packedDepthWriteView, nullptr);
+        if (snapshot.packedDepthImage)
+            p_vkDestroyImage(g_device, snapshot.packedDepthImage, nullptr);
+        if (snapshot.packedDepthMemory)
+            p_vkFreeMemory(g_device, snapshot.packedDepthMemory, nullptr);
+        snapshot.packedDepthWriteView = VK_NULL_HANDLE;
+        snapshot.packedDepthImage = VK_NULL_HANDLE;
+        snapshot.packedDepthMemory = VK_NULL_HANDLE;
+    };
+
     VkImageCreateInfo packedInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     packedInfo.imageType = VK_IMAGE_TYPE_2D;
     packedInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2931,8 +2936,7 @@ bool CreatePackedDepthSnapshotResources(ResolveSnapshot& snapshot,
     {
         KLOG("Vulkan packed depth snapshot has no device-local memory type: key=%08X bits=%08X\n",
              snapshot.key, req.memoryTypeBits);
-        p_vkDestroyImage(g_device, snapshot.packedDepthImage, nullptr);
-        snapshot.packedDepthImage = VK_NULL_HANDLE;
+        cleanup();
         return false;
     }
 
@@ -2944,8 +2948,7 @@ bool CreatePackedDepthSnapshotResources(ResolveSnapshot& snapshot,
     {
         KLOG("Vulkan packed depth snapshot memory allocation failed (%d): key=%08X bytes=%llu\n",
              result, snapshot.key, static_cast<unsigned long long>(req.size));
-        p_vkDestroyImage(g_device, snapshot.packedDepthImage, nullptr);
-        snapshot.packedDepthImage = VK_NULL_HANDLE;
+        cleanup();
         return false;
     }
 
@@ -2955,10 +2958,7 @@ bool CreatePackedDepthSnapshotResources(ResolveSnapshot& snapshot,
     {
         KLOG("Vulkan packed depth snapshot bind failed (%d): key=%08X\n",
              result, snapshot.key);
-        p_vkFreeMemory(g_device, snapshot.packedDepthMemory, nullptr);
-        p_vkDestroyImage(g_device, snapshot.packedDepthImage, nullptr);
-        snapshot.packedDepthMemory = VK_NULL_HANDLE;
-        snapshot.packedDepthImage = VK_NULL_HANDLE;
+        cleanup();
         return false;
     }
 
@@ -2973,15 +2973,76 @@ bool CreatePackedDepthSnapshotResources(ResolveSnapshot& snapshot,
     {
         KLOG("Vulkan packed depth snapshot view failed (%d): key=%08X\n",
              result, snapshot.key);
-        p_vkFreeMemory(g_device, snapshot.packedDepthMemory, nullptr);
-        p_vkDestroyImage(g_device, snapshot.packedDepthImage, nullptr);
-        snapshot.packedDepthMemory = VK_NULL_HANDLE;
-        snapshot.packedDepthImage = VK_NULL_HANDLE;
+        cleanup();
+        return false;
+    }
+
+    VkImageCreateInfo sampledInfo = packedInfo;
+    sampledInfo.format = VK_FORMAT_R32_SFLOAT;
+    sampledInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    result = p_vkCreateImage(g_device, &sampledInfo, nullptr,
+                             &snapshot.sampledDepthImage);
+    if (result != VK_SUCCESS)
+    {
+        KLOG("Vulkan sampled depth snapshot image failed (%d): key=%08X %ux%u\n",
+             result, snapshot.key, internalExtent.width, internalExtent.height);
+        cleanup();
+        return false;
+    }
+
+    p_vkGetImageMemoryRequirements(g_device, snapshot.sampledDepthImage, &req);
+    const uint32_t sampledType = FindMemoryType(req.memoryTypeBits,
+                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (sampledType == UINT32_MAX)
+    {
+        KLOG("Vulkan sampled depth snapshot has no device-local memory type: key=%08X bits=%08X\n",
+             snapshot.key, req.memoryTypeBits);
+        cleanup();
+        return false;
+    }
+
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = sampledType;
+    result = p_vkAllocateMemory(g_device, &ai, nullptr, &snapshot.sampledDepthMemory);
+    if (result != VK_SUCCESS)
+    {
+        KLOG("Vulkan sampled depth snapshot memory allocation failed (%d): key=%08X bytes=%llu\n",
+             result, snapshot.key, static_cast<unsigned long long>(req.size));
+        cleanup();
+        return false;
+    }
+    result = p_vkBindImageMemory(g_device, snapshot.sampledDepthImage,
+                                 snapshot.sampledDepthMemory, 0);
+    if (result != VK_SUCCESS)
+    {
+        KLOG("Vulkan sampled depth snapshot bind failed (%d): key=%08X\n",
+             result, snapshot.key);
+        cleanup();
+        return false;
+    }
+
+    VkImageViewCreateInfo sampledViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    sampledViewInfo.image = snapshot.sampledDepthImage;
+    sampledViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    sampledViewInfo.format = VK_FORMAT_R32_SFLOAT;
+    sampledViewInfo.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                                  VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R};
+    sampledViewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    result = p_vkCreateImageView(g_device, &sampledViewInfo, nullptr,
+                                 &snapshot.sampledDepthView);
+    if (result != VK_SUCCESS)
+    {
+        KLOG("Vulkan sampled depth snapshot view failed (%d): key=%08X\n",
+             result, snapshot.key);
+        cleanup();
         return false;
     }
 
     snapshot.packedDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     snapshot.packedDepthInitialized = false;
+    snapshot.sampledDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     return true;
 }
 
@@ -3214,7 +3275,7 @@ bool CreateDepthSnapshot(uint32_t key, uint32_t width, uint32_t height,
     // image. Xenos depth resolves are 32-bit packed words (stencil in the low
     // byte, 24-bit depth in the upper bytes) and may later be rebound through
     // an 8_8_8_8 texture fetch. A Vulkan depth view can't expose those bytes.
-    if (!CreatePackedDepthSnapshotResources(snapshot, internalExtent))
+    if (!CreateDepthSnapshotAuxResources(snapshot, internalExtent))
     {
         p_vkDestroyImageView(g_device, snapshot.view, nullptr);
         p_vkDestroyImage(g_device, snapshot.image, nullptr);
@@ -3612,7 +3673,13 @@ VSOut main(uint id : SV_VertexID)
 )";
     static constexpr const char* kPs = R"(
 Texture2DMS<float4> g_Source : register(t0, space0);
-float4 main(float4 position : SV_Position) : SV_Target0
+struct PackOut
+{
+    float4 packed : SV_Target0;
+    float decoded : SV_Target1;
+};
+
+PackOut main(float4 position : SV_Position)
 {
     int2 p = int2(position.xy);
     return (g_Source.Load(p, 0) + g_Source.Load(p, 1)) * 0.5;
@@ -4930,7 +4997,29 @@ uint Float32To20e4(float value)
     return (bits >> 3) & 0xFFFFFFu;
 }
 
-float4 main(float4 position : SV_Position) : SV_Target0
+float Float20e4To32(uint f24)
+{
+    f24 &= 0xFFFFFFu;
+    if (f24 == 0u) return 0.0f;
+    uint mantissa = f24 & 0xFFFFFu;
+    int exponent = int(f24 >> 20u);
+    if (exponent == 0)
+    {
+        int highest = firstbithigh(mantissa);
+        uint shift = uint(20 - highest);
+        exponent = 1 - int(shift);
+        mantissa = (mantissa << shift) & 0xFFFFFu;
+    }
+    return asfloat((uint(exponent + 112) << 23u) | (mantissa << 3u));
+}
+
+struct PackDepthOut
+{
+    float4 packed : SV_Target0;
+    float sampled : SV_Target1;
+};
+
+PackDepthOut main(float4 position : SV_Position)
 {
     uint2 dst = uint2(position.xy);
     uint2 src = dst - uint2(g_Push.dstX, g_Push.dstY) +
@@ -4947,8 +5036,10 @@ float4 main(float4 position : SV_Position) : SV_Target0
 #endif
 #if SRC_DEPTH_FLOAT24
     uint d24 = Float32To20e4(depth * 2.0f);
+    float sampledDepth = Float20e4To32(d24);
 #else
     uint d24 = (uint)round(saturate(depth) * 16777215.0f);
+    float sampledDepth = float(d24) / 16777215.0f;
 #endif
     uint4 b = uint4(stencil & 255u, d24 & 255u,
                     (d24 >> 8) & 255u, (d24 >> 16) & 255u);
@@ -4959,7 +5050,10 @@ float4 main(float4 position : SV_Position) : SV_Target0
 #elif RESOLVE_ENDIAN == 3
     b = b.zwxy;
 #endif
-    return float4(b) / 255.0f;
+    PackDepthOut result;
+    result.packed = float4(b) / 255.0f;
+    result.sampled = sampledDepth;
+    return result;
 }
 )";
 
@@ -5013,20 +5107,24 @@ float4 main(float4 position : SV_Position) : SV_Target0
     raster.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    std::array<VkPipelineColorBlendAttachmentState, 2> blendAttachments{};
+    blendAttachments[0].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    blendAttachments[1].colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
+    blend.attachmentCount = uint32_t(blendAttachments.size());
+    blend.pAttachments = blendAttachments.data();
     const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = uint32_t(std::size(dynamicStates));
     dynamic.pDynamicStates = dynamicStates;
-    const VkFormat packedFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    const std::array<VkFormat, 2> colorFormats = {
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_R32_SFLOAT,
+    };
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &packedFormat;
+    rendering.colorAttachmentCount = uint32_t(colorFormats.size());
+    rendering.pColorAttachmentFormats = colorFormats.data();
     VkGraphicsPipelineCreateInfo pipe{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     pipe.pNext = &rendering;
     pipe.stageCount = 2;
@@ -5118,11 +5216,13 @@ VkDescriptorSet EnsureEdramTransferDescriptor(const EdramOwner& owner)
 }
 
 void TransitionPackedDepthSnapshot(ResolveSnapshot& snapshot, VkImageLayout next);
+void TransitionSampledDepthSnapshot(ResolveSnapshot& snapshot, VkImageLayout next);
 
 bool PackDepthResolveSnapshot(ResolveSnapshot& snapshot, DepthBacking& source,
                               const VkImageCopy& copy, uint32_t resolveEndian)
 {
-    if (!snapshot.packedDepthImage || !copy.extent.width || !copy.extent.height)
+    if (!snapshot.packedDepthImage || !snapshot.sampledDepthImage ||
+        !copy.extent.width || !copy.extent.height)
         return false;
     const bool sourceFloat24 = ((source.info >> 16) & 1u) != 0;
     DepthSnapshotPackPipeline* pipeline = GetDepthSnapshotPackPipeline(
@@ -5140,19 +5240,28 @@ bool PackDepthResolveSnapshot(ResolveSnapshot& snapshot, DepthBacking& source,
     EndColorRendering();
     TransitionDepthBacking(source, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     TransitionPackedDepthSnapshot(snapshot, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    TransitionSampledDepthSnapshot(snapshot, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    color.imageView = snapshot.packedDepthWriteView;
-    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color.loadOp = snapshot.packedDepthInitialized
+    std::array<VkRenderingAttachmentInfo, 2> colors{};
+    colors[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colors[0].imageView = snapshot.packedDepthWriteView;
+    colors[0].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colors[0].loadOp = snapshot.packedDepthInitialized
         ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    colors[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colors[0].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    colors[1].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colors[1].imageView = snapshot.sampledDepthView;
+    colors[1].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colors[1].loadOp = snapshot.packedDepthInitialized
+        ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colors[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colors[1].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering.renderArea = {{0, 0}, g_internalExtent};
     rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color;
+    rendering.colorAttachmentCount = uint32_t(colors.size());
+    rendering.pColorAttachments = colors.data();
     p_vkCmdBeginRendering(g_commandBuffer, &rendering);
 
     VkViewport viewport{};
@@ -5180,6 +5289,7 @@ bool PackDepthResolveSnapshot(ResolveSnapshot& snapshot, DepthBacking& source,
     snapshot.packedDepthInitialized = true;
     snapshot.packedDepthResolveEndian = resolveEndian & 3u;
     TransitionPackedDepthSnapshot(snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    TransitionSampledDepthSnapshot(snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     return true;
 }
 
@@ -5890,6 +6000,56 @@ void TransitionPackedDepthSnapshot(ResolveSnapshot& snapshot, VkImageLayout next
     p_vkCmdPipelineBarrier(g_commandBuffer, srcStage, dstStage, 0,
                            0, nullptr, 0, nullptr, 1, &barrier);
     snapshot.packedDepthLayout = next;
+}
+
+void TransitionSampledDepthSnapshot(ResolveSnapshot& snapshot, VkImageLayout next)
+{
+    if (!snapshot.sampledDepthImage || snapshot.sampledDepthLayout == next)
+        return;
+
+    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkAccessFlags srcAccess = 0;
+    if (snapshot.sampledDepthLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    {
+        srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        srcAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    }
+    else if (snapshot.sampledDepthLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+    {
+        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        srcAccess = VK_ACCESS_SHADER_READ_BIT;
+    }
+    else if (snapshot.sampledDepthLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+    {
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        srcAccess = VK_ACCESS_TRANSFER_READ_BIT;
+    }
+
+    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    VkAccessFlags dstAccess = VK_ACCESS_SHADER_READ_BIT;
+    if (next == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+    {
+        dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dstAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    }
+    else if (next == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+    {
+        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstAccess = VK_ACCESS_TRANSFER_READ_BIT;
+    }
+
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+    barrier.oldLayout = snapshot.sampledDepthLayout;
+    barrier.newLayout = next;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = snapshot.sampledDepthImage;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    p_vkCmdPipelineBarrier(g_commandBuffer, srcStage, dstStage, 0,
+                           0, nullptr, 0, nullptr, 1, &barrier);
+    snapshot.sampledDepthLayout = next;
 }
 
 void TransitionSnapshotPresent(ResolveSnapshot& snapshot, VkImageLayout next)
@@ -6932,64 +7092,6 @@ bool ResolveRt1Surface(uint8_t* guestBase, const uint32_t* regs, uint32_t contro
     if (!MaterializeEdramOwnerForResolve(
             {EdramOwnerKind::Color, backing->key}, colorResolveFrame, "color1"))
         return false;
-    static const bool traceBlurRt1 = [] {
-        const char* value = std::getenv("MOJORECOMP_TRACE_BLUR_RT1");
-        return value && value[0] && value[0] != '0';
-    }();
-    if (traceBlurRt1 && key == 0x097DD000u)
-    {
-        static uint64_t lastRt1ReportFrame = ~0ull;
-        if (lastRt1ReportFrame != colorResolveFrame)
-        {
-            lastRt1ReportFrame = colorResolveFrame;
-            KLOG("[blur rt1] frame=%llu key=%08X srcInfo=%08X active=%08X "
-                 "lastWriteFrame=%llu lastWriteDraw=%llu lastWriteGen=%llu "
-                 "currentDraw=%llu currentGen=%llu rect=%u,%u-%u,%u\n",
-                 static_cast<unsigned long long>(colorResolveFrame), key, sourceInfo,
-                 g_activeColorInfo,
-                 static_cast<unsigned long long>(backing->lastWriteFrame),
-                 static_cast<unsigned long long>(backing->lastWriteDraw),
-                 static_cast<unsigned long long>(backing->lastWriteGeneration),
-                 static_cast<unsigned long long>(g_draws.load(std::memory_order_relaxed)),
-                 static_cast<unsigned long long>(g_renderWriteGeneration),
-                 copyX, copyY, copyX1, copyY1);
-        }
-
-        // One bounded 3D-only dump of the writes that actually reached the RT1
-        // backing immediately before the motion-vector resolve.  This is much
-        // more useful than tracing the entire PM4 stream: it tells us whether
-        // the mostly-black blur map was produced by the title's draw sequence or
-        // by host-side tile/resolve handling.
-        static bool dumped3dWriteHistory = false;
-        if (!dumped3dWriteHistory && copyX == 0 &&
-            g_indexedDraws.load(std::memory_order_relaxed) > 10000)
-        {
-            dumped3dWriteHistory = true;
-            const uint32_t count = std::min<uint32_t>(g_blurRtWriteHistoryCursor,
-                                                       g_blurRtWriteHistory.size());
-            const uint32_t start = g_blurRtWriteHistoryCursor - count;
-            KLOG("[blur rt1 history] begin frame=%llu entries=%u\n",
-                 static_cast<unsigned long long>(colorResolveFrame), count);
-            for (uint32_t i = 0; i < count; ++i)
-            {
-                const auto& h = g_blurRtWriteHistory[(start + i) % g_blurRtWriteHistory.size()];
-                KLOG("[blur rt1 history] #%u frame=%llu draw=%llu prim=%u count=%u idx=%u pred=%u "
-                     "VS=%016llX PS=%016llX color=%08X color1=%08X mask=%08X blend=%08X "
-                     "depth=%08X win=%08X..%08X off=%08X bin=%016llX/%016llX\n",
-                     i,
-                     static_cast<unsigned long long>(h.frame),
-                     static_cast<unsigned long long>(h.draw),
-                     h.prim, h.count, h.indexed ? 1u : 0u, h.predicated ? 1u : 0u,
-                     static_cast<unsigned long long>(h.vs),
-                     static_cast<unsigned long long>(h.ps),
-                     h.colorInfo, h.color1Info, h.colorMask, h.blend, h.depth,
-                     h.windowTl, h.windowBr, h.windowOffset,
-                     static_cast<unsigned long long>(h.binMask),
-                     static_cast<unsigned long long>(h.binSelect));
-            }
-            KLOG("[blur rt1 history] end\n");
-        }
-    }
     const bool sourceIsLive = backing->key == g_activeColorSurfaceKey ||
                               (g_activeColor1Enabled &&
                                backing->key == g_activeColor1SurfaceKey);
@@ -7683,6 +7785,11 @@ VkImageView GetSnapshotView(ResolveSnapshot& snapshot,
 {
     if (fetch.swizzle != 0x688u && fetch.swizzle != 0x60Au)
         return VK_NULL_HANDLE;
+    if (snapshot.depth && (fetch.format == 22u || fetch.format == 23u) &&
+        fetch.swizzle == 0x688u && snapshot.sampledDepthView)
+    {
+        return snapshot.sampledDepthView;
+    }
     if (snapshot.depth && fetch.format == 6u && fetch.swizzle == 0x60Au &&
         snapshot.packedDepthInitialized && snapshot.packedDepthImage)
     {
@@ -10042,9 +10149,6 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                     : GetSnapshotView(*snapshot, fetch);
                 wanted.samplers[slot] = GetSnapshotSampler(fetch, sceneFeedbackSamplerMode);
                 if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("snapshot-view-or-sampler", slot);
-                if (snapshot->depth && fetch.format != 6u &&
-                    snapshot->format == kDepthFloatFormat)
-                    sampleScales[slot] = 2.0f;
                 if (!stableSceneFeedback)
                     sampled[slot] = snapshot;
                 if (reportFrontPass)
@@ -16047,29 +16151,6 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         {
             if (!backing || !targetMask)
                 return;
-            if (backing->info == 0x00000438u)
-            {
-                auto& h = g_blurRtWriteHistory[
-                    g_blurRtWriteHistoryCursor++ % g_blurRtWriteHistory.size()];
-                h.frame = g_frames.load(std::memory_order_relaxed) + 1;
-                h.draw = g_draws.load(std::memory_order_relaxed) + 1;
-                h.vs = vsHash;
-                h.ps = psHash;
-                h.binMask = draw.binMask;
-                h.binSelect = draw.binSelect;
-                h.prim = draw.primType;
-                h.count = prepared.count;
-                h.colorInfo = regs[xenos::kRbColorInfo];
-                h.color1Info = regs[xenos::kRbColor1Info];
-                h.colorMask = regs[xenos::kRbColorMask];
-                h.blend = regs[xenos::kRbBlendControl0];
-                h.depth = regs[xenos::kRbDepthControl];
-                h.windowTl = regs[xenos::kPaScWindowScissorTl];
-                h.windowBr = regs[xenos::kPaScWindowScissorBr];
-                h.windowOffset = regs[xenos::kPaScWindowOffset];
-                h.indexed = prepared.indexed;
-                h.predicated = draw.predicated;
-            }
             backing->lastWriteFrame = g_frames.load(std::memory_order_relaxed) + 1;
             backing->lastWriteDraw = g_draws.load(std::memory_order_relaxed) + 1;
             backing->lastWriteGeneration = g_renderWriteGeneration;
@@ -16511,6 +16592,12 @@ void VkPresenter_Shutdown()
             p_vkDestroyImage(g_device, snapshot.packedDepthImage, nullptr);
         if (snapshot.packedDepthMemory && p_vkFreeMemory)
             p_vkFreeMemory(g_device, snapshot.packedDepthMemory, nullptr);
+        if (snapshot.sampledDepthView && p_vkDestroyImageView)
+            p_vkDestroyImageView(g_device, snapshot.sampledDepthView, nullptr);
+        if (snapshot.sampledDepthImage && p_vkDestroyImage)
+            p_vkDestroyImage(g_device, snapshot.sampledDepthImage, nullptr);
+        if (snapshot.sampledDepthMemory && p_vkFreeMemory)
+            p_vkFreeMemory(g_device, snapshot.sampledDepthMemory, nullptr);
         if (snapshot.presentBgraView && p_vkDestroyImageView)
             p_vkDestroyImageView(g_device, snapshot.presentBgraView, nullptr);
         if (snapshot.presentView && p_vkDestroyImageView)
