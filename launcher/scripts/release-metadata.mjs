@@ -53,6 +53,10 @@ export function isGitHubReleaseFeedUrl(value) {
 }
 
 export function newestGitHubReleaseAssetUrl(releases, assetName = "update-catalog.toml") {
+  return githubReleaseAssetUrls(releases, assetName)[0] ?? "";
+}
+
+export function githubReleaseAssetUrls(releases, assetName = "update-catalog.toml") {
   if (!Array.isArray(releases)) throw new Error("GitHub release feed must be an array");
   const candidates = [];
   for (const release of releases) {
@@ -65,7 +69,14 @@ export function newestGitHubReleaseAssetUrl(releases, assetName = "update-catalo
     });
   }
   candidates.sort((left, right) => right.published.localeCompare(left.published));
-  return candidates[0]?.url ?? "";
+  const seen = new Set();
+  return candidates
+    .map((candidate) => candidate.url)
+    .filter((url) => {
+      if (seen.has(url)) return false;
+      seen.add(url);
+      return true;
+    });
 }
 
 export function validateReleaseChannel(value) {
@@ -138,6 +149,14 @@ export function runtimeHistoryFromCatalog(catalogText, currentVersion) {
     .filter((block) => block.startsWith("[[release]]"));
   const seen = new Set();
   const releases = [];
+  const requiredRuntimeFiles = [
+    "cot-runtime.exe",
+    "dxcompiler.dll",
+    "dxil.dll",
+    "mojorecomp-ffmpeg.dll",
+    "mojorecomp-lzx.dll",
+    "extract-xiso.exe",
+  ];
 
   for (const block of blocks) {
     const id = blockString(block, "id");
@@ -174,9 +193,8 @@ export function runtimeHistoryFromCatalog(catalogText, currentVersion) {
       || gameId !== "cot"
       || !size
       || !unpackedSize
-      || !requiredFiles?.includes("cot-runtime.exe")
-      || !requiredFiles.includes("mojorecomp-package.toml")
-      || !requiredFiles.includes("mojorecomp-package.sig")
+      || !requiredFiles
+      || requiredRuntimeFiles.some((required) => !requiredFiles.includes(required))
       || requirements === null
       || !/^[0-9a-f]{64}$/i.test(sha256 ?? "")
     ) {

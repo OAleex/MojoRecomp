@@ -123,6 +123,7 @@ function parseLocalizationPackLanguages(manifest) {
       displayName: field("display_name"),
       xboxLanguage: integer("xbox_language"),
       version: field("version"),
+      translationVersion: field("translation_version"),
       file: field("file"),
       size: integer("size"),
       sha256: field("sha256"),
@@ -133,6 +134,7 @@ function parseLocalizationPackLanguages(manifest) {
       || !language.displayName
       || !Number.isSafeInteger(language.xboxLanguage)
       || !language.version
+      || !language.translationVersion
       || !language.file
       || !Number.isSafeInteger(language.size)
       || !/^[0-9a-f]{64}$/.test(language.sha256 ?? "")
@@ -230,6 +232,7 @@ function parseLocalizationCatalog(text) {
       displayName: field(section, "display_name"),
       xboxLanguage: integer(section, "xbox_language"),
       version: field(section, "version"),
+      translationVersion: field(section, "translation_version"),
       componentSize: integer(section, "component_size"),
       componentSha256: field(section, "component_sha256"),
       unpackedSize: integer(section, "unpacked_size"),
@@ -242,6 +245,7 @@ function parseLocalizationCatalog(text) {
       || !language.displayName
       || !Number.isSafeInteger(language.xboxLanguage)
       || !language.version
+      || !language.translationVersion
       || !Number.isSafeInteger(language.componentSize)
       || language.componentSize <= 0
       || !/^[0-9a-f]{64}$/.test(language.componentSha256 ?? "")
@@ -360,6 +364,7 @@ if ((await stat(localizationPackPath).catch(() => null))?.isFile()) {
       || metadata.locale !== language.locale
       || metadata.displayName !== language.displayName
       || metadata.xboxLanguage !== language.xboxLanguage
+      || metadata.translationVersion !== language.translationVersion
       || metadata.componentSize !== language.size
       || metadata.componentSha256 !== language.sha256
     ) {

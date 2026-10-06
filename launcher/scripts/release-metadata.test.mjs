@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  githubReleaseAssetUrls,
   isGitHubReleaseFeedUrl,
   newestGitHubReleaseAssetUrl,
   normalizedHttpsBase,
@@ -11,41 +12,49 @@ import {
 } from "./release-metadata.mjs";
 
 test("GitHub release feed accepts both pre-releases and normal releases", () => {
+  const releases = [
+    {
+      draft: false,
+      prerelease: false,
+      published_at: "2026-09-20T12:00:00Z",
+      assets: [{
+        name: "update-catalog.toml",
+        browser_download_url: "https://github.com/OAleex/MojoRecomp/releases/download/v0.9.0/update-catalog.toml",
+      }],
+    },
+    {
+      draft: false,
+      prerelease: true,
+      published_at: "2026-09-29T12:00:00Z",
+      assets: [{
+        name: "update-catalog.toml",
+        browser_download_url: "https://github.com/OAleex/MojoRecomp/releases/download/v1.0.0/update-catalog.toml",
+      }],
+    },
+    {
+      draft: true,
+      prerelease: false,
+      published_at: "2026-09-30T12:00:00Z",
+      assets: [{
+        name: "update-catalog.toml",
+        browser_download_url: "https://github.com/OAleex/MojoRecomp/releases/download/v1.1.0/update-catalog.toml",
+      }],
+    },
+  ];
   assert.equal(
     isGitHubReleaseFeedUrl("https://api.github.com/repos/OAleex/MojoRecomp/releases?per_page=30"),
     true,
   );
   assert.equal(
-    newestGitHubReleaseAssetUrl([
-      {
-        draft: false,
-        prerelease: false,
-        published_at: "2026-09-20T12:00:00Z",
-        assets: [{
-          name: "update-catalog.toml",
-          browser_download_url: "https://github.com/OAleex/MojoRecomp/releases/download/v0.9.0/update-catalog.toml",
-        }],
-      },
-      {
-        draft: false,
-        prerelease: true,
-        published_at: "2026-09-29T12:00:00Z",
-        assets: [{
-          name: "update-catalog.toml",
-          browser_download_url: "https://github.com/OAleex/MojoRecomp/releases/download/v1.0.0/update-catalog.toml",
-        }],
-      },
-      {
-        draft: true,
-        prerelease: false,
-        published_at: "2026-09-30T12:00:00Z",
-        assets: [{
-          name: "update-catalog.toml",
-          browser_download_url: "https://github.com/OAleex/MojoRecomp/releases/download/v1.1.0/update-catalog.toml",
-        }],
-      },
-    ]),
+    newestGitHubReleaseAssetUrl(releases),
     "https://github.com/OAleex/MojoRecomp/releases/download/v1.0.0/update-catalog.toml",
+  );
+  assert.deepEqual(
+    githubReleaseAssetUrls(releases),
+    [
+      "https://github.com/OAleex/MojoRecomp/releases/download/v1.0.0/update-catalog.toml",
+      "https://github.com/OAleex/MojoRecomp/releases/download/v0.9.0/update-catalog.toml",
+    ],
   );
 });
 
@@ -90,7 +99,7 @@ test("release channel and date use the catalog contract", () => {
   assert.throws(() => validateReleaseDate("not-a-date"));
 });
 
-test("runtime history keeps older signed runtime releases", () => {
+test("runtime history keeps older compatible runtime releases", () => {
   const catalog = `schema_version = 1
 channel = "development"
 
@@ -128,7 +137,7 @@ notes_url = "https://github.com/example/MojoRecomp/releases/tag/v1.0.0"
 package = "zip"
 unpacked_size = 180
 entrypoint = "cot-runtime.exe"
-required_files = ["cot-runtime.exe", "dxcompiler.dll", "mojorecomp-package.toml", "mojorecomp-package.sig"]
+required_files = ["cot-runtime.exe", "dxcompiler.dll", "dxil.dll", "mojorecomp-ffmpeg.dll", "mojorecomp-lzx.dll", "extract-xiso.exe"]
 game_id = "cot"
 localization_catalog_url = "https://github.com/example/MojoRecomp/releases/download/v1.0.0/localization-catalog.toml"
 

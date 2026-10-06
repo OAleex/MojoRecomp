@@ -5,8 +5,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { assertCanonicalProjectLicense } from "./project-license.mjs";
 import {
+  githubReleaseAssetUrls,
   isGitHubReleaseFeedUrl,
-  newestGitHubReleaseAssetUrl,
   normalizedHttpsBase,
   runtimeHistoryFromCatalog,
   validatePublicHttpsUrl,
@@ -183,6 +183,7 @@ locale = ${JSON.stringify(language.locale)}
 display_name = ${JSON.stringify(language.displayName)}
 xbox_language = ${language.xboxLanguage}
 version = ${JSON.stringify(language.version)}
+translation_version = ${JSON.stringify(language.translationVersion)}
 file = ${JSON.stringify(language.file)}
 size = ${language.size}
 sha256 = ${JSON.stringify(language.sha256)}`).join("\n\n");
@@ -341,6 +342,8 @@ function runProgram(program, args, cwd) {
 
 async function previousReleaseHistory(catalogUrl, runtimeVersion) {
   const catalogs = [];
+  let publicCatalogAuthoritative = false;
+  let publicFeedResolved = false;
   try {
     if (catalogUrl) {
       const requestOptions = () => ({
@@ -354,35 +357,41 @@ async function previousReleaseHistory(catalogUrl, runtimeVersion) {
       });
       const response = await fetch(catalogUrl, requestOptions());
       if (response.ok) {
+        publicFeedResolved = true;
         validatePublicHttpsUrl(response.url, "resolved previous update catalog URL");
         if (isGitHubReleaseFeedUrl(catalogUrl)) {
-          const assetUrl = newestGitHubReleaseAssetUrl(
-            await response.json(),
-            "update-catalog.toml",
-          );
-          if (assetUrl) {
+          const assetUrls = githubReleaseAssetUrls(await response.json(), "update-catalog.toml");
+          for (const assetUrl of assetUrls) {
             const assetResponse = await fetch(assetUrl, requestOptions());
             if (assetResponse.ok) {
               validatePublicHttpsUrl(assetResponse.url, "resolved previous update catalog asset URL");
               catalogs.push(await assetResponse.text());
             } else {
-              console.warn(`Previous public update catalog asset is unavailable (${assetResponse.status}).`);
+              fail(`Published update catalog asset is unavailable (${assetResponse.status}): ${assetUrl}`);
             }
-          } else {
+          }
+          if (assetUrls.length === 0) {
             console.warn("No published GitHub release or pre-release contains update-catalog.toml yet.");
           }
+          publicCatalogAuthoritative = true;
         } else {
           catalogs.push(await response.text());
+          publicCatalogAuthoritative = true;
         }
       } else {
-        console.warn(`Previous public update catalog is unavailable (${response.status}).`);
+        throw new Error(`Previous public update catalog is unavailable (${response.status}).`);
       }
     }
   } catch (error) {
+    if (publicFeedResolved) {
+      fail(`Could not read published release history safely: ${error.message}`);
+    }
     console.warn(`Previous public update catalog could not be read: ${error.message}`);
   }
-  const cached = await readFile(releaseHistoryCachePath, "utf8").catch(() => null);
-  if (cached) catalogs.push(cached);
+  if (!publicCatalogAuthoritative) {
+    const cached = await readFile(releaseHistoryCachePath, "utf8").catch(() => null);
+    if (cached) catalogs.push(cached);
+  }
 
   const runtimeSeen = new Set();
   const runtimeHistory = [];
@@ -463,6 +472,7 @@ locale = ${JSON.stringify(release.locale)}
 display_name = ${JSON.stringify(release.displayName)}
 xbox_language = ${release.xboxLanguage}
 version = ${JSON.stringify(release.version)}
+translation_version = ${JSON.stringify(release.translationVersion)}
 component_size = ${release.localizationPack.componentSize}
 component_sha256 = ${JSON.stringify(release.localizationPack.componentSha256)}
 unpacked_size = ${release.unpackedSize}
@@ -835,6 +845,7 @@ game_id = "cot"
 locale = ${JSON.stringify(language.locale)}
 display_name = ${JSON.stringify(language.displayName)}
 xbox_language = ${language.xboxLanguage}
+translation_version = ${JSON.stringify(language.translationVersion)}
 min_launcher = ${JSON.stringify(launcherVersion)}`,
       [{ id: "runtime.cot", minVersion: cotRuntimeVersion, maxVersion: null }],
     );
@@ -850,6 +861,7 @@ min_launcher = ${JSON.stringify(launcherVersion)}`,
       displayName: language.displayName,
       xboxLanguage: language.xboxLanguage,
       version: language.version,
+      translationVersion: language.translationVersion,
       file: `languages/${nestedName}`,
       size: archiveSize,
       sha256: archiveHash,
@@ -873,6 +885,7 @@ min_launcher = ${JSON.stringify(launcherVersion)}`,
       locale: language.locale,
       displayName: language.displayName,
       xboxLanguage: language.xboxLanguage,
+      translationVersion: language.translationVersion,
       minLauncher: launcherVersion,
       maxLauncher: null,
       requirements: [{ id: "runtime.cot", minVersion: cotRuntimeVersion, maxVersion: null }],

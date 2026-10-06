@@ -68,6 +68,7 @@ export type ComponentUpdateStatus = {
   locale: string | null;
   display_name: string | null;
   xbox_language: number | null;
+  translation_version: string | null;
   installed_version: string | null;
   latest_version: string | null;
   state:
@@ -132,6 +133,7 @@ export type RuntimeAdditionalLanguageStatus = {
   locale: string;
   display_name: string;
   version: string;
+  translation_version: string | null;
   installed_version: string | null;
 };
 

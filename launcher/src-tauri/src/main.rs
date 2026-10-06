@@ -690,6 +690,7 @@ struct ComponentUpdateStatus {
     locale: Option<String>,
     display_name: Option<String>,
     xbox_language: Option<u32>,
+    translation_version: Option<String>,
     installed_version: Option<String>,
     latest_version: Option<String>,
     state: String,
@@ -723,6 +724,7 @@ struct RuntimeAdditionalLanguageStatus {
     locale: String,
     display_name: String,
     version: String,
+    translation_version: Option<String>,
     installed_version: Option<String>,
 }
 
@@ -3779,6 +3781,7 @@ fn local_component_statuses(
         locale: None,
         display_name: None,
         xbox_language: None,
+        translation_version: None,
         installed_version: Some(env!("CARGO_PKG_VERSION").into()),
         latest_version: None,
         state: "up_to_date".into(),
@@ -3808,6 +3811,7 @@ fn local_component_statuses(
             locale: None,
             display_name: None,
             xbox_language: None,
+            translation_version: None,
             installed_version,
             latest_version: None,
             state: state.into(),
@@ -3838,6 +3842,7 @@ fn local_component_statuses(
                 locale: Some(language.locale),
                 display_name: Some(language.display_name),
                 xbox_language: Some(language.xbox_language),
+                translation_version: language.translation_version,
                 installed_version: Some(language.version),
                 latest_version: None,
                 state: if language.healthy {
@@ -3872,6 +3877,7 @@ fn local_component_statuses(
             locale: Some("pt-BR".into()),
             display_name: Some("Brazilian Portuguese".into()),
             xbox_language: Some(1),
+            translation_version: None,
             installed_version: Some(active.version),
             latest_version: None,
             state: if active.healthy {
@@ -4045,6 +4051,7 @@ fn component_statuses_from_catalog(
             locale: plan.locale,
             display_name: plan.display_name,
             xbox_language: plan.xbox_language,
+            translation_version: plan.translation_version,
             installed_version: plan.installed_version,
             latest_version: plan.latest_version,
             state: if launcher_incompatible {
@@ -4156,6 +4163,7 @@ fn launcher_component_status_from_catalog(
         locale: None,
         display_name: None,
         xbox_language: None,
+        translation_version: None,
         installed_version: plan.installed_version,
         latest_version: plan.latest_version,
         state: if launcher_incompatible {
@@ -4388,6 +4396,7 @@ async fn runtime_additional_content(
                 locale: language.locale.clone(),
                 display_name: language.display_name.clone(),
                 version: language.version.clone(),
+                translation_version: language.translation_version.clone(),
                 installed_version,
             }
         })
@@ -5318,6 +5327,7 @@ async fn install_offline_localization_pack(
                     || release.locale.as_deref() != Some(language.locale.as_str())
                     || release.display_name.as_deref() != Some(language.display_name.as_str())
                     || release.xbox_language != Some(language.xbox_language)
+                    || release.translation_version.as_deref() != language.translation_version.as_deref()
                 {
                     return Err(
                         "Localization Pack language metadata does not match its signed component"

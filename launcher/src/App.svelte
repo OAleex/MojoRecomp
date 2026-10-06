@@ -1723,6 +1723,7 @@
                       <article class:update-available={componentNeedsAttention(component)} class:focused={versionFocus === component.id} class:not-installed={!component.installed_version} class="version-card optional-version-card">
                         <div class="version-card-heading"><span>Language</span><b>{updates?.error ? "Check failed" : componentStatusLabel(component)}</b></div>
                         <h3>{component.display_name ?? component.locale ?? component.id}</h3>
+                        {#if component.translation_version}<p>Translation v{component.translation_version}</p>{/if}
                         <div class="version-numbers"><div><span>Current</span><strong>{component.installed_version ?? "-"}</strong></div><div><span>Latest</span><strong>{component.latest_version ?? "-"}</strong></div></div>
                         <p>{componentDescription(component)}</p>
                         {#if updateProgress?.component_id === component.id}
@@ -1915,7 +1916,7 @@
                   <span class={`language-flag ${languageFlag(language.locale)}`} aria-hidden="true"></span>
                   <span class="additional-language-copy">
                     <strong>{language.display_name}</strong>
-                    <small>{language.locale} · v{language.version}{language.installed_version ? ` · Installed ${language.installed_version}` : ""}</small>
+                    <small>{language.locale}{language.translation_version ? ` · Translation v${language.translation_version}` : ` · Component v${language.version}`}{language.installed_version ? ` · Component ${language.version} installed` : ""}</small>
                   </span>
                 </label>
               {/each}

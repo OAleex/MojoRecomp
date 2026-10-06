@@ -69,6 +69,8 @@ pub struct LocalizationCatalogLanguage {
     pub display_name: String,
     pub xbox_language: u32,
     pub version: String,
+    #[serde(default)]
+    pub translation_version: Option<String>,
     pub component_size: u64,
     pub component_sha256: String,
     pub unpacked_size: u64,
@@ -140,6 +142,8 @@ pub struct ComponentRelease {
     #[serde(default)]
     pub xbox_language: Option<u32>,
     #[serde(default)]
+    pub translation_version: Option<String>,
+    #[serde(default)]
     pub localization_pack: Option<LocalizationPackReference>,
     #[serde(default)]
     pub localization_catalog_url: Option<String>,
@@ -177,6 +181,8 @@ struct OfflinePackageManifest {
     #[serde(default)]
     xbox_language: Option<u32>,
     #[serde(default)]
+    translation_version: Option<String>,
+    #[serde(default)]
     min_launcher: Option<String>,
     #[serde(default)]
     max_launcher: Option<String>,
@@ -211,6 +217,8 @@ struct LocalizationPackLanguage {
     display_name: String,
     xbox_language: u32,
     version: String,
+    #[serde(default)]
+    translation_version: Option<String>,
     file: String,
     size: u64,
     sha256: String,
@@ -230,6 +238,7 @@ pub struct OfflineLocalizationPackLanguage {
     pub display_name: String,
     pub xbox_language: u32,
     pub version: String,
+    pub translation_version: Option<String>,
     pub package_path: PathBuf,
 }
 
@@ -259,6 +268,7 @@ pub struct ComponentPlan {
     pub locale: Option<String>,
     pub display_name: Option<String>,
     pub xbox_language: Option<u32>,
+    pub translation_version: Option<String>,
     pub installed_version: Option<String>,
     pub latest_version: Option<String>,
     pub state: PlanState,
@@ -337,6 +347,14 @@ pub fn parse_and_validate_localization_catalog(text: &str) -> Result<Localizatio
                 language.id
             ));
         }
+        if language.translation_version.as_deref().is_some_and(|version| {
+            version.trim().is_empty() || version.len() > 40
+        }) {
+            return Err(format!(
+                "Localization catalog language {} has an invalid translation version",
+                language.id
+            ));
+        }
         if language.xbox_language == 0 || language.xbox_language > 255 {
             return Err(format!(
                 "Localization catalog language {} has an invalid Xbox language",
@@ -401,6 +419,7 @@ pub fn apply_localization_catalog_metadata(
             }) {
                 release.display_name = Some(language.display_name.clone());
                 release.xbox_language = Some(language.xbox_language);
+                release.translation_version = language.translation_version.clone();
             }
             continue;
         }
@@ -423,6 +442,7 @@ pub fn apply_localization_catalog_metadata(
             locale: Some(language.locale.clone()),
             display_name: Some(language.display_name.clone()),
             xbox_language: Some(language.xbox_language),
+            translation_version: language.translation_version.clone(),
             localization_pack: Some(LocalizationPackReference {
                 version: localization_catalog.pack_version.clone(),
                 component_size: language.component_size,
@@ -1292,6 +1312,14 @@ fn extract_offline_localization_pack_with_key(
                 language.id
             ));
         }
+        if language.translation_version.as_deref().is_some_and(|version| {
+            version.trim().is_empty() || version.len() > 40
+        }) {
+            return Err(format!(
+                "Language {} has an invalid translation version",
+                language.id
+            ));
+        }
         if language.xbox_language == 0 || language.xbox_language > 255 {
             return Err(format!(
                 "Language {} has an invalid Xbox language",
@@ -1390,6 +1418,7 @@ fn extract_offline_localization_pack_with_key(
             display_name: language.display_name.clone(),
             xbox_language: language.xbox_language,
             version: language.version.clone(),
+            translation_version: language.translation_version.clone(),
             package_path: destination,
         });
     }
@@ -1504,7 +1533,7 @@ fn inspect_offline_package_with_key(
         }
     }
 
-    let (required_files, game_id, locale, display_name, xbox_language) = match manifest.kind {
+    let (required_files, game_id, locale, display_name, xbox_language, translation_version) = match manifest.kind {
         ComponentKind::Runtime => {
             let game = manifest
                 .id
@@ -1540,6 +1569,7 @@ fn inspect_offline_package_with_key(
                 None,
                 None,
                 None,
+                None,
             )
         }
         ComponentKind::Launcher => {
@@ -1561,6 +1591,7 @@ fn inspect_offline_package_with_key(
             let xbox_language = manifest
                 .xbox_language
                 .ok_or_else(|| "Offline language package is missing xbox_language".to_string())?;
+            let translation_version = manifest.translation_version.as_deref();
             validate_game_id(game)?;
             validate_locale(locale)?;
             if manifest.id != format!("language.{game}.{}", locale.to_ascii_lowercase()) {
@@ -1571,6 +1602,11 @@ fn inspect_offline_package_with_key(
             }
             if xbox_language == 0 || xbox_language > 255 {
                 return Err("Offline language package has an invalid xbox_language".into());
+            }
+            if translation_version.is_some_and(|version| {
+                version.trim().is_empty() || version.len() > 40
+            }) {
+                return Err("Offline language package has an invalid translation_version".into());
             }
             if manifest.package != PackageFormat::Zip
                 || manifest.entrypoint.is_some()
@@ -1586,6 +1622,7 @@ fn inspect_offline_package_with_key(
                 Some(locale.to_string()),
                 Some(display_name.to_string()),
                 Some(xbox_language),
+                translation_version.map(str::to_string),
             )
         }
     };
@@ -1613,6 +1650,7 @@ fn inspect_offline_package_with_key(
         locale,
         display_name,
         xbox_language,
+        translation_version,
         localization_pack: None,
         localization_catalog_url: None,
         compatibility,
@@ -1683,6 +1721,9 @@ pub fn plan_updates(
             locale: exemplar.locale.clone(),
             display_name: exemplar.display_name.clone(),
             xbox_language: exemplar.xbox_language,
+            translation_version: latest
+                .and_then(|release| release.translation_version.clone())
+                .or_else(|| exemplar.translation_version.clone()),
             installed_version: installed_component.map(|component| component.version.clone()),
             latest_version: latest.map(|release| release.version.clone()),
             state,
@@ -2270,6 +2311,8 @@ struct InstalledManifest {
     #[serde(default)]
     xbox_language: Option<u32>,
     #[serde(default)]
+    translation_version: Option<String>,
+    #[serde(default)]
     compatibility: Compatibility,
     files: Vec<InstalledFile>,
 }
@@ -2324,6 +2367,7 @@ pub struct InstalledLanguageStatus {
     pub locale: String,
     pub display_name: String,
     pub xbox_language: u32,
+    pub translation_version: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2575,6 +2619,7 @@ impl ComponentStore {
                 locale,
                 display_name,
                 xbox_language,
+                translation_version: manifest.translation_version,
             });
         }
         languages.sort_by(|left, right| left.locale.cmp(&right.locale));
@@ -3151,6 +3196,7 @@ impl ComponentStore {
             locale: None,
             display_name: None,
             xbox_language: None,
+            translation_version: None,
             compatibility: Compatibility::default(),
             files,
         };
@@ -3372,6 +3418,7 @@ impl ComponentStore {
             locale: release.locale.clone(),
             display_name: release.display_name.clone(),
             xbox_language: release.xbox_language,
+            translation_version: release.translation_version.clone(),
             compatibility: release.compatibility.clone(),
             files,
         };
@@ -4397,6 +4444,7 @@ min_launcher = "1.0.0"
             locale: None,
             display_name: None,
             xbox_language: None,
+            translation_version: None,
             localization_pack: None,
             localization_catalog_url: None,
             compatibility: Compatibility::default(),
@@ -4441,6 +4489,7 @@ min_launcher = "1.0.0"
             locale: Some("pt-BR".into()),
             display_name: Some("Brazilian Portuguese".into()),
             xbox_language: Some(1),
+            translation_version: Some("5.0".into()),
             localization_pack: None,
             localization_catalog_url: None,
             compatibility: Compatibility::default(),
@@ -4479,6 +4528,7 @@ min_launcher = "1.0.0"
             locale: None,
             display_name: None,
             xbox_language: None,
+            translation_version: None,
             localization_pack: None,
             localization_catalog_url: None,
             compatibility: Compatibility::default(),
@@ -4572,7 +4622,7 @@ min_launcher = "1.0.0"
         }
         let component_id = format!("language.cot.{}", locale.to_ascii_lowercase());
         let manifest = format!(
-            "schema_version = 2\nid = \"{component_id}\"\nkind = \"language\"\nversion = \"{version}\"\nplatform = \"windows\"\narch = \"x86_64\"\npackage = \"zip\"\nrequired_files = [\"language-patches.toml\", \"patches/test.mjdelta\"]\ngame_id = \"cot\"\nlocale = \"{locale}\"\ndisplay_name = \"{display_name}\"\nxbox_language = {xbox_language}\nmin_launcher = \"1.1.0\"\n\n{}\n",
+            "schema_version = 2\nid = \"{component_id}\"\nkind = \"language\"\nversion = \"{version}\"\nplatform = \"windows\"\narch = \"x86_64\"\npackage = \"zip\"\nrequired_files = [\"language-patches.toml\", \"patches/test.mjdelta\"]\ngame_id = \"cot\"\nlocale = \"{locale}\"\ndisplay_name = \"{display_name}\"\nxbox_language = {xbox_language}\ntranslation_version = \"5.0\"\nmin_launcher = \"1.1.0\"\n\n{}\n",
             signed_manifest_files(&payload)
         );
         write_signed_package_metadata(&mut writer, &package_root, &manifest, &test_signing_key());
@@ -4594,7 +4644,7 @@ min_launcher = "1.0.0"
         let pack_version = "1.0.0";
         let package_root = format!("MojoRecomp-COT-Localization-Pack-{pack_version}");
         let manifest = format!(
-            "schema_version = 1\ngame_id = \"cot\"\nversion = \"{pack_version}\"\n\n[[language]]\nid = \"language.cot.pt-br\"\nlocale = \"pt-BR\"\ndisplay_name = \"Brazilian Portuguese\"\nxbox_language = 1\nversion = \"1.0.0\"\nfile = \"languages/pt-BR.zip\"\nsize = {}\nsha256 = \"{}\"\n",
+            "schema_version = 1\ngame_id = \"cot\"\nversion = \"{pack_version}\"\n\n[[language]]\nid = \"language.cot.pt-br\"\nlocale = \"pt-BR\"\ndisplay_name = \"Brazilian Portuguese\"\nxbox_language = 1\nversion = \"1.0.0\"\ntranslation_version = \"5.0\"\nfile = \"languages/pt-BR.zip\"\nsize = {}\nsha256 = \"{}\"\n",
             language_bytes.len(),
             language_sha256
         );
@@ -4703,6 +4753,7 @@ min_launcher = "1.0.0"
         assert_eq!(language.locale, "pt-BR");
         assert_eq!(language.display_name, "Brazilian Portuguese");
         assert_eq!(language.xbox_language, 1);
+        assert_eq!(language.translation_version.as_deref(), Some("5.0"));
         let release = inspect_offline_package_with_key(&language.package_path, "1.1.0", &key)
             .expect("inspect nested language");
         assert_eq!(release.id, language.id);
@@ -4712,6 +4763,7 @@ min_launcher = "1.0.0"
             Some("Brazilian Portuguese")
         );
         assert_eq!(release.xbox_language, Some(1));
+        assert_eq!(release.translation_version.as_deref(), Some("5.0"));
 
         let component_size = release.size;
         let component_sha256 = release.sha256.clone();
@@ -6027,6 +6079,7 @@ locale = "ar"
 display_name = "العربية"
 xbox_language = 1
 version = "1.0.0"
+translation_version = "5.0"
 component_size = 400
 component_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 unpacked_size = 800
@@ -6043,6 +6096,7 @@ required_files = ["language-patches.toml", "mojorecomp-package.toml", "mojorecom
             .expect("synthesized Arabic release");
         assert_eq!(language.display_name.as_deref(), Some("العربية"));
         assert_eq!(language.xbox_language, Some(1));
+        assert_eq!(language.translation_version.as_deref(), Some("5.0"));
         assert_eq!(
             language.url,
             "https://example.com/MojoRecomp-COT-Localization-Pack-1.0.0.zip"
