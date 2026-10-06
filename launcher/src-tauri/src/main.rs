@@ -774,6 +774,46 @@ fn merge_archived_runtime_releases(
     Ok(())
 }
 
+fn merge_manifest_runtime_release(
+    releases: &mut Vec<ComponentReleaseStatus>,
+    game: &GameManifest,
+) -> Result<(), String> {
+    semver::Version::parse(&game.runtime_version).map_err(|_| {
+        format!(
+            "Embedded {} runtime version is invalid: {}",
+            game.name, game.runtime_version
+        )
+    })?;
+    if releases
+        .iter()
+        .any(|release| release.version == game.runtime_version)
+    {
+        return Ok(());
+    }
+    releases.push(ComponentReleaseStatus {
+        version: game.runtime_version.clone(),
+        published: String::new(),
+        notes_url: String::new(),
+        size: 0,
+        downloadable: false,
+    });
+    releases.sort_by(|left, right| {
+        semver::Version::parse(&right.version)
+            .ok()
+            .cmp(&semver::Version::parse(&left.version).ok())
+    });
+    Ok(())
+}
+
+fn local_runtime_releases(
+    game: &GameManifest,
+    component_id: &str,
+) -> Result<Vec<ComponentReleaseStatus>, String> {
+    let mut releases = archived_runtime_releases(component_id)?;
+    merge_manifest_runtime_release(&mut releases, game)?;
+    Ok(releases)
+}
+
 #[derive(Clone, Serialize)]
 struct InstalledComponentVersionStatus {
     version: String,
@@ -3911,7 +3951,7 @@ fn local_component_statuses(
             xbox_language: None,
             translation_version: None,
             installed_version,
-            latest_version: None,
+            latest_version: Some(game.runtime_version.clone()),
             state: state.into(),
             download_url: None,
             size: None,
@@ -3919,7 +3959,7 @@ fn local_component_statuses(
             notes_url: None,
             can_rollback: active.as_ref().is_some_and(|status| status.can_rollback),
             last_action: active.and_then(|status| status.last_action),
-            releases: archived_runtime_releases(&id)?,
+            releases: local_runtime_releases(game, &id)?,
             installed_versions: game_store
                 .installed_versions(&id)?
                 .into_iter()
@@ -4133,6 +4173,13 @@ fn component_statuses_from_catalog(
         .collect();
         if plan.kind == updates::ComponentKind::Runtime {
             merge_archived_runtime_releases(&mut releases, &plan.id)?;
+            if let Some(game) = plan
+                .game_id
+                .as_deref()
+                .and_then(|game_id| manifests.iter().find(|game| game.id == game_id))
+            {
+                merge_manifest_runtime_release(&mut releases, game)?;
+            }
         }
         let installed_versions = if plan.kind == updates::ComponentKind::Runtime {
             game_store
@@ -5901,6 +5948,18 @@ mod tests {
         assert!(archived_runtime_releases("runtime.mom")
             .expect("MOM runtime history")
             .is_empty());
+    }
+
+    #[test]
+    fn cot_local_runtime_history_keeps_current_manifest_release_visible() {
+        let manifest: GameManifest =
+            toml::from_str(GAME_MANIFESTS[0]).expect("embedded COT manifest");
+        let history = local_runtime_releases(&manifest, "runtime.cot")
+            .expect("COT local runtime release history");
+
+        assert_eq!(history[0].version, manifest.runtime_version);
+        assert!(!history[0].downloadable);
+        assert!(history.iter().any(|release| release.version == "0.1.0-alpha"));
     }
 
     #[test]

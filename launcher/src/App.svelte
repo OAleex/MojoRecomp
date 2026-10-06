@@ -218,6 +218,7 @@
     const installed = installedRuntimeVersion(release.version);
     if (installed && !installed.healthy) return "Damaged";
     if (installed) return "Downloaded";
+    if (release.version === selectedRuntimeComponent?.latest_version && !release.downloadable) return "Known";
     if (!release.downloadable) return "Archived";
     return index === 0 ? "Latest" : "Available";
   }
@@ -1694,7 +1695,7 @@
                       <span data-label="Status"><i class:installed={!!installedRuntimeVersion(release.version)}></i>{runtimeVersionStatusLabel(release, index)}</span>
                       <strong data-label="Version">{release.version}</strong>
                       <span data-label="Released">{release.local_only ? "Local" : formatReleaseDate(release.published)}</span>
-                      <span data-label="Package">{release.local_only ? "Installed" : release.downloadable ? humanBytes(release.size) : "Archived"}</span>
+                      <span data-label="Package">{release.local_only ? "Installed" : release.downloadable ? humanBytes(release.size) : release.version === selectedRuntimeComponent?.latest_version ? "Unavailable" : "Archived"}</span>
                       <div class="version-row-actions" data-label="Action">
                         {#if release.version === selectedRuntimeComponent?.installed_version}
                           {#if !release.local_only && release.downloadable}<button type="button" class="secondary-button" onclick={() => installRuntimeRelease(release)} disabled={updateInteractionBusy}>Redownload</button>{/if}
