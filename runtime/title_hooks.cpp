@@ -14,6 +14,8 @@
 
 #include "runtime_state.h"
 #include "cpu/guest_fiber.h"
+#include "gpu/pm4.h"
+#include "host/frame_rate_policy.h"
 #include "kernel/guestcall.h"
 
 namespace {
@@ -24,6 +26,12 @@ struct DecoderFillState {
 };
 
 thread_local DecoderFillState g_decoderFillState;
+
+mojorecomp::host::FrameRatePolicy ActiveTitleFrameRatePolicy()
+{
+    return mojorecomp::host::TitlePolicyForNativeCadenceContent(
+        mojorecomp::host::ActiveFrameRatePolicy(), Pm4_BinkVideoCadenceActive());
+}
 
 bool NativeFibersEnabled() {
     const char* value = std::getenv("MOJORECOMP_NATIVE_FIBERS");
@@ -94,6 +102,52 @@ uint8_t GuestLoadU8(uint32_t address) {
 
 } // namespace
 
+// The title's libc memcpy at 0x823CEC90 is a forward copy routine. Guest RAM is
+// already a contiguous host mapping, so execute large non-overlapping copies on
+// the host while preserving the original forward-copy behavior for overlap.
+void MojoRecompGuestMemcpy(PPCRegister& dst, PPCRegister& src, PPCRegister& size) {
+    const uint32_t dstAddress = dst.u32;
+    const uint32_t srcAddress = src.u32;
+    const uint32_t byteCount = size.u32;
+    if (!byteCount || dstAddress == srcAddress || !g_mojoGuestBase)
+        return;
+
+    auto* dstBytes = g_mojoGuestBase + dstAddress;
+    const auto* srcBytes = g_mojoGuestBase + srcAddress;
+    const uint64_t dstEnd = uint64_t(dstAddress) + byteCount;
+    const uint64_t srcEnd = uint64_t(srcAddress) + byteCount;
+    const bool overlaps = uint64_t(dstAddress) < srcEnd &&
+                          uint64_t(srcAddress) < dstEnd;
+    if (!overlaps) {
+        std::memcpy(dstBytes, srcBytes, byteCount);
+        return;
+    }
+
+    for (uint32_t i = 0; i < byteCount; ++i)
+        dstBytes[i] = srcBytes[i];
+}
+
+void MojoRecompHfrFrameGate(PPCRegister& elapsedUs) {
+    static thread_local mojorecomp::host::TitleFrameGatePhase gatePhase;
+    elapsedUs.u32 = mojorecomp::host::TitleFrameGateElapsedUsPhased(
+        elapsedUs.u32, ActiveTitleFrameRatePolicy(), gatePhase);
+}
+
+void MojoRecompHfrProgressCadence(PPCRegister& lookaheadCounter) {
+    lookaheadCounter.u32 = mojorecomp::host::TitleProgressCadenceCounter(
+        lookaheadCounter.u32, ActiveTitleFrameRatePolicy());
+}
+
+bool MojoRecompHfrSkipProgressWait() {
+    return mojorecomp::host::TitleProgressWaitBypass(
+        ActiveTitleFrameRatePolicy());
+}
+
+bool MojoRecompHfrYieldAsyncPoll(PPCRegister& status) {
+    return mojorecomp::host::TitleAsyncPollShouldYield(
+        status.u32, ActiveTitleFrameRatePolicy());
+}
+
 void MojoRecompBeginContextSwitch(PPCRegister& target, PPCRegister& pcr) {
     if (NativeFibersEnabled())
         mojorecomp::fiber::Begin(*g_ppcContext, target.u32, pcr.u32);
@@ -142,7 +196,7 @@ void MojoRecompProgressProbe(PPCRegister& stateObject) {
     last.drawSerial = drawSerial;
 }
 
-void MojoRecompGpuPollProbe(PPCRegister& pollObject, PPCRegister& owner) {
+void MojoRecompGpuPollBackoff(PPCRegister& pollObject, PPCRegister& owner) {
     if (!g_mojoGuestBase || !pollObject.u32 || !owner.u32)
         return;
 
@@ -163,9 +217,22 @@ void MojoRecompGpuPollProbe(PPCRegister& pollObject, PPCRegister& owner) {
     const uint32_t yieldInterval = GpuPollYieldInterval();
     const uint32_t delayUs = GpuPollDelayUs();
     const bool waitingOnCp = !(statusFlags & 0x2u) && currentPtrSlot && currentPtr == observedPtr;
-    if (delayUs && waitingOnCp)
+    const auto framePolicy = ActiveTitleFrameRatePolicy();
+    const bool hfrCooperativePoll =
+        framePolicy.mode == mojorecomp::host::FrameRateMode::HighFrameRate60 &&
+        framePolicy.requiresTitlePatches;
+
+    // Xenon's db16cyc backoff becomes a no-op in the recompilation. In HFR,
+    // restore that short CPU pause only while the CP pointer is unchanged. A
+    // host scheduler yield is much stronger than db16cyc and measurably lowers
+    // the title cadence, so HFR deliberately avoids yielding here.
+    if (hfrCooperativePoll && waitingOnCp) {
+        for (int i = 0; i < 8; ++i)
+            _mm_pause();
+    }
+    else if (delayUs && waitingOnCp)
         GpuPollBusyDelay(delayUs);
-    if (yieldInterval && waitingOnCp) {
+    if (!hfrCooperativePoll && yieldInterval && waitingOnCp) {
         struct BackoffState {
             uint32_t object = 0;
             uint32_t observed = 0;

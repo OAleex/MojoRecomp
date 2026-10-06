@@ -45,6 +45,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <cstring>
@@ -56,6 +57,147 @@ namespace ShaderTranslator
 {
 namespace
 {
+constexpr uint64_t kHostShaderCacheMagic = 0x31565053484F4A4Dull; // "MJOHSPV1"
+constexpr uint32_t kHostShaderCacheSchema = 1;
+constexpr const char* kHostShaderCacheVersion = "v1-dxc-spirv";
+
+struct HostShaderCacheStamp
+{
+    uint64_t magic = kHostShaderCacheMagic;
+    uint32_t schema = kHostShaderCacheSchema;
+    uint32_t hlslSize = 0;
+    uint64_t keyHash = 0;
+    uint32_t stage = 0;
+    uint32_t stencilExport = 0;
+};
+
+std::mutex g_hostShaderCacheIoMutex;
+
+uint64_t HostShaderHashBytes(uint64_t hash, const void* data, size_t size)
+{
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i)
+    {
+        hash ^= bytes[i];
+        hash *= 0x100000001B3ull;
+    }
+    return hash;
+}
+
+uint64_t HostShaderCacheKey(const std::string& hlsl, bool isVs,
+                            bool enableStencilExport)
+{
+    uint64_t hash = 0xCBF29CE484222325ull;
+    static constexpr char kCompilerContract[] =
+        "dxc-sm6-hv2021-spirv-vkdxlayout-stripdebug";
+    hash = HostShaderHashBytes(hash, kCompilerContract, sizeof(kCompilerContract) - 1);
+    const uint8_t stage = isVs ? 1u : 2u;
+    const uint8_t stencil = enableStencilExport ? 1u : 0u;
+    hash = HostShaderHashBytes(hash, &stage, sizeof(stage));
+    hash = HostShaderHashBytes(hash, &stencil, sizeof(stencil));
+    if (const char* extra = std::getenv("MOJORECOMP_DXC_DEFINES"); extra && *extra)
+        hash = HostShaderHashBytes(hash, extra, std::strlen(extra));
+    hash = HostShaderHashBytes(hash, hlsl.data(), hlsl.size());
+    return hash;
+}
+
+std::filesystem::path HostShaderCacheDir()
+{
+    if (const char* custom = std::getenv("MOJORECOMP_HOST_SHADER_CACHE_DIR");
+        custom && *custom)
+        return std::filesystem::path(custom) / kHostShaderCacheVersion;
+    if (const char* cacheRoot = std::getenv("MOJORECOMP_CACHE_ROOT");
+        cacheRoot && *cacheRoot)
+        return std::filesystem::path(cacheRoot) / "host-shaders" / kHostShaderCacheVersion;
+    return HostPaths::ExeDir() / "cache" / "host-shaders" / kHostShaderCacheVersion;
+}
+
+bool LoadHostShaderCache(const std::string& hlsl, bool isVs,
+                         bool enableStencilExport, uint64_t keyHash,
+                         std::vector<uint8_t>& spirv)
+{
+    char stem[64]{};
+    std::snprintf(stem, sizeof(stem), "%s-%016llx-%s",
+                  isVs ? "vs" : "ps",
+                  static_cast<unsigned long long>(keyHash),
+                  enableStencilExport ? "stencil" : "plain");
+    const auto dir = HostShaderCacheDir();
+    const auto stampPath = dir / (std::string(stem) + ".key");
+    const auto spvPath = dir / (std::string(stem) + ".spv");
+
+    std::lock_guard<std::mutex> lock(g_hostShaderCacheIoMutex);
+    std::ifstream stampFile(stampPath, std::ios::binary);
+    HostShaderCacheStamp stamp{};
+    if (!stampFile.read(reinterpret_cast<char*>(&stamp), sizeof(stamp)) ||
+        stamp.magic != kHostShaderCacheMagic ||
+        stamp.schema != kHostShaderCacheSchema ||
+        stamp.hlslSize != hlsl.size() ||
+        stamp.keyHash != keyHash ||
+        stamp.stage != (isVs ? 1u : 2u) ||
+        stamp.stencilExport != (enableStencilExport ? 1u : 0u))
+        return false;
+
+    std::ifstream input(spvPath, std::ios::binary | std::ios::ate);
+    if (!input)
+        return false;
+    const std::streamsize size = input.tellg();
+    if (size < 4 || (size & 3) != 0)
+        return false;
+    input.seekg(0, std::ios::beg);
+    spirv.resize(static_cast<size_t>(size));
+    if (!input.read(reinterpret_cast<char*>(spirv.data()), size))
+    {
+        spirv.clear();
+        return false;
+    }
+    uint32_t magic = 0;
+    std::memcpy(&magic, spirv.data(), sizeof(magic));
+    if (magic != 0x07230203u)
+    {
+        spirv.clear();
+        return false;
+    }
+    return true;
+}
+
+void StoreHostShaderCache(const std::string& hlsl, bool isVs,
+                          bool enableStencilExport, uint64_t keyHash,
+                          const std::vector<uint8_t>& spirv)
+{
+    if (spirv.empty())
+        return;
+    char stem[64]{};
+    std::snprintf(stem, sizeof(stem), "%s-%016llx-%s",
+                  isVs ? "vs" : "ps",
+                  static_cast<unsigned long long>(keyHash),
+                  enableStencilExport ? "stencil" : "plain");
+    const auto dir = HostShaderCacheDir();
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec)
+        return;
+
+    const auto stampPath = dir / (std::string(stem) + ".key");
+    const auto spvPath = dir / (std::string(stem) + ".spv");
+    HostShaderCacheStamp stamp{};
+    stamp.hlslSize = static_cast<uint32_t>(hlsl.size());
+    stamp.keyHash = keyHash;
+    stamp.stage = isVs ? 1u : 2u;
+    stamp.stencilExport = enableStencilExport ? 1u : 0u;
+
+    std::lock_guard<std::mutex> lock(g_hostShaderCacheIoMutex);
+    {
+        std::ofstream output(spvPath, std::ios::binary | std::ios::trunc);
+        if (!output.write(reinterpret_cast<const char*>(spirv.data()),
+                          static_cast<std::streamsize>(spirv.size())))
+            return;
+    }
+    // The validation stamp is written last so a partial SPIR-V write is never
+    // accepted as a cache hit on a later run.
+    std::ofstream stampFile(stampPath, std::ios::binary | std::ios::trunc);
+    stampFile.write(reinterpret_cast<const char*>(&stamp), sizeof(stamp));
+}
+
 static inline uint32_t bits(uint32_t v, uint32_t lo, uint32_t n)
 {
     return (v >> lo) & ((1u << n) - 1u);
@@ -1058,7 +1200,15 @@ bool CompileHostHlsl(const std::string& hlsl, bool isVs,
                      std::vector<uint8_t>& spirv, std::string& err,
                      bool enableStencilExport)
 {
-    return CompileSpirv(hlsl, isVs, 0x4D53u, spirv, err, enableStencilExport);
+    const uint64_t keyHash = HostShaderCacheKey(hlsl, isVs, enableStencilExport);
+    if (LoadHostShaderCache(hlsl, isVs, enableStencilExport, keyHash, spirv))
+        return true;
+
+    if (!CompileSpirv(hlsl, isVs, 0x4D53u, spirv, err, enableStencilExport))
+        return false;
+
+    StoreHostShaderCache(hlsl, isVs, enableStencilExport, keyHash, spirv);
+    return true;
 }
 
 bool ApplyHostVertexAspectTransform(std::string& hlsl)

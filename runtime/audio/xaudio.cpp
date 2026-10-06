@@ -23,15 +23,15 @@
 #include <xbox.h>
 
 #include "../debug_mode.h"
+#include "../host/timing.h"
 #include "../kernel/guestcall.h"
 #include "../kernel/heap.h"
 #include "../kernel/klog.h"
 #include "../kernel/memory.h"
 #include "../cpu/guest_thread.h"
+#include "../gpu/pm4.h"
 #include "xaudio.h"
 #include "xma_decoder.h"
-
-extern "C" void MojoRecompHostPollWaitUs(uint32_t microseconds);
 
 namespace {
 
@@ -40,6 +40,7 @@ constexpr uint32_t kStatusInvalidParameter = 0xC000000Du;
 constexpr uint32_t kStatusNoMemory = 0xC0000017u;
 constexpr uint32_t kDriverHandle = 0x41550000u;
 constexpr uint32_t kXmaMmioBase = 0x7FEA0000u;
+constexpr uint32_t kCpRbWptrAddress = 0x7FC80714u;
 constexpr uint32_t kXmaContextArrayRegister = kXmaMmioBase + 0x1800u;
 constexpr uint32_t kXmaCurrentContextRegister = kXmaMmioBase + 0x1818u;
 constexpr uint32_t kXmaNextContextRegister = kXmaMmioBase + 0x181Cu;
@@ -783,9 +784,8 @@ void EnsureAudioCallbackPump()
             auto* thread = new GuestThreadContext(3, 0x40000, 64, 0xFA0u);
             uint32_t reports = 0;
             uint64_t pumpCalls = 0;
-            bool haveDeadline = false;
-            auto nextDeadline = std::chrono::steady_clock::now();
-            auto previousStart = nextDeadline;
+            mojorecomp::host::PeriodicDeadline callbackTimer;
+            auto previousStart = std::chrono::steady_clock::now();
 
             for (;;)
             {
@@ -794,7 +794,7 @@ void EnsureAudioCallbackPump()
                     // Reset timer pacing after resume so the worker does not try
                     // to repay the wall-clock time spent paused as a burst of
                     // catch-up callbacks.
-                    haveDeadline = false;
+                    callbackTimer.Clear();
                     WaitForDebugAudioResume();
                     previousStart = std::chrono::steady_clock::now();
                     continue;
@@ -804,7 +804,7 @@ void EnsureAudioCallbackPump()
                 const uint32_t context = g_clientContext.load(std::memory_order_relaxed);
                 if (!callback)
                 {
-                    haveDeadline = false;
+                    callbackTimer.Clear();
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
@@ -812,7 +812,7 @@ void EnsureAudioCallbackPump()
                 PPCFunc* host = g_guestMemory.FindFunction(callback);
                 if (!host)
                 {
-                    haveDeadline = false;
+                    callbackTimer.Clear();
                     if (!reports++)
                         KLOG("XAudio worker: callback %08X is not translated\n", callback);
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -822,7 +822,7 @@ void EnsureAudioCallbackPump()
                 const bool devicePaced = g_audioDevicePacing.load(std::memory_order_acquire);
                 if (devicePaced)
                 {
-                    haveDeadline = false;
+                    callbackTimer.Clear();
                     if (!ConsumeAudioCredit())
                         continue;
                     // F6 may have been pressed while waiting for a device credit.
@@ -892,29 +892,25 @@ void EnsureAudioCallbackPump()
                 // Keep callback starts on a fixed 5.33 ms cadence. A full sleep
                 // after guest work makes callback execution time part of the
                 // render period and slows the title's audio-derived master clock.
-                if (!haveDeadline)
+                if (!callbackTimer.Active())
                 {
-                    nextDeadline = callbackStart + kRenderQuantum;
-                    haveDeadline = true;
+                    callbackTimer.Reset(callbackStart, kRenderQuantum);
                 }
                 else
                 {
-                    nextDeadline += kRenderQuantum;
+                    callbackTimer.Advance();
                 }
 
                 const auto now = std::chrono::steady_clock::now();
-                if (now < nextDeadline)
+                if (now < callbackTimer.Deadline())
                 {
-                    const auto remainingUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                        nextDeadline - now).count();
-                    if (remainingUs > 0)
-                        MojoRecompHostPollWaitUs(static_cast<uint32_t>(remainingUs));
+                    mojorecomp::host::WaitUntil(callbackTimer.Deadline());
                 }
-                else if (now - nextDeadline > std::chrono::microseconds(21332))
+                else if (now - callbackTimer.Deadline() > std::chrono::microseconds(21332))
                 {
                     // Reset after an exceptional stall instead of building an
                     // unbounded catch-up queue.
-                    nextDeadline = now;
+                    callbackTimer.RebaseDeadline(now);
                 }
             }
         }).detach();
@@ -1121,6 +1117,8 @@ extern "C" void MojoRecompMmioStoreU32(uint8_t* base, uint32_t address, uint32_t
     // are big-endian, so the host backing receives a byte-swapped logical value.
     const uint32_t raw = _byteswap_ulong(value);
     *reinterpret_cast<volatile uint32_t*>(base + address) = raw;
+    if (address == kCpRbWptrAddress)
+        Pm4_NotifyWorkAvailable();
 
     uint32_t trace = g_traceMmioAfterCreate.load(std::memory_order_acquire);
     while (trace && !g_traceMmioAfterCreate.compare_exchange_weak(

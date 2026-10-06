@@ -56,6 +56,13 @@ async function exists(path) {
   }
 }
 
+async function writeTextIfChanged(path, text) {
+  const current = await readFile(path, "utf8").catch(() => null);
+  if (current === text) return false;
+  await writeFile(path, text, "utf8");
+  return true;
+}
+
 async function rootLicenseFiles(packageRoot) {
   const entries = await readdir(packageRoot, { withFileTypes: true });
   return entries
@@ -306,16 +313,14 @@ function renderNotice(title, packages) {
 
 await mkdir(licensesRoot, { recursive: true });
 const [cargo, npm] = await Promise.all([cargoPackages(), npmPackages()]);
-await writeFile(
+const cargoNoticeChanged = await writeTextIfChanged(
   resolve(licensesRoot, "Cargo-ThirdPartyNotices.txt"),
   renderNotice("MojoRecomp Cargo Third-Party Notices", cargo),
-  "utf8",
 );
-await writeFile(
+const npmNoticeChanged = await writeTextIfChanged(
   resolve(licensesRoot, "Npm-ThirdPartyNotices.txt"),
   renderNotice("MojoRecomp npm Third-Party Notices", npm),
-  "utf8",
 );
 
-console.log(`Generated Cargo notices: ${cargo.length} packages`);
-console.log(`Generated npm notices: ${npm.length} installed packages`);
+console.log(`${cargoNoticeChanged ? "Generated" : "Unchanged"} Cargo notices: ${cargo.length} packages`);
+console.log(`${npmNoticeChanged ? "Generated" : "Unchanged"} npm notices: ${npm.length} installed packages`);

@@ -4,6 +4,8 @@
 
 // Connects PM4 callbacks to renderer diagnostics and the optional Vulkan presenter.
 void RendererProbe_Init();
+void RendererProbe_Flush();
+void RendererProbe_Shutdown();
 
 uint64_t RendererProbe_DrawCount();
 uint64_t RendererProbe_SwapCount();

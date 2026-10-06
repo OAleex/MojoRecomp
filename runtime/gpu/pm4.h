@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 // Xenos command processor. It decodes PM4 in guest order, maintains register
@@ -19,6 +20,11 @@ void Pm4_SetReadPointerUpdateFrequency(uint32_t dwords);
 
 // Called exactly where an INTERRUPT packet is reached in the command stream.
 void Pm4_SetInterruptSink(void (*sink)());
+void Pm4_SetInterruptCommandSink(void (*sink)());
+void Pm4_SetInterruptWakeSink(void (*sink)());
+void Pm4_NotifyWorkAvailable();
+void Pm4_RendererInterruptHandshake();
+void Pm4_ServiceRendererInterrupts();
 
 // Xenos exposes a command-processor counter that advances with guest vblank
 // progress and swaps. EVENT_WRITE_SHD may write this counter back to guest
@@ -62,9 +68,22 @@ struct Pm4Draw
 // remain strictly stream-positioned.
 void Pm4_SetShaderSink(void (*sink)(uint32_t type, uint64_t hash,
                                     const uint8_t* code, uint32_t sizeDwords));
+void Pm4_SetRegisterSink(void (*sink)(uint32_t index, uint32_t value));
+void Pm4_SetRegisterBatchSink(void (*sink)(const uint32_t* indices,
+                                          const uint32_t* values,
+                                          std::size_t count));
+void Pm4_SetStoreSink(void (*sink)(uint8_t* base, uint32_t guestAddress,
+                                   uint32_t value));
 void Pm4_SetDrawSink(void (*sink)(uint8_t* base, const Pm4Draw& draw));
 void Pm4_SetSwapSink(void (*sink)(uint8_t* base, uint32_t frontBuffer,
                                   uint32_t width, uint32_t height));
+
+// Crash's pre-rendered movies use the named binkdecompress shader container.
+// Registering its container lets PM4 derive the actual microcode hash at
+// runtime, rather than baking a title-build-specific hash into cadence logic.
+bool Pm4_RegisterBinkPixelShaderContainer(const uint8_t* container,
+                                          std::size_t sizeBytes);
+bool Pm4_BinkVideoCadenceActive();
 
 const Pm4ShaderBinding& Pm4_BoundShader(uint32_t stage);
 const uint32_t* Pm4_Registers();
@@ -82,14 +101,11 @@ uint64_t Pm4_WaitCount();
 uint64_t Pm4_WaitStallCount();
 uint64_t Pm4_DrawCount();
 uint64_t Pm4_DrawSinkCpuNs();
+uint64_t Pm4_ExecuteCpuNs();
+uint64_t Pm4_ExecuteDrawSinkCpuNs();
+uint64_t Pm4_ExecuteCallCount();
 uint64_t Pm4_FrameCount();
 uint64_t Pm4_ShaderBindCount();
 uint64_t Pm4_ShaderCacheHitCount();
-uint64_t Pm4_SceneIbSkipCount();
-uint64_t Pm4_SceneIbSkippedDwords();
-uint64_t Pm4_SceneRenderPacketSkipCount();
-uint64_t Pm4_SceneRenderSkippedDwords();
-uint64_t Pm4_SceneType0ReplaySkipCount();
-uint64_t Pm4_SceneType0ReplaySkippedDwords();
 void Pm4_LogPacketProfile();
 void Pm4_LogTimingProfile();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 
 // Small, title-independent subset of the Xenos register map used by the
@@ -60,6 +61,36 @@ constexpr uint32_t kAluConstantBase = 0x4000;
 constexpr uint32_t kFetchConstantBase = 0x4800;
 constexpr uint32_t kBoolConstantBase = 0x4900;
 constexpr uint32_t kLoopConstantBase = 0x4908;
+
+constexpr uint32_t kVertexIndexMask = 0x00FFFFFFu;
+
+inline uint32_t RemapVertexIndex(uint32_t index, uint32_t indexOffset,
+                                 uint32_t minVertex, uint32_t maxVertex)
+{
+    uint32_t remapped = (index + indexOffset) & kVertexIndexMask;
+    if (minVertex <= maxVertex)
+        remapped = std::clamp(remapped, minVertex, maxVertex);
+    return remapped;
+}
+
+inline uint32_t MaxRemappedAutoVertexIndex(uint32_t count, uint32_t indexOffset,
+                                           uint32_t minVertex, uint32_t maxVertex)
+{
+    if (!count)
+        return 0;
+
+    constexpr uint64_t kDomain = uint64_t(kVertexIndexMask) + 1u;
+    const uint64_t start = uint64_t(indexOffset & kVertexIndexMask);
+    const uint64_t span = uint64_t(count) - 1u;
+    const uint32_t rawMax =
+        count >= kDomain || start + span >= kDomain
+            ? kVertexIndexMask
+            : static_cast<uint32_t>(start + span);
+
+    return minVertex <= maxVertex
+        ? std::clamp(rawMax, minVertex, maxVertex)
+        : rawMax;
+}
 
 enum PrimType : uint32_t
 {

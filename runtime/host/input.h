@@ -13,8 +13,15 @@ struct HostInputState
     int16_t thumbRY = 0;
 };
 
-// Merge the native keyboard and the first XInput-compatible controller into
-// one Xbox 360-style state.  The guest ABI conversion remains in imports.cpp;
-// this layer deliberately contains no guest pointers or endian types.
-void HostInput_Poll(HostInputState& state);
+constexpr uint32_t kHostInputPlayerCount = 2;
 
+// Poll one Xbox 360-style player slot. Player 0 merges Keyboard 1 with the
+// first physical controller; player 1 merges Keyboard 2 with the second.
+// Physical input is neutral while the game window is not the foreground
+// window. The guest ABI conversion remains in imports.cpp.
+void HostInput_Poll(uint32_t playerIndex, HostInputState& state);
+
+// Forward Xbox 360 vibration to the physical controller assigned to a player
+// when the active backend supports rumble.
+void HostInput_SetVibration(uint32_t playerIndex, uint16_t leftMotor,
+                            uint16_t rightMotor);

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod localization;
+mod presence;
 mod rcf;
 mod storage;
 mod updates;
@@ -36,6 +37,8 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -79,6 +82,10 @@ const EMBEDDED_EXTRACT_XISO: &[u8] = &[];
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const PROCESS_SYNCHRONIZE_ACCESS: u32 = 0x00100000;
+#[cfg(windows)]
+const WAIT_OBJECT_0_RESULT: u32 = 0;
 
 fn hide_child_console(command: &mut Command) {
     #[cfg(windows)]
@@ -216,6 +223,10 @@ struct SuiteManifest {
     version: String,
     release_channel: String,
     update_catalog: String,
+    #[serde(default)]
+    localization_catalog: String,
+    #[serde(default)]
+    discord_application_id: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -280,6 +291,193 @@ struct DisplaySettings {
 struct GraphicsSettings {
     anti_aliasing: String,
     texture_filtering: String,
+    #[serde(default = "default_frame_rate")]
+    frame_rate: String,
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(pid: u32, timeout_ms: u32) -> Result<(), String> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE_ACCESS, 0, pid);
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(87) {
+                return Ok(());
+            }
+            return Err(format!(
+                "Could not wait for the previous launcher process: {error}"
+            ));
+        }
+        let result = WaitForSingleObject(handle, timeout_ms);
+        CloseHandle(handle);
+        if result != WAIT_OBJECT_0_RESULT {
+            return Err(format!(
+                "Timed out waiting for the previous launcher process to exit ({result})"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_process_exit(_pid: u32, _timeout_ms: u32) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_runtime_process_exit(pid: u32) -> bool {
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE_ACCESS, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let result = WaitForSingleObject(handle, u32::MAX);
+        CloseHandle(handle);
+        result == WAIT_OBJECT_0_RESULT
+    }
+}
+
+fn restore_and_restart_previous_launcher(
+    target_exe: &Path,
+    target_root: &Path,
+    backup_root: &Path,
+) -> Result<(), String> {
+    updates::restore_launcher_replacement_tree(target_root, backup_root)?;
+    let _ = fs::remove_dir_all(backup_root);
+    Command::new(target_exe)
+        .spawn()
+        .map_err(|error| format!("Could not restart the restored launcher: {error}"))?;
+    Ok(())
+}
+
+fn record_launcher_update_action(state: &str, detail: &str) {
+    if let Ok(store) = launcher_component_store() {
+        let _ = store.record_action("launcher", state, detail);
+    }
+}
+
+fn run_launcher_update_helper_from_args() -> Option<i32> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args.get(1).and_then(|value| value.to_str()) != Some("--apply-launcher-update") {
+        return None;
+    }
+    let result = (|| -> Result<(), String> {
+        if args.len() != 5 {
+            return Err("Launcher update helper received invalid arguments".into());
+        }
+        let pid = args[2]
+            .to_string_lossy()
+            .parse::<u32>()
+            .map_err(|_| "Launcher update helper received an invalid process ID".to_string())?;
+        let source_root = PathBuf::from(&args[3]);
+        let target_exe = PathBuf::from(&args[4]);
+        let target_root = target_exe
+            .parent()
+            .ok_or_else(|| "Launcher update target has no parent directory".to_string())?;
+        wait_for_process_exit(pid, 60_000)?;
+        let version = updates::signed_launcher_executable_version(
+            &source_root.join("mojorecomp-launcher.exe"),
+        )?;
+        let backup_root = std::env::temp_dir().join(format!(
+            "mojorecomp-launcher-backup-{}-{}",
+            std::process::id(),
+            timestamp_seconds()
+        ));
+        updates::backup_launcher_replacement_tree(target_root, &backup_root)?;
+        if let Err(error) = updates::apply_launcher_replacement_tree(&source_root, target_root) {
+            record_launcher_update_action(
+                "apply_failed",
+                &format!("Launcher update {version} could not be applied: {error}"),
+            );
+            let rollback =
+                restore_and_restart_previous_launcher(&target_exe, target_root, &backup_root);
+            return Err(match rollback {
+                Ok(()) => format!("Launcher update {version} failed and was rolled back: {error}"),
+                Err(restore_error) => format!(
+                    "Launcher update {version} failed ({error}) and recovery also failed: {restore_error}"
+                ),
+            });
+        }
+        record_launcher_update_action(
+            "applying",
+            &format!("Launcher update {version} is being verified after restart"),
+        );
+        let mut updated = match Command::new(&target_exe).spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                record_launcher_update_action(
+                    "apply_failed",
+                    &format!("Launcher update {version} could not restart: {error}"),
+                );
+                restore_and_restart_previous_launcher(&target_exe, target_root, &backup_root)?;
+                return Err(format!(
+                    "Could not restart launcher {version}; the previous version was restored: {error}"
+                ));
+            }
+        };
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match updated.try_wait() {
+            Ok(Some(status)) => {
+                record_launcher_update_action(
+                    "apply_failed",
+                    &format!("Launcher update {version} exited during startup with {status}"),
+                );
+                restore_and_restart_previous_launcher(&target_exe, target_root, &backup_root)?;
+                return Err(format!(
+                    "Updated launcher {version} exited during startup with {status}; the previous version was restored"
+                ));
+            }
+            Err(error) => {
+                record_launcher_update_action(
+                    "apply_failed",
+                    &format!("Launcher update {version} startup could not be monitored: {error}"),
+                );
+                restore_and_restart_previous_launcher(&target_exe, target_root, &backup_root)?;
+                return Err(format!(
+                    "Could not monitor launcher {version} startup; the previous version was restored: {error}"
+                ));
+            }
+            Ok(None) => {}
+        }
+        record_launcher_update_action(
+            "installed",
+            &format!("Launcher update {version} applied successfully"),
+        );
+        let _ = fs::remove_dir_all(&backup_root);
+        Ok(())
+    })();
+    Some(match result {
+        Ok(()) => {
+            append_launcher_log("Launcher update helper completed successfully");
+            0
+        }
+        Err(error) => {
+            record_launcher_update_action("apply_failed", &error);
+            append_launcher_log(&format!("Launcher update helper failed: {error}"));
+            1
+        }
+    })
+}
+
+fn cleanup_launcher_update_helpers() {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_helper = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("mojorecomp-launcher-update-") && name.ends_with(".exe")
+            });
+        if is_helper && path != current_exe {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -290,6 +488,10 @@ struct AdvancedSettings {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_frame_rate() -> String {
+    "30".into()
 }
 
 impl Default for RuntimeSettings {
@@ -307,8 +509,9 @@ impl Default for RuntimeSettings {
                 vsync: false,
             },
             graphics: GraphicsSettings {
-                anti_aliasing: "off".into(),
-                texture_filtering: "default".into(),
+                anti_aliasing: "fxaa_extreme".into(),
+                texture_filtering: "8x".into(),
+                frame_rate: default_frame_rate(),
             },
             advanced: AdvancedSettings {
                 logging_enabled: true,
@@ -330,14 +533,46 @@ fn localization_xbox_language(game_id: &str, profile: &str) -> Option<u32> {
     }
 }
 
+fn native_localization_profile(game_id: &str, profile: &str) -> bool {
+    match game_id {
+        "cot" => matches!(profile, "en" | "de" | "fr" | "es" | "it" | "nl"),
+        _ => profile == "en",
+    }
+}
+
+fn language_component_id(game_id: &str, profile: &str) -> String {
+    format!("language.{game_id}.{}", profile.to_ascii_lowercase())
+}
+
+fn valid_dynamic_localization_profile(profile: &str) -> bool {
+    let bytes = profile.as_bytes();
+    (2..=35).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
 fn validate_localization_settings(
     game_id: &str,
     localization: &LocalizationSettings,
 ) -> Result<(), String> {
-    let expected = localization_xbox_language(game_id, &localization.profile)
-        .ok_or_else(|| format!("Unsupported localization profile: {}", localization.profile))?;
-    if localization.xbox_language != expected {
-        return Err("Localization profile and Xbox language do not match".into());
+    if let Some(expected) = localization_xbox_language(game_id, &localization.profile) {
+        if localization.xbox_language != expected {
+            return Err("Localization profile and Xbox language do not match".into());
+        }
+        return Ok(());
+    }
+    if game_id != "cot"
+        || !valid_dynamic_localization_profile(&localization.profile)
+        || localization.xbox_language == 0
+        || localization.xbox_language > 255
+    {
+        return Err(format!(
+            "Unsupported localization profile: {}",
+            localization.profile
+        ));
     }
     Ok(())
 }
@@ -381,6 +616,8 @@ struct LauncherStorageStatus {
     default_library_path: String,
     existing_library_detected: bool,
     available_bytes: u64,
+    discord_activity_enabled: bool,
+    language_setup_completed_games: Vec<String>,
     notice: Option<String>,
 }
 
@@ -440,11 +677,19 @@ struct ComponentReleaseStatus {
 }
 
 #[derive(Clone, Serialize)]
+struct InstalledComponentVersionStatus {
+    version: String,
+    healthy: bool,
+}
+
+#[derive(Clone, Serialize)]
 struct ComponentUpdateStatus {
     id: String,
     kind: String,
     game_id: Option<String>,
     locale: Option<String>,
+    display_name: Option<String>,
+    xbox_language: Option<u32>,
     installed_version: Option<String>,
     latest_version: Option<String>,
     state: String,
@@ -453,7 +698,9 @@ struct ComponentUpdateStatus {
     published: Option<String>,
     notes_url: Option<String>,
     last_action: Option<String>,
+    can_rollback: bool,
     releases: Vec<ComponentReleaseStatus>,
+    installed_versions: Vec<InstalledComponentVersionStatus>,
 }
 
 #[derive(Serialize)]
@@ -470,6 +717,31 @@ struct ComponentUpdateResult {
     restart_required: bool,
 }
 
+#[derive(Clone, Serialize)]
+struct RuntimeAdditionalLanguageStatus {
+    id: String,
+    locale: String,
+    display_name: String,
+    version: String,
+    installed_version: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct RuntimeAdditionalContentStatus {
+    game_id: String,
+    runtime_version: String,
+    pack_version: String,
+    pack_size: u64,
+    languages: Vec<RuntimeAdditionalLanguageStatus>,
+}
+
+#[derive(Serialize)]
+struct LocalizationPackInstallResult {
+    game_id: String,
+    version: String,
+    installed_languages: Vec<String>,
+}
+
 struct AppState {
     manifests: Vec<GameManifest>,
     processes: Mutex<HashMap<String, Child>>,
@@ -479,6 +751,7 @@ struct AppState {
     component_update_job: Mutex<bool>,
     operation_gate: Mutex<()>,
     runtime_job: RuntimeJob,
+    presence: presence::PresenceController,
 }
 
 fn terminate_all_processes(processes: &Mutex<HashMap<String, Child>>) {
@@ -1151,6 +1424,10 @@ fn cleanup_library_transients(root: &Path) -> Result<(), String> {
             remove_managed_directory(&path, root)?;
         }
     }
+    let managed_root = root.join(".mojorecomp");
+    remove_directory_if_empty(&managed_root.join("staging"));
+    remove_directory_if_empty(&managed_root.join("components"));
+    remove_directory_if_empty(&managed_root);
     Ok(())
 }
 
@@ -1182,6 +1459,40 @@ fn timestamp_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn utc_timestamp_iso8601() -> String {
+    let seconds = timestamp_seconds() as i64;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096)
+            / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    )
+}
+
+fn configured_discord_application_id(suite: &SuiteManifest) -> Option<String> {
+    match std::env::var("MOJORECOMP_DISCORD_APPLICATION_ID") {
+        Ok(value) => presence::valid_application_id(&value),
+        Err(_) => presence::valid_application_id(&suite.discord_application_id),
+    }
 }
 
 fn append_launcher_log(message: &str) {
@@ -1231,7 +1542,63 @@ fn add_text_to_zip(zip: &mut ZipWriter<File>, name: &str, text: &str) -> Result<
         .map_err(|e| format!("Could not write ZIP entry {name}: {e}"))
 }
 
-fn newest_crash_log(logs: &Path) -> Option<PathBuf> {
+const SUPPORT_BINARY_FILE_LIMIT: u64 = 256 * 1024 * 1024;
+
+fn add_binary_file_to_zip(
+    zip: &mut ZipWriter<File>,
+    name: &str,
+    path: &Path,
+    max_bytes: u64,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Could not inspect support artifact {name}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("Support artifact {name} is not a regular file"));
+    }
+    if metadata.len() == 0 || metadata.len() > max_bytes {
+        return Err(format!(
+            "Support artifact {name} has an unsafe size: {} bytes",
+            metadata.len()
+        ));
+    }
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    zip.start_file(name, options)
+        .map_err(|error| format!("Could not create ZIP entry {name}: {error}"))?;
+    let mut source = File::open(path)
+        .map_err(|error| format!("Could not open support artifact {name}: {error}"))?;
+    std::io::copy(&mut source, zip)
+        .map_err(|error| format!("Could not stream support artifact {name}: {error}"))?;
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|error| format!("Could not open file for SHA-256: {error}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("Could not hash file: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CrashIncident {
+    stem: String,
+    log: PathBuf,
+    json: Option<PathBuf>,
+    dump: Option<PathBuf>,
+}
+
+fn newest_crash_incident(logs: &Path) -> Option<CrashIncident> {
     let mut candidates = fs::read_dir(logs)
         .ok()?
         .filter_map(Result::ok)
@@ -1250,7 +1617,16 @@ fn newest_crash_log(logs: &Path) -> Option<PathBuf> {
             .and_then(|metadata| metadata.modified())
             .unwrap_or(UNIX_EPOCH)
     });
-    candidates.pop()
+    let log = candidates.pop()?;
+    let stem = log.file_stem()?.to_str()?.to_string();
+    let json = log.with_extension("json");
+    let dump = log.with_extension("dmp");
+    Some(CrashIncident {
+        stem,
+        log,
+        json: json.is_file().then_some(json),
+        dump: dump.is_file().then_some(dump),
+    })
 }
 
 fn manifest<'a>(state: &'a AppState, game_id: &str) -> Result<&'a GameManifest, String> {
@@ -1427,7 +1803,16 @@ fn inspect_library_path(
 
 fn launcher_storage_status() -> Result<LauncherStorageStatus, String> {
     let layout = storage_layout()?;
-    let configured = layout.load_launcher_settings()?.is_some();
+    let launcher_settings = layout.load_launcher_settings()?;
+    let configured = launcher_settings.is_some();
+    let discord_activity_enabled = launcher_settings
+        .as_ref()
+        .map(|settings| settings.discord_activity_enabled)
+        .unwrap_or(true);
+    let language_setup_completed_games = launcher_settings
+        .as_ref()
+        .map(|settings| settings.language_setup_completed_games.clone())
+        .unwrap_or_default();
     let library = effective_library_root(&layout)?;
     let existing_library_detected =
         !configured && directory_has_entries(&layout.legacy_game_library());
@@ -1437,6 +1822,8 @@ fn launcher_storage_status() -> Result<LauncherStorageStatus, String> {
         default_library_path: layout.default_library_root().to_string_lossy().to_string(),
         existing_library_detected,
         available_bytes: available_space_for(&library),
+        discord_activity_enabled,
+        language_setup_completed_games,
         notice: None,
     })
 }
@@ -1444,6 +1831,77 @@ fn launcher_storage_status() -> Result<LauncherStorageStatus, String> {
 #[tauri::command]
 fn get_launcher_storage() -> Result<LauncherStorageStatus, String> {
     launcher_storage_status()
+}
+
+#[tauri::command]
+fn complete_game_language_setup(
+    game_id: String,
+    profile: String,
+    xbox_language: u32,
+    state: tauri::State<'_, AppState>,
+) -> Result<LauncherStorageStatus, String> {
+    manifest(&state, &game_id)?;
+    let localization = LocalizationSettings {
+        profile,
+        xbox_language,
+    };
+    validate_localization_settings(&game_id, &localization)?;
+
+    let path = settings_path(&game_id)?;
+    let mut settings = if path.is_file() {
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("Could not read settings: {error}"))?;
+        toml::from_str::<RuntimeSettings>(&text)
+            .map_err(|error| format!("Could not parse settings: {error}"))?
+    } else {
+        RuntimeSettings::default()
+    };
+    settings.localization = localization;
+    validate_localization_settings(&game_id, &settings.localization)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create title data directory: {error}"))?;
+    }
+    let text = toml::to_string_pretty(&settings)
+        .map_err(|error| format!("Could not serialize settings: {error}"))?;
+    fs::write(&path, text).map_err(|error| format!("Could not save settings: {error}"))?;
+
+    let layout = storage_layout()?;
+    let mut launcher_settings = layout
+        .load_launcher_settings()?
+        .ok_or_else(|| "Finish launcher setup before choosing a game language".to_string())?;
+    if !launcher_settings
+        .language_setup_completed_games
+        .iter()
+        .any(|value| value == &game_id)
+    {
+        launcher_settings
+            .language_setup_completed_games
+            .push(game_id.clone());
+        launcher_settings.language_setup_completed_games.sort();
+        launcher_settings.language_setup_completed_games.dedup();
+        layout.save_launcher_settings(&launcher_settings)?;
+    }
+    append_launcher_log(&format!(
+        "Completed initial language selection for {game_id}: {}",
+        settings.localization.profile
+    ));
+    launcher_storage_status()
+}
+
+#[tauri::command]
+fn set_discord_activity_enabled(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let layout = storage_layout()?;
+    let mut settings = layout
+        .load_launcher_settings()?
+        .ok_or_else(|| "Finish launcher setup before changing Discord activity".to_string())?;
+    settings.discord_activity_enabled = enabled;
+    layout.save_launcher_settings(&settings)?;
+    state.presence.set_enabled(enabled);
+    Ok(enabled)
 }
 
 #[tauri::command]
@@ -1548,66 +2006,68 @@ async fn set_game_library(
     }
     drop(operation_gate);
     let worker_app = app.clone();
-    emit_library_progress(
-        &app,
-        LibraryMigrationProgress {
-            stage: "planning".into(),
-            progress: 0,
-            detail: "Checking the game library and available disk space...".into(),
-            bytes_done: 0,
-            bytes_total: 0,
-        },
-    );
 
     let worker = tauri::async_runtime::spawn_blocking(move || {
         let mut source_to_clean = None;
         let mut completed_plan = None;
+        let mut migration_performed = false;
         if source == destination {
             initialize_library(&destination)?;
         } else {
             cleanup_library_transients(&source)?;
             if library_has_persistent_data(&source)? {
-            let plan = plan_library_migration(&source, &destination)?;
-            let total = plan.bytes;
-            emit_library_progress(
-                &worker_app,
-                LibraryMigrationProgress {
-                    stage: "moving".into(),
-                    progress: 1,
-                    detail: "Copying and verifying the game library...".into(),
-                    bytes_done: 0,
-                    bytes_total: total,
-                },
-            );
-            layout.begin_library_migration(&plan)?;
-            let outcome = match execute_library_migration(&plan, |done, total| {
-                let progress = progress_percent(done, total, 100, 99);
+                emit_library_progress(
+                    &worker_app,
+                    LibraryMigrationProgress {
+                        stage: "planning".into(),
+                        progress: 0,
+                        detail: "Checking the installed game library and available disk space...".into(),
+                        bytes_done: 0,
+                        bytes_total: 0,
+                    },
+                );
+                let plan = plan_library_migration(&source, &destination)?;
+                let total = plan.bytes;
                 emit_library_progress(
                     &worker_app,
                     LibraryMigrationProgress {
                         stage: "moving".into(),
-                        progress,
-                        detail: "Copying and verifying game files...".into(),
-                        bytes_done: done,
+                        progress: 1,
+                        detail: "Copying and verifying the game library...".into(),
+                        bytes_done: 0,
                         bytes_total: total,
                     },
                 );
-            }) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    match rollback_library_migration(&plan) {
-                        Ok(()) => layout.clear_library_migration_journal(),
-                        Err(cleanup_error) => {
-                            return Err(format!(
-                                "{error}. Migration cleanup will be retried next launch: {cleanup_error}"
-                            ));
+                layout.begin_library_migration(&plan)?;
+                let outcome = match execute_library_migration(&plan, |done, total| {
+                    let progress = progress_percent(done, total, 100, 99);
+                    emit_library_progress(
+                        &worker_app,
+                        LibraryMigrationProgress {
+                            stage: "moving".into(),
+                            progress,
+                            detail: "Copying and verifying game files...".into(),
+                            bytes_done: done,
+                            bytes_total: total,
+                        },
+                    );
+                }) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        match rollback_library_migration(&plan) {
+                            Ok(()) => layout.clear_library_migration_journal(),
+                            Err(cleanup_error) => {
+                                return Err(format!(
+                                    "{error}. Migration cleanup will be retried next launch: {cleanup_error}"
+                                ));
+                            }
                         }
+                        return Err(error);
                     }
-                    return Err(error);
-                }
-            };
-            source_to_clean = outcome.source_to_clean;
-            completed_plan = Some(plan);
+                };
+                source_to_clean = outcome.source_to_clean;
+                completed_plan = Some(plan);
+                migration_performed = true;
             } else {
                 if destination.exists()
                     && library_has_persistent_data(&destination)?
@@ -1623,9 +2083,11 @@ async fn set_game_library(
                 }
             }
         }
-        if let Err(settings_error) =
-            layout.save_launcher_settings(&LauncherSettings::new(destination.clone()))
-        {
+        let mut launcher_settings = layout
+            .load_launcher_settings()?
+            .unwrap_or_else(|| LauncherSettings::new(destination.clone()));
+        launcher_settings.game_library = destination.clone();
+        if let Err(settings_error) = layout.save_launcher_settings(&launcher_settings) {
             if let Some(plan) = completed_plan {
                 if let Err(rollback_error) = rollback_library_migration(&plan) {
                     return Err(format!(
@@ -1642,7 +2104,7 @@ async fn set_game_library(
         let notice = source_to_clean.and_then(|source| {
             fs::remove_dir_all(&source).err().map(|error| {
                 format!(
-                    "The verified new library is active, but some files could not be removed from {}: {error}",
+                    "The verified new library is active, but some files could not be removed from {}: {error}. Close any program using the old library; cleanup will be retried on the next launcher start",
                     source.display()
                 )
             })
@@ -1650,7 +2112,7 @@ async fn set_game_library(
         if notice.is_none() {
             layout.clear_library_migration_journal();
         }
-        Ok::<_, String>(notice)
+        Ok::<_, String>((notice, migration_performed))
     })
     .await;
 
@@ -1659,19 +2121,21 @@ async fn set_game_library(
     }
     let result = worker.map_err(|error| format!("Game library worker failed: {error}"))?;
     match result {
-        Ok(notice) => {
-            emit_library_progress(
-                &app,
-                LibraryMigrationProgress {
-                    stage: "complete".into(),
-                    progress: 100,
-                    detail: notice
-                        .clone()
-                        .unwrap_or_else(|| "Game library ready.".into()),
-                    bytes_done: 0,
-                    bytes_total: 0,
-                },
-            );
+        Ok((notice, migration_performed)) => {
+            if migration_performed {
+                emit_library_progress(
+                    &app,
+                    LibraryMigrationProgress {
+                        stage: "complete".into(),
+                        progress: 100,
+                        detail: notice
+                            .clone()
+                            .unwrap_or_else(|| "Game library moved and verified.".into()),
+                        bytes_done: 0,
+                        bytes_total: 0,
+                    },
+                );
+            }
             append_launcher_log("Game library location updated");
             if let Some(detail) = notice.as_deref() {
                 append_launcher_log(detail);
@@ -2255,6 +2719,9 @@ fn save_settings(
     if settings.schema_version != 1 || !(1..=3).contains(&settings.display.resolution_scale) {
         return Err("Unsupported settings schema or resolution scale".into());
     }
+    if !matches!(settings.graphics.frame_rate.as_str(), "30" | "60") {
+        return Err("Frame rate must be 30 or 60".into());
+    }
     validate_localization_settings(&game_id, &settings.localization)?;
     let path = settings_path(&game_id)?;
     if let Some(parent) = path.parent() {
@@ -2286,34 +2753,43 @@ fn localization_context(
     Ok((root.join("default.rcf"), root))
 }
 
-fn active_ptbr_language_component() -> Result<Option<updates::ActiveComponentPayload>, String> {
-    let Some(component) = game_component_store()?.active_payload("language.cot.pt-br")? else {
+fn active_language_component(
+    game_id: &str,
+    profile: &str,
+) -> Result<Option<updates::ActiveComponentPayload>, String> {
+    let component_id = language_component_id(game_id, profile);
+    let Some(component) = game_component_store()?.active_payload(&component_id)? else {
         return Ok(None);
     };
     if component.kind != updates::ComponentKind::Language {
-        return Err("The active pt-BR component is not a language component".into());
+        return Err(format!(
+            "The active {profile} component is not a language component"
+        ));
     }
     Ok(Some(component))
 }
 
 fn localization_status_with_component(
+    game_id: &str,
+    profile: &str,
     archive: &Path,
     game_root: &Path,
 ) -> Result<localization::LocalizationStatus, String> {
-    let mut status = localization::status(archive, game_root);
-    let active = active_ptbr_language_component()?;
+    let mut status = localization::status(archive, game_root, profile);
+    let active = active_language_component(game_id, profile)?;
     if let Some(component) = active {
-        let component_source_current = localization::uses_component_source(game_root)
-            && localization::component_source_version(game_root).as_deref()
+        let component_source_current = localization::uses_component_source(game_root, profile)
+            && localization::component_source_version(game_root, profile).as_deref()
                 == Some(component.version.as_str());
         let manual_source = status.source_installed
-            && !localization::uses_bundled_source(game_root)
-            && !localization::uses_component_source(game_root);
+            && !(profile == localization::PT_BR_PROFILE
+                && localization::uses_bundled_source(game_root))
+            && !localization::uses_component_source(game_root, profile);
         if !manual_source && !component_source_current {
             status.overlay_ready = false;
             status.detail = "A downloaded Localization Pack component is ready to install.".into();
         }
-    } else if localization::uses_component_source(game_root) {
+    } else if localization::uses_component_source(game_root, profile) {
         status.overlay_ready = false;
         status.detail =
             "The downloaded Localization Pack component was rolled back and needs to be restored."
@@ -2325,103 +2801,32 @@ fn localization_status_with_component(
 #[tauri::command]
 fn localization_status(
     game_id: String,
+    profile: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<localization::LocalizationStatus, String> {
-    let (archive, game_root) = localization_context(&game_id, &state)?;
-    localization_status_with_component(&archive, &game_root)
-}
-
-#[tauri::command]
-async fn import_localization_patch(
-    game_id: String,
-    profile: String,
-    source_path: String,
-    state: tauri::State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<localization::LocalizationStatus, String> {
-    let operation_gate = state
-        .operation_gate
-        .lock()
-        .map_err(|_| "Operation gate lock failed")?;
-    ensure_component_update_idle(&state)?;
-    ensure_library_idle(&state)?;
-    if profile != localization::PT_BR_PROFILE {
-        return Err("Only the pt-BR localization profile can import external resources".into());
-    }
-    {
-        let setup_jobs = state
-            .setup_jobs
-            .lock()
-            .map_err(|_| "Game setup state lock failed")?;
-        if setup_jobs.get(&game_id).copied().unwrap_or(false) {
-            return Err(
-                "Wait for game setup to finish before importing localization resources".into(),
-            );
+    let profile = match profile {
+        Some(profile) => profile,
+        None => {
+            load_settings(game_id.clone(), state.clone())?
+                .localization
+                .profile
         }
+    };
+    if !native_localization_profile(&game_id, &profile)
+        && !valid_dynamic_localization_profile(&profile)
+    {
+        return Err(format!("Unsupported localization profile: {profile}"));
+    }
+    if native_localization_profile(&game_id, &profile) {
+        return Ok(localization::LocalizationStatus {
+            profile,
+            source_installed: true,
+            overlay_ready: true,
+            detail: "Original game language selected.".into(),
+        });
     }
     let (archive, game_root) = localization_context(&game_id, &state)?;
-    let job_cancel = Arc::new(AtomicBool::new(false));
-    {
-        let mut jobs = state
-            .localization_jobs
-            .lock()
-            .map_err(|_| "Localization state lock failed")?;
-        if jobs.contains_key(&game_id) {
-            return Err("Localization work is already running for this title".into());
-        }
-        jobs.insert(game_id.clone(), job_cancel);
-    }
-    drop(operation_gate);
-    let source = PathBuf::from(source_path);
-    let job_game_id = game_id.clone();
-    emit_localization_progress(
-        &app,
-        LocalizationProgress {
-            game_id: game_id.clone(),
-            profile: profile.clone(),
-            stage: "importing".into(),
-            progress: 0,
-            detail: "Validating PT-BR resources...".into(),
-            bytes_done: 0,
-            bytes_total: 0,
-        },
-    );
-    let worker = tauri::async_runtime::spawn_blocking(move || {
-        localization::import_patch(&source, &game_root)?;
-        Ok::<_, String>(localization::status(&archive, &game_root))
-    })
-    .await;
-    if let Ok(mut jobs) = state.localization_jobs.lock() {
-        jobs.remove(&job_game_id);
-    }
-    let worker = worker.map_err(|error| format!("Localization import worker failed: {error}"))?;
-    match &worker {
-        Ok(_) => emit_localization_progress(
-            &app,
-            LocalizationProgress {
-                game_id: job_game_id,
-                profile,
-                stage: "imported".into(),
-                progress: 100,
-                detail: "PT-BR resources imported. The derived archive can now be prepared.".into(),
-                bytes_done: 0,
-                bytes_total: 0,
-            },
-        ),
-        Err(error) => emit_localization_progress(
-            &app,
-            LocalizationProgress {
-                game_id: job_game_id,
-                profile,
-                stage: "failed".into(),
-                progress: 0,
-                detail: error.clone(),
-                bytes_done: 0,
-                bytes_total: 0,
-            },
-        ),
-    }
-    worker
+    localization_status_with_component(&game_id, &profile, &archive, &game_root)
 }
 
 #[tauri::command]
@@ -2437,8 +2842,8 @@ async fn prepare_localization(
         .map_err(|_| "Operation gate lock failed")?;
     ensure_component_update_idle(&state)?;
     ensure_library_idle(&state)?;
-    if profile != localization::PT_BR_PROFILE {
-        return Err("Only the pt-BR localization profile requires preparation".into());
+    if native_localization_profile(&game_id, &profile) {
+        return Err("Original game languages do not require Localization Pack preparation".into());
     }
     let process = inspect_process_status(&game_id, &state.processes)?;
     if process.running {
@@ -2456,21 +2861,16 @@ async fn prepare_localization(
         }
     }
     let (archive, game_root) = localization_context(&game_id, &state)?;
-    let current_status = localization::status(&archive, &game_root);
-    let active_language_component = active_ptbr_language_component()?;
+    let current_status = localization::status(&archive, &game_root, &profile);
+    let active_language_component = active_language_component(&game_id, &profile)?;
     let needs_component_source = active_language_component.as_ref().is_some_and(|component| {
         !current_status.source_installed
-            || localization::uses_bundled_source(&game_root)
-            || (localization::uses_component_source(&game_root)
-                && localization::component_source_version(&game_root).as_deref()
+            || (profile == localization::PT_BR_PROFILE
+                && localization::uses_bundled_source(&game_root))
+            || (localization::uses_component_source(&game_root, &profile)
+                && localization::component_source_version(&game_root, &profile).as_deref()
                     != Some(component.version.as_str()))
     });
-    let needs_bundled_source = active_language_component.is_none()
-        && localization::bundled_patch_available()
-        && (!current_status.source_installed
-            || localization::uses_component_source(&game_root)
-            || (localization::uses_bundled_source(&game_root)
-                && !localization::bundled_source_matches(&game_root)));
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut jobs = state
@@ -2506,7 +2906,7 @@ async fn prepare_localization(
         if needs_component_source {
             let component = worker_language_component
                 .as_ref()
-                .ok_or_else(|| "The pt-BR language component is no longer active".to_string())?;
+                .ok_or_else(|| "The selected language component is no longer active".to_string())?;
             emit_localization_progress(
                 &worker_app,
                 LocalizationProgress {
@@ -2521,48 +2921,44 @@ async fn prepare_localization(
             );
             localization::install_component_patch(
                 &component.root,
-                "language.cot.pt-br",
+                &language_component_id(&worker_game_id, &worker_profile),
                 &component.version,
+                &worker_profile,
                 &worker_game_root,
             )?;
-        } else if needs_bundled_source {
-            emit_localization_progress(
-                &worker_app,
-                LocalizationProgress {
-                    game_id: worker_game_id.clone(),
-                    profile: worker_profile.clone(),
-                    stage: "importing".into(),
-                    progress: 0,
-                    detail: "Installing Localization Pack resources...".into(),
-                    bytes_done: 0,
-                    bytes_total: 0,
-                },
-            );
-            localization::install_bundled_patch(&worker_game_root)?;
         }
-        let overlay = localization::prepare_overlay(&archive, &worker_game_root, |done, total| {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Localization preparation cancelled".into());
-            }
-            let progress = progress_percent(done, total, 0, 99);
-            emit_localization_progress(
-                &worker_app,
-                LocalizationProgress {
-                    game_id: worker_game_id.clone(),
-                    profile: worker_profile.clone(),
-                    stage: "building".into(),
-                    progress,
-                    detail: "Building localization archive...".into(),
-                    bytes_done: done,
-                    bytes_total: total,
-                },
-            );
-            Ok(())
-        })?;
+        let overlay = localization::prepare_overlay(
+            &archive,
+            &worker_game_root,
+            &worker_profile,
+            |done, total| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Localization preparation cancelled".into());
+                }
+                let progress = progress_percent(done, total, 0, 99);
+                emit_localization_progress(
+                    &worker_app,
+                    LocalizationProgress {
+                        game_id: worker_game_id.clone(),
+                        profile: worker_profile.clone(),
+                        stage: "building".into(),
+                        progress,
+                        detail: "Building localization archive...".into(),
+                        bytes_done: done,
+                        bytes_total: total,
+                    },
+                );
+                Ok(())
+            },
+        )?;
         if !overlay.is_file() {
             return Err("Localization preparation completed without a derived archive".into());
         }
-        Ok::<_, String>(localization::status(&archive, &worker_game_root))
+        Ok::<_, String>(localization::status(
+            &archive,
+            &worker_game_root,
+            &worker_profile,
+        ))
     })
     .await;
 
@@ -2629,7 +3025,7 @@ fn probe_hardware(
 fn launch_game(
     game_id: String,
     state: tauri::State<'_, AppState>,
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
 ) -> Result<ProcessStatus, String> {
     let _operation_gate = state
         .operation_gate
@@ -2667,16 +3063,24 @@ fn launch_game(
     }
     let runtime_settings = load_settings(game_id.clone(), state.clone())?;
     let localization_overlay =
-        if runtime_settings.localization.profile == localization::PT_BR_PROFILE {
+        if !native_localization_profile(&game_id, &runtime_settings.localization.profile) {
             let original_archive = root.join("default.rcf");
-            let status = localization_status_with_component(&original_archive, &root)?;
+            let status = localization_status_with_component(
+                &game_id,
+                &runtime_settings.localization.profile,
+                &original_archive,
+                &root,
+            )?;
             if !status.overlay_ready {
                 return Err(format!(
                     "The selected Localization Pack is not installed: {}",
                     status.detail
                 ));
             }
-            Some(localization::overlay_root(&root))
+            Some(localization::overlay_root(
+                &root,
+                &runtime_settings.localization.profile,
+            ))
         } else {
             None
         };
@@ -2697,6 +3101,7 @@ fn launch_game(
     processes.remove(&game_id);
 
     let runtime = runtime_path(&game)?;
+    let runtime_sha256 = sha256_file(&runtime)?;
     let runtime_payload_dir = runtime
         .parent()
         .map(Path::to_path_buf)
@@ -2716,6 +3121,11 @@ fn launch_game(
         .env("MOJORECOMP_CACHE_ROOT", cache_root(&game_id)?)
         .env("MOJORECOMP_UTILITY_ROOT", utility_root(&game_id)?)
         .env("MOJORECOMP_LOG_ROOT", game_log_root(&game_id)?)
+        .env("MOJORECOMP_RUNTIME_SHA256", &runtime_sha256)
+        .env(
+            "MOJORECOMP_FRAME_RATE",
+            &runtime_settings.graphics.frame_rate,
+        )
         .stdin(Stdio::null());
     if let Some(overlay) = localization_overlay {
         command.arg("--game-overlay").arg(overlay);
@@ -2826,7 +3236,7 @@ fn launch_game(
     }
     let mut child = command
         .spawn()
-        .map_err(|e| format!("Could not launch {}: {e}", game.name))?;
+        .map_err(|error| format!("Could not launch {}: {error}", game.name))?;
     if let Err(error) = state.runtime_job.assign(&child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -2834,7 +3244,20 @@ fn launch_game(
     }
     let pid = child.id();
     append_launcher_log(&format!("Launched {} runtime with PID {}", game.id, pid));
+    let is_cot = game_id == "cot";
+    if is_cot {
+        state.presence.cot_started(pid);
+    }
     processes.insert(game_id, child);
+    #[cfg(windows)]
+    if is_cot {
+        thread::spawn(move || {
+            if wait_for_runtime_process_exit(pid) {
+                let state = app.state::<AppState>();
+                state.presence.cot_stopped(pid);
+            }
+        });
+    }
     Ok(ProcessStatus {
         running: true,
         pid: Some(pid),
@@ -2883,12 +3306,181 @@ fn inspect_process_status(
 #[tauri::command]
 fn create_support_package(
     game_id: String,
+    include_minidump: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let game = manifest(&state, &game_id)?.clone();
     let game_root = resolved_game_root(&game);
     let suite: SuiteManifest = toml::from_str(SUITE_MANIFEST)
         .map_err(|e| format!("Could not parse suite manifest: {e}"))?;
+
+    let logs_dir = game_log_root(&game_id)?;
+    let incident = newest_crash_incident(&logs_dir);
+    let crash_json_text = incident
+        .as_ref()
+        .and_then(|incident| incident.json.as_ref())
+        .and_then(|path| fs::read_to_string(path).ok());
+    let crash_data = crash_json_text
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+    let dump_available = incident
+        .as_ref()
+        .and_then(|incident| incident.dump.as_ref())
+        .is_some_and(|path| {
+            fs::symlink_metadata(path).ok().is_some_and(|metadata| {
+                metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() > 0
+                    && metadata.len() <= SUPPORT_BINARY_FILE_LIMIT
+            })
+        });
+    let dump_included = include_minidump && dump_available;
+
+    let settings_file = settings_path(&game_id)?;
+    let settings_text = fs::read_to_string(&settings_file).ok();
+    let settings_value = settings_text
+        .as_deref()
+        .and_then(|text| toml::from_str::<RuntimeSettings>(text).ok())
+        .and_then(|settings| serde_json::to_value(settings).ok());
+
+    let hardware_result = run_hardware_probe(&game);
+    let hardware_value = hardware_result.as_ref().ok();
+
+    let mut os_version_command = Command::new("cmd.exe");
+    os_version_command.args(["/C", "ver"]);
+    hide_child_console(&mut os_version_command);
+    let os_version = os_version_command
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Windows version unavailable".to_string());
+
+    let runtime_file = runtime_path(&game).ok();
+    let runtime_sha256 = runtime_file
+        .as_deref()
+        .and_then(|path| sha256_file(path).ok());
+    let active_runtime_version = if game.id == "cot" {
+        game_component_store()
+            .ok()
+            .and_then(|store| store.active_status("runtime.cot").ok().flatten())
+            .map(|status| status.version)
+            .unwrap_or_else(|| game.runtime_version.clone())
+    } else {
+        game.runtime_version.clone()
+    };
+    let build_id = crash_data
+        .as_ref()
+        .and_then(|value| value.get("build_id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let crash_runtime_sha256 = crash_data
+        .as_ref()
+        .and_then(|value| value.get("runtime_sha256"))
+        .cloned()
+        .filter(|value| !value.is_null())
+        .or_else(|| runtime_sha256.clone().map(serde_json::Value::String))
+        .unwrap_or(serde_json::Value::Null);
+    let last_vulkan_call = crash_data
+        .as_ref()
+        .and_then(|value| value.get("last_vulkan_call"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let classification = match last_vulkan_call.as_str() {
+        Some("vkQueuePresentKHR") => serde_json::Value::String("renderer_presentation_failure".into()),
+        Some(_) => serde_json::Value::String("renderer_vulkan_failure".into()),
+        None => serde_json::Value::Null,
+    };
+    let incident_id = incident.as_ref().map(|incident| {
+        format!("{}-{}", game.id, incident.stem.trim_start_matches("crash-"))
+    });
+
+    let hardware_field = |name: &str| {
+        hardware_value
+            .and_then(|value| value.get(name))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let settings_field = |pointer: &str| {
+        settings_value
+            .as_ref()
+            .and_then(|value| value.pointer(pointer))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let crash_field = |name: &str| {
+        crash_data
+            .as_ref()
+            .and_then(|value| value.get(name))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+
+    let summary = serde_json::json!({
+        "schema_version": 2,
+        "incident_id": incident_id,
+        "created_at": utc_timestamp_iso8601(),
+        "result": if incident.is_some() { "crash" } else { "manual_support_request" },
+        "classification": classification,
+        "game": {
+            "id": game.id,
+            "name": game.name,
+        },
+        "versions": {
+            "suite": suite.version,
+            "launcher": env!("CARGO_PKG_VERSION"),
+            "runtime": active_runtime_version,
+            "build_id": build_id,
+            "runtime_sha256": crash_runtime_sha256,
+        },
+        "system": {
+            "os": os_version,
+            "os_build": serde_json::Value::Null,
+            "architecture": std::env::consts::ARCH,
+            "gpu": hardware_field("adapter"),
+            "gpu_vendor_id": hardware_field("vendor_id"),
+            "gpu_device_id": hardware_field("device_id"),
+            "vulkan_api": hardware_field("vulkan_api"),
+            "driver_version": serde_json::Value::Null,
+        },
+        "settings": {
+            "display_mode": settings_field("/display/mode"),
+            "output_resolution": settings_field("/display/output_resolution"),
+            "resolution_scale": settings_field("/display/resolution_scale"),
+            "aspect_ratio": settings_field("/display/aspect_ratio"),
+            "vsync": settings_field("/display/vsync"),
+            "anti_aliasing": settings_field("/graphics/anti_aliasing"),
+            "texture_filtering": settings_field("/graphics/texture_filtering"),
+        },
+        "failure": {
+            "exception_code": crash_field("exception_code"),
+            "access": crash_field("access"),
+            "invalid_address": crash_field("invalid_address"),
+            "frame": crash_field("frame"),
+            "thread_id": crash_field("thread_id"),
+            "last_vulkan_call": last_vulkan_call,
+            "vulkan_result": crash_field("vulkan_result_name"),
+            "vulkan_result_code": crash_field("vulkan_result"),
+            "vulkan_stage": crash_field("vulkan_stage"),
+            "gpu_sequence": crash_field("gpu_sequence"),
+            "faulting_module": crash_field("faulting_module"),
+        },
+        "artifacts": {
+            "runtime_log": logs_dir.join("runtime.log").is_file(),
+            "stutter_log": logs_dir.join("stutter.log").is_file(),
+            "crash_log": incident.is_some(),
+            "crash_json": incident.as_ref().is_some_and(|incident| incident.json.is_some()),
+            "minidump": dump_included,
+            "minidump_available": dump_available,
+            "gpu_breadcrumbs": false,
+        },
+        "privacy": {
+            "game_files_included": false,
+            "save_contents_included": false,
+            "personal_paths_sanitized": true,
+            "minidump_requires_consent": true,
+        }
+    });
 
     let support_dir = storage_layout()?.support_root();
     fs::create_dir_all(&support_dir)
@@ -2902,6 +3494,12 @@ fn create_support_package(
         File::create(&output_path).map_err(|e| format!("Could not create support package: {e}"))?;
     let mut zip = ZipWriter::new(file);
 
+    add_text_to_zip(
+        &mut zip,
+        "summary.json",
+        &serde_json::to_string_pretty(&summary).map_err(|error| error.to_string())?,
+    )?;
+
     if let Ok(path) = launcher_log_path()
         && let Ok(text) = fs::read_to_string(path)
     {
@@ -2912,7 +3510,6 @@ fn create_support_package(
         )?;
     }
 
-    let logs_dir = game_log_root(&game_id)?;
     let runtime_log = logs_dir.join("runtime.log");
     if let Ok(text) = fs::read_to_string(&runtime_log) {
         add_text_to_zip(
@@ -2921,14 +3518,42 @@ fn create_support_package(
             &sanitize_text(text, game_root.as_deref()),
         )?;
     }
-    if let Some(crash) = newest_crash_log(&logs_dir)
-        && let Ok(text) = fs::read_to_string(crash)
-    {
+    let stutter_log = logs_dir.join("stutter.log");
+    if let Ok(text) = fs::read_to_string(&stutter_log) {
         add_text_to_zip(
             &mut zip,
-            "logs/latest-crash.log",
+            "logs/stutter.log",
             &sanitize_text(text, game_root.as_deref()),
         )?;
+    }
+
+    if let Some(incident) = &incident {
+        if let Ok(text) = fs::read_to_string(&incident.log) {
+            add_text_to_zip(
+                &mut zip,
+                &format!("crash/{}.log", incident.stem),
+                &sanitize_text(text, game_root.as_deref()),
+            )?;
+        }
+        if let Some(json) = &incident.json
+            && let Ok(text) = fs::read_to_string(json)
+        {
+            add_text_to_zip(
+                &mut zip,
+                &format!("crash/{}.json", incident.stem),
+                &sanitize_text(text, game_root.as_deref()),
+            )?;
+        }
+        if dump_included
+            && let Some(dump) = &incident.dump
+        {
+            add_binary_file_to_zip(
+                &mut zip,
+                &format!("crash/{}.dmp", incident.stem),
+                dump,
+                SUPPORT_BINARY_FILE_LIMIT,
+            )?;
+        }
     }
 
     let versions = serde_json::json!({
@@ -2938,7 +3563,9 @@ fn create_support_package(
         "game_id": game.id,
         "game_name": game.name,
         "runtime": game.runtime,
-        "runtime_version": game.runtime_version,
+        "runtime_version": active_runtime_version,
+        "build_id": build_id,
+        "runtime_sha256": runtime_sha256,
         "profile_status": game.status,
     });
     add_text_to_zip(
@@ -2947,8 +3574,7 @@ fn create_support_package(
         &serde_json::to_string_pretty(&versions).map_err(|e| e.to_string())?,
     )?;
 
-    let settings = settings_path(&game_id)?;
-    if let Ok(text) = fs::read_to_string(settings) {
+    if let Some(text) = settings_text {
         add_text_to_zip(
             &mut zip,
             "settings.toml",
@@ -2956,7 +3582,7 @@ fn create_support_package(
         )?;
     }
 
-    match run_hardware_probe(&game) {
+    match hardware_result {
         Ok(hardware) => add_text_to_zip(
             &mut zip,
             "hardware.json",
@@ -2969,14 +3595,6 @@ fn create_support_package(
         )?,
     }
 
-    let mut os_version_command = Command::new("cmd.exe");
-    os_version_command.args(["/C", "ver"]);
-    hide_child_console(&mut os_version_command);
-    let os_version = os_version_command
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_else(|| "Windows version unavailable".to_string());
     add_text_to_zip(
         &mut zip,
         "os.txt",
@@ -2986,12 +3604,18 @@ fn create_support_package(
     add_text_to_zip(
         &mut zip,
         "README.txt",
-        "This support package contains technical diagnostics only. It does not include game files or save-file contents.\n",
+        &format!(
+            "This support package contains technical diagnostics only. It does not include game files or save-file contents.\n\nMinidump included: {}\nMinidumps may contain small fragments of memory used by the runtime and are never uploaded automatically.\n",
+            if dump_included { "yes (user consented)" } else { "no" }
+        ),
     )?;
     zip.finish()
         .map_err(|e| format!("Could not finalize support package: {e}"))?;
 
-    append_launcher_log(&format!("Created support package for {}", game_id));
+    append_launcher_log(&format!(
+        "Created support package for {} (minidump_included={})",
+        game_id, dump_included
+    ));
     if let Some(parent) = output_path.parent() {
         let _ = Command::new("explorer.exe").arg(parent).spawn();
     }
@@ -3036,6 +3660,83 @@ fn parsed_suite_manifest() -> Result<SuiteManifest, String> {
         .map_err(|error| format!("Could not parse suite manifest: {error}"))
 }
 
+fn fetch_game_component_catalog(
+    update_catalog_url: &str,
+    localization_catalog_url: &str,
+) -> Result<updates::UpdateCatalog, String> {
+    let mut catalog = updates::fetch_catalog(update_catalog_url)?;
+    updates::apply_builtin_language_metadata(&mut catalog);
+    if !localization_catalog_url.trim().is_empty() {
+        match updates::fetch_localization_catalog(localization_catalog_url) {
+            Ok(localization_catalog) => {
+                if let Err(error) =
+                    updates::apply_localization_catalog_metadata(&mut catalog, &localization_catalog)
+                {
+                    append_launcher_log(&format!(
+                        "Localization catalog could not be applied; continuing without dynamic language components: {error}"
+                    ));
+                }
+            }
+            Err(error) => append_launcher_log(&format!(
+                "Localization catalog unavailable; continuing without dynamic language metadata: {error}"
+            )),
+        }
+    }
+    Ok(catalog)
+}
+
+async fn fetch_runtime_localization_catalog(
+    component_id: &str,
+    version: &str,
+) -> Result<Option<(updates::ComponentRelease, updates::LocalizationCatalog)>, String> {
+    let suite = parsed_suite_manifest()?;
+    if suite.update_catalog.trim().is_empty() {
+        return Ok(None);
+    }
+    let catalog_url = suite.update_catalog.clone();
+    let expected_channel = suite.release_channel.clone();
+    let component_id = component_id.to_string();
+    let version = version.to_string();
+    let catalog = tauri::async_runtime::spawn_blocking(move || updates::fetch_catalog(&catalog_url))
+        .await
+        .map_err(|error| format!("Update catalog worker failed: {error}"))??;
+    if catalog.channel != expected_channel {
+        return Err(format!(
+            "Update catalog channel mismatch: expected {expected_channel}, got {}",
+            catalog.channel
+        ));
+    }
+    let release = catalog
+        .releases
+        .into_iter()
+        .find(|release| release.id == component_id && release.version == version)
+        .ok_or_else(|| format!("Runtime {component_id} {version} is not available"))?;
+    if release.kind != updates::ComponentKind::Runtime {
+        return Err(format!("Component {} is not a runtime", release.id));
+    }
+    let Some(localization_catalog_url) = release.localization_catalog_url.clone() else {
+        return Ok(None);
+    };
+    let localization_catalog = tauri::async_runtime::spawn_blocking(move || {
+        updates::fetch_localization_catalog(&localization_catalog_url)
+    })
+    .await
+    .map_err(|error| format!("Localization catalog worker failed: {error}"))??;
+    let game_id = release
+        .game_id
+        .as_deref()
+        .ok_or_else(|| "Runtime release is missing game_id".to_string())?;
+    if localization_catalog.game_id != game_id
+        || localization_catalog.runtime_version != release.version
+    {
+        return Err(format!(
+            "Localization catalog does not belong to {} {}",
+            release.id, release.version
+        ));
+    }
+    Ok(Some((release, localization_catalog)))
+}
+
 fn component_kind_name(kind: &updates::ComponentKind) -> &'static str {
     match kind {
         updates::ComponentKind::Launcher => "launcher",
@@ -3076,6 +3777,8 @@ fn local_component_statuses(
         kind: "launcher".into(),
         game_id: None,
         locale: None,
+        display_name: None,
+        xbox_language: None,
         installed_version: Some(env!("CARGO_PKG_VERSION").into()),
         latest_version: None,
         state: "up_to_date".into(),
@@ -3084,7 +3787,9 @@ fn local_component_statuses(
         published: None,
         notes_url: None,
         last_action: launcher_store.last_action_state("launcher"),
+        can_rollback: false,
         releases: Vec::new(),
+        installed_versions: Vec::new(),
     }];
     for game in manifests {
         let id = format!("runtime.{}", game.id);
@@ -3101,6 +3806,8 @@ fn local_component_statuses(
             kind: "runtime".into(),
             game_id: Some(game.id.clone()),
             locale: None,
+            display_name: None,
+            xbox_language: None,
             installed_version,
             latest_version: None,
             state: state.into(),
@@ -3108,19 +3815,63 @@ fn local_component_statuses(
             size: None,
             published: None,
             notes_url: None,
-            last_action: active
-                .and_then(|status| status.last_action)
-                .or_else(|| game_store.last_action_state(&id)),
+            can_rollback: active.as_ref().is_some_and(|status| status.can_rollback),
+            last_action: active.and_then(|status| status.last_action),
             releases: Vec::new(),
+            installed_versions: game_store
+                .installed_versions(&id)?
+                .into_iter()
+                .map(|version| InstalledComponentVersionStatus {
+                    version: version.version,
+                    healthy: version.healthy,
+                })
+                .collect(),
         });
     }
-    let language_id = "language.cot.pt-br";
-    if let Some(active) = game_store.active_status(language_id)? {
+    for game in manifests {
+        for language in game_store.active_languages(&game.id)? {
+            let active = game_store.active_status(&language.id)?;
+            statuses.push(ComponentUpdateStatus {
+                id: language.id.clone(),
+                kind: "language".into(),
+                game_id: Some(language.game_id),
+                locale: Some(language.locale),
+                display_name: Some(language.display_name),
+                xbox_language: Some(language.xbox_language),
+                installed_version: Some(language.version),
+                latest_version: None,
+                state: if language.healthy {
+                    "up_to_date".into()
+                } else {
+                    "corrupted".into()
+                },
+                download_url: None,
+                size: None,
+                published: None,
+                notes_url: None,
+                can_rollback: active.as_ref().is_some_and(|status| status.can_rollback),
+                last_action: active
+                    .and_then(|status| status.last_action)
+                    .or_else(|| game_store.last_action_state(&language.id)),
+                releases: Vec::new(),
+                installed_versions: Vec::new(),
+            });
+        }
+    }
+
+    // Compatibility for PT-BR components installed by launcher versions that
+    // predate generic language metadata in installation.toml.
+    let legacy_ptbr_id = "language.cot.pt-br";
+    if !statuses.iter().any(|status| status.id == legacy_ptbr_id)
+        && let Some(active) = game_store.active_status(legacy_ptbr_id)?
+    {
         statuses.push(ComponentUpdateStatus {
-            id: language_id.into(),
+            id: legacy_ptbr_id.into(),
             kind: "language".into(),
             game_id: Some("cot".into()),
             locale: Some("pt-BR".into()),
+            display_name: Some("Brazilian Portuguese".into()),
+            xbox_language: Some(1),
             installed_version: Some(active.version),
             latest_version: None,
             state: if active.healthy {
@@ -3132,10 +3883,12 @@ fn local_component_statuses(
             size: None,
             published: None,
             notes_url: None,
+            can_rollback: active.can_rollback,
             last_action: active
                 .last_action
-                .or_else(|| game_store.last_action_state(language_id)),
+                .or_else(|| game_store.last_action_state(legacy_ptbr_id)),
             releases: Vec::new(),
+            installed_versions: Vec::new(),
         });
     }
     Ok(statuses)
@@ -3182,6 +3935,47 @@ fn installed_update_components(
     Ok(installed)
 }
 
+fn installed_components_for_compatibility(
+    manifests: &[GameManifest],
+    release: &updates::ComponentRelease,
+) -> Result<Vec<updates::InstalledComponent>, String> {
+    let store = game_component_store()?;
+    let mut installed = vec![updates::InstalledComponent {
+        id: "launcher".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        healthy: true,
+    }];
+    let mut seen = HashSet::from(["launcher".to_string()]);
+
+    for game in manifests {
+        let id = format!("runtime.{}", game.id);
+        if let Some(status) = store.active_status(&id)? {
+            let healthy = status.healthy && runtime_component_is_ready(&store, &id)?;
+            installed.push(updates::InstalledComponent {
+                id: id.clone(),
+                version: status.version,
+                healthy,
+            });
+            seen.insert(id);
+        }
+    }
+
+    for requirement in &release.compatibility.requirements {
+        if seen.contains(&requirement.id) {
+            continue;
+        }
+        if let Some(status) = store.active_status(&requirement.id)? {
+            installed.push(updates::InstalledComponent {
+                id: requirement.id.clone(),
+                version: status.version,
+                healthy: status.healthy,
+            });
+            seen.insert(requirement.id.clone());
+        }
+    }
+    Ok(installed)
+}
+
 fn component_statuses_from_catalog(
     manifests: &[GameManifest],
     catalog: &updates::UpdateCatalog,
@@ -3192,11 +3986,31 @@ fn component_statuses_from_catalog(
     let plans = updates::plan_updates(catalog, &installed, env!("CARGO_PKG_VERSION"))?;
     let mut statuses = Vec::with_capacity(plans.len());
     for plan in plans {
+        if plan.kind == updates::ComponentKind::Language
+            && (plan.display_name.is_none() || plan.xbox_language.is_none())
+        {
+            continue;
+        }
+        let launcher_incompatible = plan.kind == updates::ComponentKind::Launcher
+            && plan.latest_version.as_deref().is_some_and(|version| {
+                game_store
+                    .ensure_launcher_version_compatible(version)
+                    .is_err()
+            });
         let last_action = match &plan.kind {
             updates::ComponentKind::Launcher => launcher_store.last_action_state(&plan.id),
-            updates::ComponentKind::Runtime | updates::ComponentKind::Language => {
+            updates::ComponentKind::Runtime | updates::ComponentKind::Language
+                if plan.installed_version.is_some() =>
+            {
                 game_store.last_action_state(&plan.id)
             }
+            updates::ComponentKind::Runtime | updates::ComponentKind::Language => None,
+        };
+        let can_rollback = match &plan.kind {
+            updates::ComponentKind::Launcher => false,
+            updates::ComponentKind::Runtime | updates::ComponentKind::Language => game_store
+                .active_status(&plan.id)?
+                .is_some_and(|status| status.can_rollback),
         };
         let releases = updates::compatible_releases_for_component(
             catalog,
@@ -3212,20 +4026,44 @@ fn component_statuses_from_catalog(
             size: release.size,
         })
         .collect();
+        let installed_versions = if plan.kind == updates::ComponentKind::Runtime {
+            game_store
+                .installed_versions(&plan.id)?
+                .into_iter()
+                .map(|version| InstalledComponentVersionStatus {
+                    version: version.version,
+                    healthy: version.healthy,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         statuses.push(ComponentUpdateStatus {
             id: plan.id.clone(),
             kind: component_kind_name(&plan.kind).into(),
             game_id: plan.game_id,
             locale: plan.locale,
+            display_name: plan.display_name,
+            xbox_language: plan.xbox_language,
             installed_version: plan.installed_version,
             latest_version: plan.latest_version,
-            state: plan_state_name(&plan.state).into(),
-            download_url: plan.download_url,
+            state: if launcher_incompatible {
+                "incompatible".into()
+            } else {
+                plan_state_name(&plan.state).into()
+            },
+            download_url: if launcher_incompatible {
+                None
+            } else {
+                plan.download_url
+            },
             size: plan.size,
             published: plan.published,
             notes_url: plan.notes_url,
             last_action,
+            can_rollback,
             releases,
+            installed_versions,
         });
     }
 
@@ -3237,6 +4075,107 @@ fn component_statuses_from_catalog(
     }
     statuses.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(statuses)
+}
+
+fn launcher_component_status_from_catalog(
+    catalog: &updates::UpdateCatalog,
+) -> Result<ComponentUpdateStatus, String> {
+    let launcher_store = launcher_component_store()?;
+    let game_store = game_component_store()?;
+    let launcher_catalog = updates::UpdateCatalog {
+        schema_version: catalog.schema_version,
+        channel: catalog.channel.clone(),
+        releases: catalog
+            .releases
+            .iter()
+            .filter(|release| {
+                release.id == "launcher" && release.package == updates::PackageFormat::PortableExe
+            })
+            .cloned()
+            .collect(),
+    };
+    if launcher_catalog.releases.is_empty() {
+        return local_component_statuses(&[])?
+            .into_iter()
+            .find(|component| component.id == "launcher")
+            .ok_or_else(|| "Launcher status is unavailable".to_string());
+    }
+
+    let mut installed = vec![updates::InstalledComponent {
+        id: "launcher".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        healthy: true,
+    }];
+    let mut seen = HashSet::from(["launcher".to_string()]);
+    for requirement in launcher_catalog
+        .releases
+        .iter()
+        .flat_map(|release| release.compatibility.requirements.iter())
+    {
+        if seen.contains(&requirement.id) {
+            continue;
+        }
+        if let Some(status) = game_store.active_status(&requirement.id)? {
+            installed.push(updates::InstalledComponent {
+                id: requirement.id.clone(),
+                version: status.version,
+                healthy: status.healthy,
+            });
+            seen.insert(requirement.id.clone());
+        }
+    }
+
+    let plan = updates::plan_updates(&launcher_catalog, &installed, env!("CARGO_PKG_VERSION"))?
+        .into_iter()
+        .find(|plan| plan.id == "launcher")
+        .ok_or_else(|| "Launcher update plan is unavailable".to_string())?;
+    let launcher_incompatible = plan.latest_version.as_deref().is_some_and(|version| {
+        game_store
+            .ensure_launcher_version_compatible(version)
+            .is_err()
+    });
+    let releases = updates::compatible_releases_for_component(
+        &launcher_catalog,
+        &installed,
+        env!("CARGO_PKG_VERSION"),
+        "launcher",
+    )?
+    .into_iter()
+    .map(|release| ComponentReleaseStatus {
+        version: release.version,
+        published: release.published,
+        notes_url: release.notes_url,
+        size: release.size,
+    })
+    .collect();
+
+    Ok(ComponentUpdateStatus {
+        id: plan.id,
+        kind: "launcher".into(),
+        game_id: None,
+        locale: None,
+        display_name: None,
+        xbox_language: None,
+        installed_version: plan.installed_version,
+        latest_version: plan.latest_version,
+        state: if launcher_incompatible {
+            "incompatible".into()
+        } else {
+            plan_state_name(&plan.state).into()
+        },
+        download_url: if launcher_incompatible {
+            None
+        } else {
+            plan.download_url
+        },
+        size: plan.size,
+        published: plan.published,
+        notes_url: plan.notes_url,
+        last_action: launcher_store.last_action_state("launcher"),
+        can_rollback: false,
+        releases,
+        installed_versions: Vec::new(),
+    })
 }
 
 fn select_component_release(
@@ -3252,7 +4191,12 @@ fn select_component_release(
         &installed,
         env!("CARGO_PKG_VERSION"),
         component_id,
-    )?;
+    )?
+    .into_iter()
+    .filter(|release| {
+        component_id != "launcher" || release.package == updates::PackageFormat::PortableExe
+    })
+    .collect::<Vec<_>>();
     let release = match requested_version {
         Some(version) => compatible
             .iter()
@@ -3275,6 +4219,16 @@ fn select_component_release(
         return Err(format!(
             "Component {component_id} version {} is already active",
             release.version
+        ));
+    }
+    if release.kind == updates::ComponentKind::Launcher {
+        game_component_store()?.ensure_launcher_version_compatible(&release.version)?;
+    }
+    if release.kind == updates::ComponentKind::Language
+        && (release.display_name.is_none() || release.xbox_language.is_none())
+    {
+        return Err(format!(
+            "Localization metadata is unavailable for {component_id}; check for updates again"
         ));
     }
     Ok(release)
@@ -3311,16 +4265,155 @@ fn ensure_game_stopped(game_id: &str, state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_runtime_version_operation_idle(
+    component_id: &str,
+    state: &AppState,
+) -> Result<String, String> {
+    ensure_component_update_idle(state)?;
+    ensure_library_idle(state)?;
+    let game_id = component_id
+        .strip_prefix("runtime.")
+        .ok_or_else(|| "Only game runtime versions can be managed here".to_string())?;
+    let game = manifest(state, game_id)?;
+    if !game.playable {
+        return Err(format!(
+            "{} does not have a selectable runtime yet",
+            game.name
+        ));
+    }
+    ensure_game_stopped(game_id, state).map_err(|error| {
+        if error.starts_with("Close ") {
+            format!("Close {} before changing runtime versions", game.name)
+        } else {
+            error
+        }
+    })?;
+    if state
+        .setup_jobs
+        .lock()
+        .map_err(|_| "Game setup state lock failed")?
+        .values()
+        .any(|running| *running)
+    {
+        return Err("Wait for game setup to finish before changing runtime versions".into());
+    }
+    if !state
+        .localization_jobs
+        .lock()
+        .map_err(|_| "Localization state lock failed")?
+        .is_empty()
+    {
+        return Err("Wait for localization work to finish before changing runtime versions".into());
+    }
+    Ok(game_id.to_string())
+}
+
 #[tauri::command]
 async fn check_component_updates(
+    offline_only: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<UpdateOverview, String> {
     let suite = parsed_suite_manifest()?;
     let manifests = state.manifests.clone();
+    let game_components_only = |mut components: Vec<ComponentUpdateStatus>| {
+        components.retain(|component| component.id != "launcher");
+        components
+    };
+    if offline_only.unwrap_or(false) || suite.update_catalog.trim().is_empty() {
+        return Ok(UpdateOverview {
+            configured: !suite.update_catalog.trim().is_empty(),
+            components: game_components_only(local_component_statuses(&manifests)?),
+            error: None,
+        });
+    }
+    let catalog_url = suite.update_catalog;
+    let localization_catalog_url = suite.localization_catalog;
+    let expected_channel = suite.release_channel;
+    match tauri::async_runtime::spawn_blocking(move || {
+        fetch_game_component_catalog(&catalog_url, &localization_catalog_url)
+    })
+    .await
+    {
+        Ok(Ok(catalog)) if catalog.channel == expected_channel => Ok(UpdateOverview {
+            configured: true,
+            components: game_components_only(component_statuses_from_catalog(
+                &manifests, &catalog,
+            )?),
+            error: None,
+        }),
+        Ok(Ok(catalog)) => Ok(UpdateOverview {
+            configured: true,
+            components: game_components_only(local_component_statuses(&manifests)?),
+            error: Some(format!(
+                "Update catalog channel mismatch: expected {expected_channel}, got {}",
+                catalog.channel
+            )),
+        }),
+        Ok(Err(error)) => Ok(UpdateOverview {
+            configured: true,
+            components: game_components_only(local_component_statuses(&manifests)?),
+            error: Some(error),
+        }),
+        Err(error) => Ok(UpdateOverview {
+            configured: true,
+            components: game_components_only(local_component_statuses(&manifests)?),
+            error: Some(format!("Update catalog worker failed: {error}")),
+        }),
+    }
+}
+
+#[tauri::command]
+async fn runtime_additional_content(
+    component_id: String,
+    version: String,
+) -> Result<Option<RuntimeAdditionalContentStatus>, String> {
+    let Some((_runtime, localization_catalog)) =
+        fetch_runtime_localization_catalog(&component_id, &version).await?
+    else {
+        return Ok(None);
+    };
+    let store = game_component_store()?;
+    let languages = localization_catalog
+        .languages
+        .iter()
+        .map(|language| {
+            let installed_version = store
+                .active_status(&language.id)
+                .ok()
+                .flatten()
+                .filter(|status| status.healthy)
+                .map(|status| status.version);
+            RuntimeAdditionalLanguageStatus {
+                id: language.id.clone(),
+                locale: language.locale.clone(),
+                display_name: language.display_name.clone(),
+                version: language.version.clone(),
+                installed_version,
+            }
+        })
+        .collect();
+    Ok(Some(RuntimeAdditionalContentStatus {
+        game_id: localization_catalog.game_id,
+        runtime_version: localization_catalog.runtime_version,
+        pack_version: localization_catalog.pack_version,
+        pack_size: localization_catalog.size,
+        languages,
+    }))
+}
+
+#[tauri::command]
+async fn check_launcher_update() -> Result<UpdateOverview, String> {
+    let suite = parsed_suite_manifest()?;
+    let local_launcher = || -> Result<Vec<ComponentUpdateStatus>, String> {
+        Ok(local_component_statuses(&[])?
+            .into_iter()
+            .filter(|component| component.id == "launcher")
+            .collect())
+    };
     if suite.update_catalog.trim().is_empty() {
         return Ok(UpdateOverview {
             configured: false,
-            components: local_component_statuses(&manifests)?,
+            components: local_launcher()?,
             error: None,
         });
     }
@@ -3329,12 +4422,12 @@ async fn check_component_updates(
     match tauri::async_runtime::spawn_blocking(move || updates::fetch_catalog(&catalog_url)).await {
         Ok(Ok(catalog)) if catalog.channel == expected_channel => Ok(UpdateOverview {
             configured: true,
-            components: component_statuses_from_catalog(&manifests, &catalog)?,
+            components: vec![launcher_component_status_from_catalog(&catalog)?],
             error: None,
         }),
         Ok(Ok(catalog)) => Ok(UpdateOverview {
             configured: true,
-            components: local_component_statuses(&manifests)?,
+            components: local_launcher()?,
             error: Some(format!(
                 "Update catalog channel mismatch: expected {expected_channel}, got {}",
                 catalog.channel
@@ -3342,12 +4435,12 @@ async fn check_component_updates(
         }),
         Ok(Err(error)) => Ok(UpdateOverview {
             configured: true,
-            components: local_component_statuses(&manifests)?,
+            components: local_launcher()?,
             error: Some(error),
         }),
         Err(error) => Ok(UpdateOverview {
             configured: true,
-            components: local_component_statuses(&manifests)?,
+            components: local_launcher()?,
             error: Some(format!("Update catalog worker failed: {error}")),
         }),
     }
@@ -3358,19 +4451,22 @@ async fn install_component_update(
     component_id: String,
     version: Option<String>,
     reinstall: bool,
+    activate: bool,
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<ComponentUpdateResult, String> {
     let suite = parsed_suite_manifest()?;
     let catalog_url = suite.update_catalog.clone();
+    let localization_catalog_url = suite.localization_catalog.clone();
     if catalog_url.trim().is_empty() {
         return Err("No update catalog is configured".into());
     }
     let expected_channel = suite.release_channel.clone();
-    let catalog =
-        tauri::async_runtime::spawn_blocking(move || updates::fetch_catalog(&catalog_url))
-            .await
-            .map_err(|error| format!("Update catalog worker failed: {error}"))??;
+    let catalog = tauri::async_runtime::spawn_blocking(move || {
+        fetch_game_component_catalog(&catalog_url, &localization_catalog_url)
+    })
+    .await
+    .map_err(|error| format!("Update catalog worker failed: {error}"))??;
     if catalog.channel != expected_channel {
         return Err(format!(
             "Update catalog channel mismatch: expected {expected_channel}, got {}",
@@ -3390,6 +4486,9 @@ async fn install_component_update(
             game_component_store()?
         }
     };
+    if !activate && release.kind != updates::ComponentKind::Runtime {
+        return Err("Only runtime versions can be downloaded without activation".into());
+    }
     {
         let _operation_gate = state
             .operation_gate
@@ -3440,28 +4539,24 @@ async fn install_component_update(
             },
         );
         let mut last_download_percent = 0u8;
-        let download = updates::download_release(
-            &worker_store,
-            &worker_release,
-            |done, total| {
-                let percent = progress_percent(done, total, 0, 100);
-                if percent == last_download_percent {
-                    return;
-                }
-                last_download_percent = percent;
-                emit_component_update_progress(
-                    &worker_app,
-                    ComponentUpdateProgress {
-                        component_id: worker_release.id.clone(),
-                        stage: "downloading".into(),
-                        progress: percent,
-                        detail: "Downloading and verifying SHA-256...".into(),
-                        bytes_done: done,
-                        bytes_total: total,
-                    },
-                );
-            },
-        );
+        let download = updates::download_release(&worker_store, &worker_release, |done, total| {
+            let percent = progress_percent(done, total, 0, 100);
+            if percent == last_download_percent {
+                return;
+            }
+            last_download_percent = percent;
+            emit_component_update_progress(
+                &worker_app,
+                ComponentUpdateProgress {
+                    component_id: worker_release.id.clone(),
+                    stage: "downloading".into(),
+                    progress: percent,
+                    detail: "Downloading and verifying SHA-256...".into(),
+                    bytes_done: done,
+                    bytes_total: total,
+                },
+            );
+        });
         if let Err(error) = download {
             let _ = worker_store.record_action(&worker_release.id, "failed", &error);
             emit_component_update_progress(
@@ -3477,13 +4572,142 @@ async fn install_component_update(
             );
             return Err(error);
         }
+        let worker_release = if worker_release.kind == updates::ComponentKind::Language {
+            if let Some(pack_reference) = worker_release.localization_pack.clone() {
+                let artifact = worker_store.staged_artifact_path(&worker_release);
+                let pack_staging = std::env::temp_dir().join(format!(
+                    "mojorecomp-online-localization-pack-{}-{}",
+                    std::process::id(),
+                    timestamp_seconds()
+                ));
+                let prepared = (|| -> Result<updates::ComponentRelease, String> {
+                    let pack = updates::extract_offline_localization_pack(&artifact, &pack_staging)?;
+                    if pack.version != pack_reference.version {
+                        return Err(format!(
+                            "Localization Pack version mismatch: expected {}, got {}",
+                            pack_reference.version, pack.version
+                        ));
+                    }
+                    if worker_release.game_id.as_deref() != Some(pack.game_id.as_str()) {
+                        return Err("Localization Pack game does not match the selected language component".into());
+                    }
+                    let language = pack
+                        .languages
+                        .iter()
+                        .find(|language| language.id == worker_release.id)
+                        .ok_or_else(|| {
+                            format!(
+                                "Localization Pack does not contain component {}",
+                                worker_release.id
+                            )
+                        })?;
+                    if language.version != worker_release.version
+                        || worker_release.locale.as_deref() != Some(language.locale.as_str())
+                        || worker_release.display_name.as_deref()
+                            != Some(language.display_name.as_str())
+                        || worker_release.xbox_language != Some(language.xbox_language)
+                    {
+                        return Err(
+                            "Localization Pack language metadata does not match the update catalog"
+                                .into(),
+                        );
+                    }
+                    let mut component_release = worker_release.clone();
+                    component_release.size = pack_reference.component_size;
+                    component_release.sha256 = pack_reference.component_sha256;
+                    component_release.localization_pack = None;
+                    let signed = updates::inspect_signed_release_artifact(
+                        &language.package_path,
+                        env!("CARGO_PKG_VERSION"),
+                        &component_release,
+                    )?;
+                    worker_store.stage_local_artifact(&signed, &language.package_path)?;
+                    Ok(signed)
+                })();
+                let _ = fs::remove_dir_all(&pack_staging);
+                match prepared {
+                    Ok(release) => release,
+                    Err(error) => {
+                        let _ = worker_store.record_action(&worker_release.id, "failed", &error);
+                        emit_component_update_progress(
+                            &worker_app,
+                            ComponentUpdateProgress {
+                                component_id: worker_release.id.clone(),
+                                stage: "failed".into(),
+                                progress: 0,
+                                detail: error.clone(),
+                                bytes_done: worker_release.size,
+                                bytes_total: worker_release.size,
+                            },
+                        );
+                        return Err(error);
+                    }
+                }
+            } else {
+                worker_release
+            }
+        } else {
+            worker_release
+        };
+        let worker_release = match worker_release.kind {
+            updates::ComponentKind::Launcher => {
+                let artifact = worker_store.staged_artifact_path(&worker_release);
+                if let Err(error) =
+                    updates::verify_signed_launcher_executable(&artifact, &worker_release.version)
+                {
+                    let _ = worker_store.record_action(&worker_release.id, "failed", &error);
+                    emit_component_update_progress(
+                        &worker_app,
+                        ComponentUpdateProgress {
+                            component_id: worker_release.id.clone(),
+                            stage: "failed".into(),
+                            progress: 0,
+                            detail: error.clone(),
+                            bytes_done: worker_release.size,
+                            bytes_total: worker_release.size,
+                        },
+                    );
+                    return Err(error);
+                }
+                worker_release
+            }
+            updates::ComponentKind::Runtime | updates::ComponentKind::Language => {
+                let artifact = worker_store.staged_artifact_path(&worker_release);
+                match updates::inspect_signed_release_artifact(
+                    &artifact,
+                    env!("CARGO_PKG_VERSION"),
+                    &worker_release,
+                ) {
+                    Ok(signed) => signed,
+                    Err(error) => {
+                        let _ = worker_store.record_action(&worker_release.id, "failed", &error);
+                        emit_component_update_progress(
+                            &worker_app,
+                            ComponentUpdateProgress {
+                                component_id: worker_release.id.clone(),
+                                stage: "failed".into(),
+                                progress: 0,
+                                detail: error.clone(),
+                                bytes_done: worker_release.size,
+                                bytes_total: worker_release.size,
+                            },
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+        };
         emit_component_update_progress(
             &worker_app,
             ComponentUpdateProgress {
                 component_id: worker_release.id.clone(),
                 stage: "validating".into(),
                 progress: 100,
-                detail: "Package size and SHA-256 verified.".into(),
+                detail: if worker_release.kind == updates::ComponentKind::Launcher {
+                    "Launcher executable signature, size, and SHA-256 verified.".into()
+                } else {
+                    "Package signature, manifest, size, and SHA-256 verified.".into()
+                },
                 bytes_done: worker_release.size,
                 bytes_total: worker_release.size,
             },
@@ -3508,16 +4732,16 @@ async fn install_component_update(
                 &worker_app,
                 ComponentUpdateProgress {
                     component_id: worker_release.id.clone(),
-                    stage: "ready_manual".into(),
+                    stage: "ready_restart".into(),
                     progress: 100,
-                    detail: "Verified launcher package is ready. Close the launcher before replacing it.".into(),
+                    detail: "Verified launcher package is ready to install on restart.".into(),
                     bytes_done: worker_release.size,
                     bytes_total: worker_release.size,
                 },
             );
             return Ok(ComponentUpdateResult {
                 component_id: worker_release.id,
-                state: "ready_manual".into(),
+                state: "ready_restart".into(),
                 restart_required: true,
             });
         }
@@ -3533,8 +4757,7 @@ async fn install_component_update(
                 bytes_total: worker_release.size,
             },
         );
-        if let Err(error) =
-            worker_store.prepare_repair(&worker_release.id, &worker_release.version)
+        if let Err(error) = worker_store.prepare_repair(&worker_release.id, &worker_release.version)
         {
             let _ = worker_store.record_action(&worker_release.id, "failed", &error);
             emit_component_update_progress(
@@ -3550,11 +4773,17 @@ async fn install_component_update(
             );
             return Err(error);
         }
-        if let Err(error) = worker_store.install_staged(&worker_release) {
+        let install_result = if activate {
+            worker_store.install_staged(&worker_release)
+        } else {
+            worker_store.install_staged_inactive(&worker_release)
+        };
+        if let Err(error) = install_result {
             if matches!(
                 worker_store.recover_component(&worker_release.id),
                 Ok(Some(updates::RecoveryResult::Completed(_)))
-            ) {
+            ) && activate
+            {
                 let _ = worker_store.record_action(
                     &worker_release.id,
                     "installed",
@@ -3582,14 +4811,22 @@ async fn install_component_update(
                 component_id: worker_release.id.clone(),
                 stage: "complete".into(),
                 progress: 100,
-                detail: "Component update installed successfully.".into(),
+                detail: if activate {
+                    "Component update installed successfully.".into()
+                } else {
+                    "Runtime version downloaded and verified.".into()
+                },
                 bytes_done: worker_release.size,
                 bytes_total: worker_release.size,
             },
         );
         Ok(ComponentUpdateResult {
             component_id: worker_release.id,
-            state: "installed".into(),
+            state: if activate {
+                "installed".into()
+            } else {
+                "downloaded".into()
+            },
             restart_required: false,
         })
     })
@@ -3614,6 +4851,714 @@ async fn install_component_update(
         }
     }
     result
+}
+
+#[tauri::command]
+async fn install_runtime_additional_content(
+    component_id: String,
+    version: String,
+    language_ids: Vec<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<LocalizationPackInstallResult, String> {
+    let Some((runtime_release, localization_catalog)) =
+        fetch_runtime_localization_catalog(&component_id, &version).await?
+    else {
+        return Err(format!(
+            "Runtime {component_id} {version} has no published additional content"
+        ));
+    };
+    let game_id = runtime_release
+        .game_id
+        .clone()
+        .ok_or_else(|| "Runtime release is missing game_id".to_string())?;
+    let store = game_component_store()?;
+    let active_runtime = store
+        .active_status(&component_id)?
+        .filter(|status| status.healthy)
+        .ok_or_else(|| format!("Activate runtime {version} before installing additional content"))?;
+    if active_runtime.version != version || !runtime_component_is_ready(&store, &component_id)? {
+        return Err(format!(
+            "Activate runtime {version} before installing its additional content"
+        ));
+    }
+
+    let requested = language_ids.into_iter().collect::<HashSet<_>>();
+    if requested.is_empty() {
+        return Ok(LocalizationPackInstallResult {
+            game_id,
+            version: localization_catalog.pack_version,
+            installed_languages: Vec::new(),
+        });
+    }
+    if requested.len() > localization_catalog.languages.len() {
+        return Err("Additional content selection contains unknown languages".into());
+    }
+    for id in &requested {
+        if !localization_catalog
+            .languages
+            .iter()
+            .any(|language| &language.id == id)
+        {
+            return Err(format!("Additional content is not part of runtime {version}: {id}"));
+        }
+    }
+
+    let suite = parsed_suite_manifest()?;
+    let mut language_catalog = updates::UpdateCatalog {
+        schema_version: 1,
+        channel: suite.release_channel,
+        releases: Vec::new(),
+    };
+    updates::apply_localization_catalog_metadata(&mut language_catalog, &localization_catalog)?;
+    let mut releases = Vec::new();
+    for release in language_catalog.releases {
+        if !requested.contains(&release.id) {
+            continue;
+        }
+        let already_installed = store.active_status(&release.id)?.is_some_and(|status| {
+            status.healthy && status.version == release.version
+        });
+        if already_installed {
+            continue;
+        }
+        let installed = installed_components_for_compatibility(&state.manifests, &release)?;
+        updates::validate_release_compatibility(
+            &release,
+            env!("CARGO_PKG_VERSION"),
+            &installed,
+        )?;
+        releases.push(release);
+    }
+    if releases.is_empty() {
+        let installed_languages = localization_catalog
+            .languages
+            .iter()
+            .filter(|language| requested.contains(&language.id))
+            .map(|language| language.locale.clone())
+            .collect();
+        return Ok(LocalizationPackInstallResult {
+            game_id,
+            version: localization_catalog.pack_version,
+            installed_languages,
+        });
+    }
+
+    {
+        let _operation_gate = state
+            .operation_gate
+            .lock()
+            .map_err(|_| "Operation gate lock failed")?;
+        ensure_library_idle(&state)?;
+        ensure_game_stopped(&game_id, &state)?;
+        if state
+            .setup_jobs
+            .lock()
+            .map_err(|_| "Game setup state lock failed")?
+            .values()
+            .any(|running| *running)
+        {
+            return Err("Wait for game setup to finish before installing additional content".into());
+        }
+        if !state
+            .localization_jobs
+            .lock()
+            .map_err(|_| "Localization state lock failed")?
+            .is_empty()
+        {
+            return Err("Wait for localization work to finish before installing additional content".into());
+        }
+        let mut update_running = state
+            .component_update_job
+            .lock()
+            .map_err(|_| "Component update state lock failed")?;
+        if *update_running {
+            return Err("Another component update is already running".into());
+        }
+        *update_running = true;
+    }
+
+    let worker_store = store.clone();
+    let worker_app = app.clone();
+    let worker_catalog = localization_catalog.clone();
+    let worker_game_id = game_id.clone();
+    let worker_result = tauri::async_runtime::spawn_blocking(move || {
+        let first = releases
+            .first()
+            .ok_or_else(|| "No additional language component was selected".to_string())?;
+        emit_component_update_progress(
+            &worker_app,
+            ComponentUpdateProgress {
+                component_id: first.id.clone(),
+                stage: "downloading".into(),
+                progress: 0,
+                detail: format!(
+                    "Downloading Localization Pack {} once for {} selected language(s)...",
+                    worker_catalog.pack_version,
+                    releases.len()
+                ),
+                bytes_done: 0,
+                bytes_total: first.size,
+            },
+        );
+        let mut last_percent = 0u8;
+        let artifact = updates::download_release(&worker_store, first, |done, total| {
+            let percent = progress_percent(done, total, 0, 100);
+            if percent == last_percent {
+                return;
+            }
+            last_percent = percent;
+            emit_component_update_progress(
+                &worker_app,
+                ComponentUpdateProgress {
+                    component_id: first.id.clone(),
+                    stage: "downloading".into(),
+                    progress: percent,
+                    detail: "Downloading and verifying Localization Pack SHA-256...".into(),
+                    bytes_done: done,
+                    bytes_total: total,
+                },
+            );
+        })?;
+        let pack_staging = std::env::temp_dir().join(format!(
+            "mojorecomp-runtime-additional-content-{}-{}",
+            std::process::id(),
+            timestamp_seconds()
+        ));
+        let result = (|| -> Result<Vec<String>, String> {
+            let pack = updates::extract_offline_localization_pack(&artifact, &pack_staging)?;
+            if pack.game_id != worker_game_id || pack.version != worker_catalog.pack_version {
+                return Err("Downloaded Localization Pack does not match this runtime release".into());
+            }
+            let mut prepared_languages = Vec::with_capacity(releases.len());
+            for release in &releases {
+                let language = pack
+                    .languages
+                    .iter()
+                    .find(|language| language.id == release.id)
+                    .ok_or_else(|| format!("Localization Pack does not contain {}", release.id))?;
+                if release.locale.as_deref() != Some(language.locale.as_str())
+                    || release.display_name.as_deref() != Some(language.display_name.as_str())
+                    || release.xbox_language != Some(language.xbox_language)
+                    || release.version != language.version
+                {
+                    return Err("Localization Pack language metadata does not match its catalog".into());
+                }
+                let mut component_release = release.clone();
+                let pack_reference = component_release
+                    .localization_pack
+                    .clone()
+                    .ok_or_else(|| "Localization component is missing pack metadata".to_string())?;
+                component_release.size = pack_reference.component_size;
+                component_release.sha256 = pack_reference.component_sha256;
+                component_release.localization_pack = None;
+                let signed = updates::inspect_signed_release_artifact(
+                    &language.package_path,
+                    env!("CARGO_PKG_VERSION"),
+                    &component_release,
+                )?;
+                prepared_languages.push((signed, language.clone(), component_release.size));
+            }
+
+            let mut installed_languages = Vec::new();
+            for (index, (signed, language, component_size)) in
+                prepared_languages.iter().enumerate()
+            {
+                let ordinal = index + 1;
+                let total = prepared_languages.len();
+                emit_component_update_progress(
+                    &worker_app,
+                    ComponentUpdateProgress {
+                        component_id: signed.id.clone(),
+                        stage: "installing".into(),
+                        progress: 100,
+                        detail: format!("Installing selected language {ordinal} of {total}..."),
+                        bytes_done: *component_size,
+                        bytes_total: *component_size,
+                    },
+                );
+                worker_store.stage_local_artifact(&signed, &language.package_path)?;
+                worker_store.prepare_repair(&signed.id, &signed.version)?;
+                worker_store.install_staged(&signed)?;
+                installed_languages.push(language.locale.clone());
+                emit_component_update_progress(
+                    &worker_app,
+                    ComponentUpdateProgress {
+                        component_id: signed.id.clone(),
+                        stage: "complete".into(),
+                        progress: 100,
+                        detail: format!("Installed {}.", language.display_name),
+                        bytes_done: *component_size,
+                        bytes_total: *component_size,
+                    },
+                );
+            }
+            Ok(installed_languages)
+        })();
+        let _ = fs::remove_dir_all(&pack_staging);
+        result
+    })
+    .await;
+
+    if let Ok(mut running) = state.component_update_job.lock() {
+        *running = false;
+    }
+    let installed_languages = worker_result
+        .map_err(|error| format!("Additional content worker failed: {error}"))??;
+    append_launcher_log(&format!(
+        "Installed Localization Pack {} for {} runtime {} ({} selected language component(s))",
+        localization_catalog.pack_version,
+        game_id,
+        version,
+        installed_languages.len()
+    ));
+    Ok(LocalizationPackInstallResult {
+        game_id,
+        version: localization_catalog.pack_version,
+        installed_languages,
+    })
+}
+
+#[tauri::command]
+async fn install_offline_runtime_package(
+    path: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<ComponentUpdateResult, String> {
+    let package_path = PathBuf::from(path);
+    let current_launcher = env!("CARGO_PKG_VERSION").to_string();
+    let inspect_path = package_path.clone();
+    let release = tauri::async_runtime::spawn_blocking(move || {
+        updates::inspect_offline_package(&inspect_path, &current_launcher)
+    })
+    .await
+    .map_err(|error| format!("Offline package validation worker failed: {error}"))??;
+
+    if release.kind != updates::ComponentKind::Runtime {
+        return Err("Offline installation accepts signed game runtime ZIPs only".into());
+    }
+
+    let installed = installed_components_for_compatibility(&state.manifests, &release)?;
+    updates::validate_release_compatibility(&release, env!("CARGO_PKG_VERSION"), &installed)?;
+    let store = game_component_store()?;
+    {
+        let _operation_gate = state
+            .operation_gate
+            .lock()
+            .map_err(|_| "Operation gate lock failed")?;
+        ensure_library_idle(&state)?;
+        ensure_component_game_stopped(&release, &state)?;
+        if state
+            .setup_jobs
+            .lock()
+            .map_err(|_| "Game setup state lock failed")?
+            .values()
+            .any(|running| *running)
+        {
+            return Err(
+                "Wait for game setup to finish before installing an offline runtime".into(),
+            );
+        }
+        if !state
+            .localization_jobs
+            .lock()
+            .map_err(|_| "Localization state lock failed")?
+            .is_empty()
+        {
+            return Err(
+                "Wait for localization work to finish before installing an offline runtime".into(),
+            );
+        }
+        let mut update_running = state
+            .component_update_job
+            .lock()
+            .map_err(|_| "Component update state lock failed")?;
+        if *update_running {
+            return Err("Another component update is already running".into());
+        }
+        *update_running = true;
+    }
+
+    let worker_store = store.clone();
+    let worker_release = release.clone();
+    let worker_path = package_path.clone();
+    let worker_app = app.clone();
+    let worker_result = tauri::async_runtime::spawn_blocking(move || {
+        emit_component_update_progress(
+            &worker_app,
+            ComponentUpdateProgress {
+                component_id: worker_release.id.clone(),
+                stage: "validating".into(),
+                progress: 20,
+                detail: "Validating signed runtime ZIP...".into(),
+                bytes_done: 0,
+                bytes_total: worker_release.size,
+            },
+        );
+        if let Err(error) = worker_store.stage_local_artifact(&worker_release, &worker_path) {
+            let _ = worker_store.record_action(&worker_release.id, "failed", &error);
+            return Err(error);
+        }
+        emit_component_update_progress(
+            &worker_app,
+            ComponentUpdateProgress {
+                component_id: worker_release.id.clone(),
+                stage: "installing".into(),
+                progress: 70,
+                detail: "Installing offline runtime package...".into(),
+                bytes_done: worker_release.size,
+                bytes_total: worker_release.size,
+            },
+        );
+        if let Err(error) = worker_store.prepare_repair(&worker_release.id, &worker_release.version)
+        {
+            let _ = worker_store.record_action(&worker_release.id, "failed", &error);
+            emit_component_update_progress(
+                &worker_app,
+                ComponentUpdateProgress {
+                    component_id: worker_release.id.clone(),
+                    stage: "failed".into(),
+                    progress: 0,
+                    detail: error.clone(),
+                    bytes_done: worker_release.size,
+                    bytes_total: worker_release.size,
+                },
+            );
+            return Err(error);
+        }
+        if let Err(error) = worker_store.install_staged(&worker_release) {
+            if matches!(
+                worker_store.recover_component(&worker_release.id),
+                Ok(Some(updates::RecoveryResult::Completed(_)))
+            ) {
+                let _ = worker_store.record_action(
+                    &worker_release.id,
+                    "installed",
+                    "Offline runtime installed successfully after journal recovery",
+                );
+            } else {
+                let _ = worker_store.record_action(&worker_release.id, "failed", &error);
+                emit_component_update_progress(
+                    &worker_app,
+                    ComponentUpdateProgress {
+                        component_id: worker_release.id.clone(),
+                        stage: "failed".into(),
+                        progress: 0,
+                        detail: error.clone(),
+                        bytes_done: worker_release.size,
+                        bytes_total: worker_release.size,
+                    },
+                );
+                return Err(error);
+            }
+        }
+        emit_component_update_progress(
+            &worker_app,
+            ComponentUpdateProgress {
+                component_id: worker_release.id.clone(),
+                stage: "complete".into(),
+                progress: 100,
+                detail: "Offline runtime installed successfully.".into(),
+                bytes_done: worker_release.size,
+                bytes_total: worker_release.size,
+            },
+        );
+        Ok(ComponentUpdateResult {
+            component_id: worker_release.id,
+            state: "installed".into(),
+            restart_required: false,
+        })
+    })
+    .await;
+
+    if let Ok(mut running) = state.component_update_job.lock() {
+        *running = false;
+    }
+    let result =
+        worker_result.map_err(|error| format!("Offline runtime worker failed: {error}"))?;
+    if release.id == "runtime.cot" && result.is_ok() {
+        let _ = cleanup_legacy_runtime_cache_if_ready();
+    }
+    result
+}
+
+#[tauri::command]
+async fn install_offline_localization_pack(
+    path: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<LocalizationPackInstallResult, String> {
+    let package_path = PathBuf::from(path);
+    let staging_root = std::env::temp_dir().join(format!(
+        "mojorecomp-localization-pack-{}-{}",
+        std::process::id(),
+        timestamp_seconds()
+    ));
+    let inspect_path = package_path.clone();
+    let inspect_staging = staging_root.clone();
+    let pack = tauri::async_runtime::spawn_blocking(move || {
+        updates::extract_offline_localization_pack(&inspect_path, &inspect_staging)
+    })
+    .await
+    .map_err(|error| format!("Localization Pack validation worker failed: {error}"))??;
+
+    let validation =
+        (|| -> Result<(Vec<updates::ComponentRelease>, updates::ComponentStore), String> {
+            manifest(&state, &pack.game_id)?;
+            let store = game_component_store()?;
+            let current_launcher = env!("CARGO_PKG_VERSION").to_string();
+            let mut releases = Vec::with_capacity(pack.languages.len());
+            for language in &pack.languages {
+                let release =
+                    updates::inspect_offline_package(&language.package_path, &current_launcher)?;
+                if release.kind != updates::ComponentKind::Language
+                    || release.game_id.as_deref() != Some(pack.game_id.as_str())
+                    || release.id != language.id
+                    || release.version != language.version
+                    || release.locale.as_deref() != Some(language.locale.as_str())
+                    || release.display_name.as_deref() != Some(language.display_name.as_str())
+                    || release.xbox_language != Some(language.xbox_language)
+                {
+                    return Err(
+                        "Localization Pack language metadata does not match its signed component"
+                            .into(),
+                    );
+                }
+                let installed = installed_components_for_compatibility(&state.manifests, &release)?;
+                updates::validate_release_compatibility(
+                    &release,
+                    env!("CARGO_PKG_VERSION"),
+                    &installed,
+                )?;
+                releases.push(release);
+            }
+            Ok((releases, store))
+        })();
+    let (releases, store) = match validation {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(error);
+        }
+    };
+
+    let operation_ready = (|| -> Result<(), String> {
+        let _operation_gate = state
+            .operation_gate
+            .lock()
+            .map_err(|_| "Operation gate lock failed")?;
+        ensure_library_idle(&state)?;
+        ensure_game_stopped(&pack.game_id, &state)?;
+        if state
+            .setup_jobs
+            .lock()
+            .map_err(|_| "Game setup state lock failed")?
+            .values()
+            .any(|running| *running)
+        {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(
+                "Wait for game setup to finish before installing a Localization Pack".into(),
+            );
+        }
+        if !state
+            .localization_jobs
+            .lock()
+            .map_err(|_| "Localization state lock failed")?
+            .is_empty()
+        {
+            let _ = fs::remove_dir_all(&staging_root);
+            return Err(
+                "Wait for localization work to finish before installing a Localization Pack".into(),
+            );
+        }
+        let mut update_running = state
+            .component_update_job
+            .lock()
+            .map_err(|_| "Component update state lock failed")?;
+        if *update_running {
+            return Err("Another component update is already running".into());
+        }
+        *update_running = true;
+        Ok(())
+    })();
+    if let Err(error) = operation_ready {
+        let _ = fs::remove_dir_all(&staging_root);
+        return Err(error);
+    }
+
+    let worker_store = store.clone();
+    let worker_app = app.clone();
+    let worker_packages = pack
+        .languages
+        .iter()
+        .map(|language| language.package_path.clone())
+        .collect::<Vec<_>>();
+    let worker_releases = releases.clone();
+    let worker_result = tauri::async_runtime::spawn_blocking(move || {
+        let mut installed_languages = Vec::new();
+        for (index, (release, package)) in worker_releases
+            .iter()
+            .zip(worker_packages.iter())
+            .enumerate()
+        {
+            let ordinal = index + 1;
+            let total = worker_releases.len();
+            emit_component_update_progress(
+                &worker_app,
+                ComponentUpdateProgress {
+                    component_id: release.id.clone(),
+                    stage: "validating".into(),
+                    progress: 20,
+                    detail: format!(
+                        "Validating Localization Pack language {ordinal} of {total}..."
+                    ),
+                    bytes_done: 0,
+                    bytes_total: release.size,
+                },
+            );
+            worker_store.stage_local_artifact(release, package)?;
+            worker_store.prepare_repair(&release.id, &release.version)?;
+            worker_store.install_staged(release)?;
+            installed_languages.push(release.locale.clone().unwrap_or_else(|| release.id.clone()));
+            emit_component_update_progress(
+                &worker_app,
+                ComponentUpdateProgress {
+                    component_id: release.id.clone(),
+                    stage: "complete".into(),
+                    progress: 100,
+                    detail: format!("Installed Localization Pack language {ordinal} of {total}."),
+                    bytes_done: release.size,
+                    bytes_total: release.size,
+                },
+            );
+        }
+        Ok::<_, String>(installed_languages)
+    })
+    .await;
+
+    if let Ok(mut running) = state.component_update_job.lock() {
+        *running = false;
+    }
+    let _ = fs::remove_dir_all(&staging_root);
+    let installed_languages = worker_result
+        .map_err(|error| format!("Localization Pack install worker failed: {error}"))??;
+    append_launcher_log(&format!(
+        "Installed Localization Pack {} for {} ({} language component(s))",
+        pack.version,
+        pack.game_id,
+        installed_languages.len()
+    ));
+    Ok(LocalizationPackInstallResult {
+        game_id: pack.game_id,
+        version: pack.version,
+        installed_languages,
+    })
+}
+
+#[tauri::command]
+fn activate_runtime_version(
+    component_id: String,
+    version: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let _operation_gate = state
+        .operation_gate
+        .lock()
+        .map_err(|_| "Operation gate lock failed")?;
+    let game_id = ensure_runtime_version_operation_idle(&component_id, &state)?;
+    let store = game_component_store()?;
+    store.activate_version(&component_id, &version)?;
+    append_launcher_log(&format!(
+        "Activated {} runtime version {} for {}",
+        component_id, version, game_id
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_runtime_version(
+    component_id: String,
+    version: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let _operation_gate = state
+        .operation_gate
+        .lock()
+        .map_err(|_| "Operation gate lock failed")?;
+    let game_id = ensure_runtime_version_operation_idle(&component_id, &state)?;
+    let store = game_component_store()?;
+    store.remove_version(&component_id, &version)?;
+    append_launcher_log(&format!(
+        "Removed {} runtime version {} for {}",
+        component_id, version, game_id
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn apply_launcher_update(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let _operation_gate = state
+        .operation_gate
+        .lock()
+        .map_err(|_| "Operation gate lock failed")?;
+    ensure_component_update_idle(&state)?;
+    ensure_library_idle(&state)?;
+    for game in &state.manifests {
+        ensure_game_stopped(&game.id, &state)?;
+    }
+    if state
+        .setup_jobs
+        .lock()
+        .map_err(|_| "Game setup state lock failed")?
+        .values()
+        .any(|running| *running)
+    {
+        return Err("Wait for game setup to finish before restarting the launcher".into());
+    }
+    if !state
+        .localization_jobs
+        .lock()
+        .map_err(|_| "Localization state lock failed")?
+        .is_empty()
+    {
+        return Err("Wait for localization work to finish before restarting the launcher".into());
+    }
+
+    let prepared = launcher_component_store()?.prepare_launcher_replacement()?;
+    game_component_store()?.ensure_launcher_version_compatible(&prepared.version)?;
+    let current_exe = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve current launcher executable: {error}"))?;
+    if !current_exe
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("mojorecomp-launcher.exe"))
+    {
+        return Err("Launcher self-update is only available from a packaged portable build".into());
+    }
+    let helper = std::env::temp_dir().join(format!(
+        "mojorecomp-launcher-update-{}-{}.exe",
+        std::process::id(),
+        timestamp_seconds()
+    ));
+    fs::copy(&current_exe, &helper)
+        .map_err(|error| format!("Could not prepare launcher update helper: {error}"))?;
+    Command::new(&helper)
+        .arg("--apply-launcher-update")
+        .arg(std::process::id().to_string())
+        .arg(&prepared.source_root)
+        .arg(&current_exe)
+        .spawn()
+        .map_err(|error| format!("Could not start launcher update helper: {error}"))?;
+    append_launcher_log(&format!(
+        "Applying verified launcher update {} on restart",
+        prepared.version
+    ));
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3652,16 +5597,6 @@ fn rollback_component_update(
 }
 
 #[tauri::command]
-fn open_launcher_update_folder() -> Result<(), String> {
-    let path = launcher_component_store()?.launcher_ready_root()?;
-    Command::new("explorer.exe")
-        .arg(path)
-        .spawn()
-        .map_err(|error| format!("Could not open launcher update folder: {error}"))?;
-    Ok(())
-}
-
-#[tauri::command]
 fn open_update_url(url: String) -> Result<(), String> {
     let url = updates::validate_resolved_public_https_url(&url)?;
     Command::new("explorer.exe")
@@ -3672,6 +5607,10 @@ fn open_update_url(url: String) -> Result<(), String> {
 }
 
 fn main() {
+    if let Some(exit_code) = run_launcher_update_helper_from_args() {
+        std::process::exit(exit_code);
+    }
+    cleanup_launcher_update_helpers();
     let manifests = GAME_MANIFESTS
         .iter()
         .map(|text| toml::from_str::<GameManifest>(text))
@@ -3764,6 +5703,16 @@ fn main() {
         suite.release_channel
     ));
 
+    let discord_activity_enabled = storage_layout()
+        .and_then(|layout| layout.load_launcher_settings())
+        .ok()
+        .flatten()
+        .map(|settings| settings.discord_activity_enabled)
+        .unwrap_or(true);
+    let presence = presence::PresenceController::new(
+        discord_activity_enabled,
+        configured_discord_application_id(&suite),
+    );
     let runtime_job = RuntimeJob::new().expect("runtime Job Object must be available");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -3776,15 +5725,19 @@ fn main() {
             component_update_job: Mutex::new(false),
             operation_gate: Mutex::new(()),
             runtime_job,
+            presence,
         })
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                 let state = window.app_handle().state::<AppState>();
+                state.presence.shutdown();
                 terminate_all_processes(&state.processes);
             }
         })
         .invoke_handler(tauri::generate_handler![
             get_launcher_storage,
+            complete_game_language_setup,
+            set_discord_activity_enabled,
             inspect_game_library,
             set_game_library,
             open_game_library,
@@ -3794,7 +5747,6 @@ fn main() {
             load_settings,
             save_settings,
             localization_status,
-            import_localization_patch,
             prepare_localization,
             cancel_localization,
             probe_hardware,
@@ -3804,9 +5756,16 @@ fn main() {
             open_license_notices,
             create_support_package,
             check_component_updates,
+            runtime_additional_content,
+            check_launcher_update,
             install_component_update,
+            install_runtime_additional_content,
+            install_offline_runtime_package,
+            install_offline_localization_pack,
+            activate_runtime_version,
+            remove_runtime_version,
+            apply_launcher_update,
             rollback_component_update,
-            open_launcher_update_folder,
             open_update_url
         ])
         .run(tauri::generate_context!())
@@ -3879,6 +5838,69 @@ mod tests {
         assert!(sample.contains("<APP_DATA>"));
         assert!(sample.contains("<USER_PROFILE>"));
         assert!(!sample.contains(&game_root.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn support_crash_incident_pairs_only_matching_artifacts() {
+        let root = isolated_test_root();
+        fs::create_dir_all(&root).expect("crash directory");
+        let older = root.join("crash-2026-10-05-120000-pid10.log");
+        let newer = root.join("crash-2026-10-05-120001-pid11.log");
+        fs::write(&older, b"older").expect("older log");
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&newer, b"newer").expect("newer log");
+        fs::write(newer.with_extension("json"), b"{}\n").expect("matching json");
+        fs::write(older.with_extension("dmp"), b"MDMPold").expect("different dump");
+
+        let incident = newest_crash_incident(&root).expect("newest crash incident");
+        assert_eq!(incident.log, newer);
+        assert!(incident.json.is_some());
+        assert!(incident.dump.is_none());
+
+        fs::write(incident.log.with_extension("dmp"), b"MDMPnew").expect("matching dump");
+        let paired = newest_crash_incident(&root).expect("paired crash incident");
+        assert_eq!(paired.dump, Some(paired.log.with_extension("dmp")));
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[test]
+    fn support_binary_zip_entry_preserves_bytes_without_text_sanitization() {
+        let root = isolated_test_root();
+        fs::create_dir_all(&root).expect("support directory");
+        let source = root.join("crash.dmp");
+        let payload = [0x4d, 0x44, 0x4d, 0x50, 0x00, 0xff, 0x10, 0x7f];
+        fs::write(&source, payload).expect("binary support artifact");
+        let archive_path = root.join("support.zip");
+        let file = File::create(&archive_path).expect("support archive");
+        let mut writer = ZipWriter::new(file);
+        add_binary_file_to_zip(
+            &mut writer,
+            "crash/test.dmp",
+            &source,
+            SUPPORT_BINARY_FILE_LIMIT,
+        )
+        .expect("stream binary artifact");
+        writer.finish().expect("finish support archive");
+
+        let file = File::open(&archive_path).expect("open support archive");
+        let mut archive = zip::ZipArchive::new(file).expect("parse support archive");
+        let mut entry = archive.by_name("crash/test.dmp").expect("binary entry");
+        let mut restored = Vec::new();
+        entry.read_to_end(&mut restored).expect("read binary entry");
+        assert_eq!(restored, payload);
+        drop(entry);
+        drop(archive);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[test]
+    fn support_timestamp_is_utc_iso8601() {
+        let timestamp = utc_timestamp_iso8601();
+        assert_eq!(timestamp.len(), 20);
+        assert_eq!(&timestamp[4..5], "-");
+        assert_eq!(&timestamp[7..8], "-");
+        assert_eq!(&timestamp[10..11], "T");
+        assert_eq!(&timestamp[19..20], "Z");
     }
 
     #[test]
@@ -3955,6 +5977,77 @@ mod tests {
     }
 
     #[test]
+    fn library_transient_cleanup_does_not_turn_an_empty_library_into_a_migration() {
+        let root = isolated_test_root();
+        initialize_library(&root).expect("initialize library");
+        fs::create_dir_all(root.join(".staging").join("cot")).expect("legacy staging");
+        fs::write(root.join(".staging").join("cot").join("partial.bin"), b"partial")
+            .expect("legacy staging file");
+        fs::create_dir_all(root.join(".backup").join("cot-old")).expect("legacy backup");
+        fs::write(root.join(".backup").join("cot-old").join("old.bin"), b"old")
+            .expect("legacy backup file");
+        fs::create_dir_all(root.join(".mojorecomp").join("downloads").join("runtime.cot"))
+            .expect("component download staging");
+        fs::write(
+            root.join(".mojorecomp")
+                .join("downloads")
+                .join("runtime.cot")
+                .join("partial.zip"),
+            b"partial",
+        )
+        .expect("partial component download");
+        fs::create_dir_all(
+            root.join(".mojorecomp")
+                .join("staging")
+                .join("components")
+                .join("runtime.cot"),
+        )
+        .expect("component staging");
+        fs::create_dir_all(root.join(".mojorecomp").join("components"))
+            .expect("empty component store");
+
+        cleanup_library_transients(&root).expect("cleanup library transients");
+
+        assert!(!library_has_persistent_data(&root).expect("inspect cleaned library"));
+        assert!(!root.join(".staging").exists());
+        assert!(!root.join(".backup").exists());
+        assert!(!root.join(".mojorecomp").exists());
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[test]
+    fn library_transient_cleanup_preserves_installed_components_as_persistent_data() {
+        let root = isolated_test_root();
+        initialize_library(&root).expect("initialize library");
+        let component = root
+            .join(".mojorecomp")
+            .join("components")
+            .join("runtime.cot")
+            .join("versions")
+            .join("0.2.0")
+            .join("payload");
+        fs::create_dir_all(&component).expect("runtime component payload");
+        fs::write(component.join("cot-runtime.exe"), b"runtime").expect("runtime payload");
+        fs::create_dir_all(root.join(".mojorecomp").join("downloads").join("runtime.cot"))
+            .expect("download staging");
+        fs::write(
+            root.join(".mojorecomp")
+                .join("downloads")
+                .join("runtime.cot")
+                .join("partial.zip"),
+            b"partial",
+        )
+        .expect("partial download");
+
+        cleanup_library_transients(&root).expect("cleanup library transients");
+
+        assert!(component.join("cot-runtime.exe").is_file());
+        assert!(library_has_persistent_data(&root).expect("inspect runtime library"));
+        assert!(!root.join(".mojorecomp").join("downloads").exists());
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[test]
     fn integrity_validation_rejects_modified_game_files() {
         let root = isolated_test_root();
         fs::create_dir_all(&root).expect("game root");
@@ -3983,6 +6076,7 @@ mod tests {
         settings.display.vsync = true;
         settings.graphics.anti_aliasing = "fxaa_extreme".into();
         settings.graphics.texture_filtering = "16x".into();
+        settings.graphics.frame_rate = "60".into();
         settings.advanced.logging_enabled = false;
         settings.localization.profile = "pt-BR".into();
         settings.localization.xbox_language = 1;
@@ -3999,7 +6093,19 @@ mod tests {
         assert!(restored.display.vsync);
         assert_eq!(restored.graphics.anti_aliasing, "fxaa_extreme");
         assert_eq!(restored.graphics.texture_filtering, "16x");
+        assert_eq!(restored.graphics.frame_rate, "60");
         assert!(!restored.advanced.logging_enabled);
+    }
+
+    #[test]
+    fn runtime_settings_defaults_are_balanced_and_native() {
+        let settings = RuntimeSettings::default();
+        assert_eq!(settings.display.resolution_scale, 1);
+        assert_eq!(settings.display.aspect_ratio, "16:9");
+        assert!(!settings.display.vsync);
+        assert_eq!(settings.graphics.anti_aliasing, "fxaa_extreme");
+        assert_eq!(settings.graphics.texture_filtering, "8x");
+        assert_eq!(settings.graphics.frame_rate, "30");
     }
 
     #[test]
@@ -4023,6 +6129,7 @@ texture_filtering = "default"
 "#;
         let restored: RuntimeSettings = toml::from_str(legacy).expect("parse legacy settings");
         assert!(restored.advanced.logging_enabled);
+        assert_eq!(restored.graphics.frame_rate, "30");
         assert_eq!(restored.localization.profile, "en");
         assert_eq!(restored.localization.xbox_language, 1);
     }
@@ -4053,6 +6160,7 @@ texture_filtering = "default"
             toml::from_str(partial).expect("parse partial localization settings");
         assert_eq!(restored.localization.profile, "pt-BR");
         assert_eq!(restored.localization.xbox_language, 1);
+        assert_eq!(restored.graphics.frame_rate, "30");
     }
 
     #[test]
@@ -4071,11 +6179,15 @@ texture_filtering = "default"
     #[test]
     fn launcher_update_catalog_is_empty_or_uses_public_https() {
         let suite = parsed_suite_manifest().expect("suite manifest");
-        assert_eq!(suite.version, "1.0.0");
+        assert_eq!(suite.version, "1.1.0");
         assert_eq!(suite.release_channel, "development");
         if !suite.update_catalog.is_empty() {
             updates::validate_public_https_url(&suite.update_catalog)
                 .expect("configured update catalog must use public HTTPS");
+        }
+        if !suite.localization_catalog.is_empty() {
+            updates::validate_public_https_url(&suite.localization_catalog)
+                .expect("configured localization catalog must use public HTTPS");
         }
     }
 
@@ -4090,6 +6202,7 @@ texture_filtering = "default"
             version: "0.1.0-alpha".into(),
             healthy: true,
             repair_required: false,
+            can_rollback: false,
             last_action: None,
         };
         assert_eq!(

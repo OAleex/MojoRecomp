@@ -19816,7 +19816,11 @@ file_path = "../game/default.xex"
 out_directory_path = "../ppc"
 switch_table_file_path = "CrashOfTheTitans_switch_tables.toml"
 
-# Correctness baseline. Enable these only after the new runtime reaches parity.
+# Static-recompilation optimization profile. LR/MSR remain architectural because
+# Crash of the Titans uses them in its scheduler/synchronization paths. Register
+# localization stays aggressive elsewhere, while XenonRecomp's context-safety
+# analysis keeps CR/non-volatiles PPCContext-backed on any call chain that can
+# enter host/indirect code or the guest scheduler context switch.
 skip_lr = false
 skip_msr = false
 ctr_as_local = false
@@ -19825,6 +19829,8 @@ reserved_as_local = false
 cr_as_local = false
 non_argument_as_local = false
 non_volatile_as_local = false
+preserve_local_context_storage = true
+context_barrier_functions = [0x823E9C10]
 
 savegprlr_14_address = 0x823CEBE0
 restgprlr_14_address = 0x823CEC30
@@ -19859,3 +19865,70 @@ address = 0x822CC6C0
 name = "MojoRecompDecoderFillStalled"
 registers = ["r25", "r22"]
 jump_address_on_true = 0x822CC6E4
+
+# Native equivalent of the title's forward-copy libc routine. Guest RAM is a
+# contiguous host mapping, so large streaming copies do not need to execute the
+# original PPC byte/word/dword loops instruction by instruction.
+[[midasm_hook]]
+address = 0x823CEC90
+name = "MojoRecompGuestMemcpy"
+registers = ["r3", "r4", "r5"]
+return = true
+
+# The original Xenon poll includes db16cyc backoff before rereading the CP
+# progress pointer. XenonRecomp currently emits db16cyc as a no-op. Restore the
+# short CPU pause in HFR only when the pointer is genuinely unchanged; guest
+# state and the routine's return value remain entirely controlled by guest code.
+[[midasm_hook]]
+address = 0x8226D984
+name = "MojoRecompGpuPollBackoff"
+registers = ["r31", "r29"]
+
+# The normal title loop measures elapsed microseconds in r28 and only dispatches
+# its frame/update virtual when r28 > 33333 (~30 Hz).  The downstream scheduler
+# already uses a 1/60-second minimum and receives the unmodified real delta in
+# f1.  In HFR mode, scale only r28 immediately before the gate comparison; this
+# releases the existing scheduler at ~60 Hz without speeding up guest time.
+[[midasm_hook]]
+address = 0x821FD15C
+name = "MojoRecompHfrFrameGate"
+registers = ["r28"]
+
+# In the mode-1 graphics progress path, the title advances lastCounter to one
+# tick beyond the current 60 Hz graphics interrupt counter when diff == 1. That
+# makes the next consumer pass wait for two vblanks (~30 Hz). HFR cancels only
+# this one-tick look-ahead immediately before the original store; 30 FPS mode is
+# a strict no-op and all other progress modes/branches remain untouched.
+[[midasm_hook]]
+address = 0x8238F05C
+name = "MojoRecompHfrProgressCadence"
+registers = ["r11"]
+
+# Mode 1 reaches this loop only when the graphics-progress counter has not yet
+# advanced. The scheduler that called it has already crossed its 1/60 step, so
+# waiting for the next 60 Hz vblank here serializes two clocks. In HFR, jump to
+# the existing reconciliation block and consume the current counter immediately.
+# Compatibility mode returns false and executes the original yield loop.
+[[midasm_hook]]
+address = 0x8238F02C
+name = "MojoRecompHfrSkipProgressWait"
+registers = []
+jump_address_on_true = 0x8238F048
+
+# sub_82230198 contains two state-machine loops that busy-wait while the
+# asynchronous backend reports status 4. With the outer scheduler released at
+# 60 Hz, that wait still blocks the main thread for roughly one 30 Hz worker
+# period. In HFR mode only, return from the update while status 4 is still
+# pending; the state remains 3/4 and is polled again on the next update. All
+# completed/error transitions and the compatibility-30 path remain unchanged.
+[[midasm_hook]]
+address = 0x82230394
+name = "MojoRecompHfrYieldAsyncPoll"
+registers = ["r3"]
+jump_address_on_true = 0x8223053C
+
+[[midasm_hook]]
+address = 0x82230470
+name = "MojoRecompHfrYieldAsyncPoll"
+registers = ["r3"]
+jump_address_on_true = 0x8223053C

@@ -13,7 +13,7 @@ setup and product information belongs in `README.md`.
 - MojoRecomp is an independent native recompilation project for Xbox 360 Crash
   titles. It is not affiliated with or endorsed by the games' rights holders.
 - **Crash of the Titans (COT)** is the current playable target.
-- **Crash: Mind over Mutant (MOM)** has a separate launcher profile and runtime
+- **Crash: Mind Over Mutant (MOM)** has a separate launcher profile and runtime
   identity, but is not yet a playable target.
 - Keep maintained source code, project-controlled identifiers, comments, UI
   text, configuration, tests, logs, and documentation in English.

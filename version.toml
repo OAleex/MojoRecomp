@@ -1,5 +1,6 @@
 schema_version = 1
-suite = "1.0.0"
-launcher = "1.0.0"
-cot_runtime = "0.1.0-alpha"
+suite = "1.1.0"
+launcher = "1.1.0"
+cot_runtime = "0.2.0-alpha"
+cot_localization_pack = "1.0.0"
 mom_runtime = "0.0.0-dev"

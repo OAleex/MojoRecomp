@@ -25,12 +25,18 @@
 /thirdparty/sdl3/
 /.private/
 /.release/
+/.release-state/
+/release-signing-private.pem
+/release-signing-public.pem
 
 # Proprietary disc/title inputs must never be staged outside their normal roots.
 *.iso
 *.xex
 *.xexp
 *.rcf
+/localization/**/*.p3d
+/localization/**/*.xex
+/localization/**/*.xexp
 
 # First-run/generated caches.
 shader_cache/

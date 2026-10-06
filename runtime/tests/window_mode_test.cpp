@@ -55,6 +55,8 @@ int main()
         return Fail("native HWND is invalid");
     if (IsWindowVisible(hwnd))
         return Fail("headless window unexpectedly became visible");
+    if (HostWindow_AcceptsInput())
+        return Fail("hidden background window unexpectedly accepted physical input");
 
     uint64_t generation = 0;
     if (!WaitForExtent(generation, 320, 180, false))

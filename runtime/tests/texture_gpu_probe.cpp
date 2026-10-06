@@ -694,7 +694,11 @@ int main(int argc, char** argv)
         if (rectangle) vs.attributes.push_back({0, 0, 57, 1, 1, 7, 0, 0});
         ps.hash = 1;
         ps.type = 1;
-        ParseShaderMeta(translated.metaJson, ps);
+        Require(PopulateShaderModuleMetadata(
+                    MojoTranslatedShader{1, 1, translated.spirv, translated.metaJson,
+                                         translated.hlsl},
+                    ps),
+                "translated shader metadata");
         Require(ps.usesTextures && ps.textureSlots == std::vector<uint32_t>{3}, "translated sampler metadata");
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = size;
@@ -711,7 +715,7 @@ int main(int argc, char** argv)
         // presenter honors min/max index semantics it would collapse RECTLIST
         // corners to one point.
         regs[xenos::kVgtMinVtxIndx] = 0;
-        regs[xenos::kVgtMaxVtxIndx] = kXenosVertexIndexMask;
+        regs[xenos::kVgtMaxVtxIndx] = xenos::kVertexIndexMask;
         constexpr uint32_t address = 0x01000000;
         regs[xenos::kRbCopyDestBase] = address;
         regs[xenos::kRbCopyDestPitch] = 1280 | (720 << 16);
@@ -798,7 +802,7 @@ int main(int argc, char** argv)
             const VkPipeline pipeline = GetPipeline(vs, ps, primitive, 15,
                                                      0x00010001u, 0x00010001u, 0, 0, 0, 4,
                                                      false, VK_SAMPLE_COUNT_1_BIT,
-                                                     kDepthUnormFormat, false);
+                                                     kDepthUnormFormat);
             Require(pipeline != VK_NULL_HANDLE, "texture pipeline");
             const VkDeviceSize shared = UploadShared(regs.data(), sampleScales);
             Require(shared != VK_WHOLE_SIZE, "shared upload");

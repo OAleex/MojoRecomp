@@ -8,8 +8,10 @@
 #include "cpu/timebase.h"
 #include "audio/xaudio.h"
 #include "gpu/pm4.h"
+#include "host/frame_rate_policy.h"
 #include "host/input.h"
 #include "host/window.h"
+#include "mojorecomp_version.h"
 
 #include <array>
 #include <atomic>
@@ -74,7 +76,7 @@ const char* NotificationText(Notification notification) noexcept
         case Notification::FastForwardDisabled: return "Fast-forward disabled";
         case Notification::Paused: return "Paused";
         case Notification::Resumed: return "Resumed";
-        case Notification::FrameAdvanced: return "Frame advanced (1/30 s)";
+        case Notification::FrameAdvanced: return "Frame advanced";
         default: return "";
     }
 }
@@ -259,6 +261,8 @@ DebugOverlaySnapshot GetOverlaySnapshot() noexcept
     snapshot.speed = snapshot.fastForward ? kFastForwardSpeed : 1.0;
     snapshot.fps = g_fps.load(std::memory_order_relaxed);
     snapshot.frameMs = g_frameMs.load(std::memory_order_relaxed);
+    std::snprintf(snapshot.runtimeLabel.data(), snapshot.runtimeLabel.size(),
+                  "Crash of the Titans - %s Runtime", mojorecomp::version::kCotRuntime);
     if (ClockMs() <= g_notificationUntilMs.load(std::memory_order_acquire))
     {
         std::snprintf(snapshot.notification.data(), snapshot.notification.size(), "%s",
@@ -371,9 +375,11 @@ void PollHotkeys()
         }
         if (Pressed(VK_F7) && g_paused.load(std::memory_order_relaxed))
         {
-            mojorecomp::timebase::AdvanceDebugFrame(30);
+            mojorecomp::timebase::AdvanceDebugFrame(
+                mojorecomp::host::ActiveFrameRatePolicy().simulationHz);
             SetNotification(Notification::FrameAdvanced, 1200);
-            std::fprintf(stderr, "[debug] frame-step 1/30s\n");
+            std::fprintf(stderr, "[debug] frame-step 1/%us\n",
+                         mojorecomp::host::ActiveFrameRatePolicy().simulationHz);
         }
         (void)Pressed(VK_F10); // Reserved for a verified restart-level hook.
     }

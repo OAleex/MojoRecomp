@@ -29,6 +29,8 @@
 #include "gpu/hardware_probe.h"
 #include "gpu/pm4.h"
 #include "gpu/vk_presenter.h"
+#include "host/crash_reporter.h"
+#include "host/frame_rate_policy.h"
 #include "host/window.h"
 #include "kernel/heap.h"
 #include "kernel/guestcall.h"
@@ -116,8 +118,6 @@ void StartGuestThreadTimeProfile(DWORD threadId)
 #endif
 
 #if defined(_WIN32)
-volatile LONG g_crashReportInProgress = 0;
-std::filesystem::path g_crashLogRoot;
 constexpr wchar_t kCotRuntimeMutexName[] = L"Local\\MojoRecomp.COT.Runtime";
 
 HANDLE AcquireNamedRuntimeMutex(const wchar_t* name, bool& alreadyRunning)
@@ -134,213 +134,6 @@ HANDLE AcquireNamedRuntimeMutex(const wchar_t* name, bool& alreadyRunning)
         return nullptr;
     }
     return handle;
-}
-
-std::filesystem::path CrashLogRootForConfig(const std::filesystem::path& configPath)
-{
-    return configPath.parent_path() / "logs";
-}
-
-bool CrashDebugModeEnabled()
-{
-    return mojorecomp::debug::ExtendedCrashInfoEnabled();
-}
-
-void CrashWrite(FILE* crashFile, const char* format, ...)
-{
-    va_list args;
-    va_start(args, format);
-    va_list copy;
-    va_copy(copy, args);
-    std::vfprintf(stderr, format, args);
-    va_end(args);
-    if (crashFile)
-    {
-        std::vfprintf(crashFile, format, copy);
-        std::fflush(crashFile);
-    }
-    va_end(copy);
-}
-
-FILE* OpenCrashReport(wchar_t* reportPath, size_t reportPathCount)
-{
-    if (!reportPath || reportPathCount == 0)
-        return nullptr;
-
-    wchar_t exePath[1024]{};
-    const DWORD length = GetModuleFileNameW(nullptr, exePath,
-                                            static_cast<DWORD>(std::size(exePath)));
-    if (!length || length >= std::size(exePath))
-        return nullptr;
-
-    wchar_t* slash = std::wcsrchr(exePath, L'\\');
-    if (!slash)
-        slash = std::wcsrchr(exePath, L'/');
-    if (slash)
-        *slash = L'\0';
-
-    const std::filesystem::path crashDirPath = !g_crashLogRoot.empty()
-        ? g_crashLogRoot
-        : std::filesystem::path(exePath) / L"crashlogs";
-    std::error_code crashDirError;
-    std::filesystem::create_directories(crashDirPath, crashDirError);
-    if (crashDirError)
-        return nullptr;
-    const std::wstring crashDir = crashDirPath.wstring();
-
-    SYSTEMTIME now{};
-    GetLocalTime(&now);
-    if (swprintf_s(reportPath, reportPathCount,
-                   L"%ls\\crash-%04u-%02u-%02u-%02u%02u%02u-pid%lu.log",
-                   crashDir.c_str(),
-                   static_cast<unsigned>(now.wYear),
-                   static_cast<unsigned>(now.wMonth),
-                   static_cast<unsigned>(now.wDay),
-                   static_cast<unsigned>(now.wHour),
-                   static_cast<unsigned>(now.wMinute),
-                   static_cast<unsigned>(now.wSecond),
-                   static_cast<unsigned long>(GetCurrentProcessId())) < 0)
-        return nullptr;
-
-    FILE* file = nullptr;
-    return _wfopen_s(&file, reportPath, L"wb") == 0 ? file : nullptr;
-}
-
-LONG WINAPI BootProbeExceptionFilter(EXCEPTION_POINTERS* info) {
-    if (!info || !info->ExceptionRecord || !info->ContextRecord)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    if (InterlockedCompareExchange(&g_crashReportInProgress, 1, 0) != 0)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    const auto* record = info->ExceptionRecord;
-    const auto* context = info->ContextRecord;
-    const auto module = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-    const auto rip = static_cast<uintptr_t>(context->Rip);
-    const auto rsp = static_cast<uintptr_t>(context->Rsp);
-
-    wchar_t reportPath[1400]{};
-    FILE* crashFile = OpenCrashReport(reportPath, std::size(reportPath));
-    const bool debugMode = CrashDebugModeEnabled();
-    uint32_t lastIndirectTarget = 0;
-    uint32_t lastIndirectLr = 0;
-    uint32_t lastIndirectObject = 0;
-    uint64_t lastIndirectSequence = 0;
-    MojoRecompGetLastIndirectCall(&lastIndirectTarget, &lastIndirectLr,
-                                &lastIndirectObject, &lastIndirectSequence);
-    const char* lastIndirectMapped = "unknown";
-    __try {
-        lastIndirectMapped = lastIndirectTarget && g_guestMemory.FindFunction(lastIndirectTarget)
-            ? "yes" : "no";
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        lastIndirectMapped = "unavailable";
-    }
-
-    SYSTEMTIME crashTime{};
-    GetLocalTime(&crashTime);
-
-    CrashWrite(crashFile, "MojoRecomp Crash Report\n");
-    CrashWrite(crashFile, "timestamp_local=%04u-%02u-%02u %02u:%02u:%02u\n",
-               static_cast<unsigned>(crashTime.wYear),
-               static_cast<unsigned>(crashTime.wMonth),
-               static_cast<unsigned>(crashTime.wDay),
-               static_cast<unsigned>(crashTime.wHour),
-               static_cast<unsigned>(crashTime.wMinute),
-               static_cast<unsigned>(crashTime.wSecond));
-    CrashWrite(crashFile, "version=%s build=%s %s\n",
-               mojorecomp::version::kCotRuntime, __DATE__, __TIME__);
-    CrashWrite(crashFile, "pid=%lu tid=%lu debug_mode=%u frame=%llu\n",
-               static_cast<unsigned long>(GetCurrentProcessId()),
-               static_cast<unsigned long>(GetCurrentThreadId()),
-               debugMode ? 1u : 0u,
-               static_cast<unsigned long long>(Pm4_FrameCount()));
-
-    CrashWrite(crashFile,
-               "[host-crash] code=%08lX address=%p module=%p rva=%llX "
-               "rip=%llX rsp=%llX rbp=%llX\n",
-               record->ExceptionCode, record->ExceptionAddress,
-               reinterpret_cast<void*>(module),
-               static_cast<unsigned long long>(rip >= module ? rip - module : 0),
-               static_cast<unsigned long long>(rip),
-               static_cast<unsigned long long>(rsp),
-               static_cast<unsigned long long>(context->Rbp));
-
-    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
-        record->NumberParameters >= 2) {
-        const char* kind = record->ExceptionInformation[0] == 0 ? "read" :
-                           record->ExceptionInformation[0] == 1 ? "write" : "execute";
-        CrashWrite(crashFile, "[host-crash] access=%s target=%llX\n", kind,
-                   static_cast<unsigned long long>(record->ExceptionInformation[1]));
-    }
-
-    CrashWrite(crashFile,
-               "[last-indirect] seq=%llu target=%08X lr=%08X object=%08X mapped=%s\n",
-               static_cast<unsigned long long>(lastIndirectSequence),
-               lastIndirectTarget, lastIndirectLr, lastIndirectObject,
-               lastIndirectMapped);
-
-    __try {
-        if (g_ppcContext) {
-            CrashWrite(crashFile,
-                       "[guest-crash] lr=%08X ctr=%08X ctr_mapped=%s r1=%08X r3=%08X r4=%08X "
-                       "r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r11=%08X r12=%08X r13=%08X\n",
-                       static_cast<uint32_t>(g_ppcContext->lr),
-                       g_ppcContext->ctr.u32,
-                       g_guestMemory.FindFunction(g_ppcContext->ctr.u32) ? "yes" : "no",
-                       g_ppcContext->r1.u32,
-                       g_ppcContext->r3.u32,
-                       g_ppcContext->r4.u32,
-                       g_ppcContext->r5.u32,
-                       g_ppcContext->r6.u32,
-                       g_ppcContext->r7.u32,
-                       g_ppcContext->r8.u32,
-                       g_ppcContext->r9.u32,
-                       g_ppcContext->r10.u32,
-                       g_ppcContext->r11.u32,
-                       g_ppcContext->r12.u32,
-                       g_ppcContext->r13.u32);
-
-            if (debugMode) {
-                CrashWrite(crashFile,
-                           "[guest-debug] r14=%08X r15=%08X r16=%08X r17=%08X r18=%08X r19=%08X "
-                           "r20=%08X r21=%08X r22=%08X r23=%08X r24=%08X r25=%08X r26=%08X "
-                           "r27=%08X r28=%08X r29=%08X r30=%08X r31=%08X\n",
-                           g_ppcContext->r14.u32, g_ppcContext->r15.u32,
-                           g_ppcContext->r16.u32, g_ppcContext->r17.u32,
-                           g_ppcContext->r18.u32, g_ppcContext->r19.u32,
-                           g_ppcContext->r20.u32, g_ppcContext->r21.u32,
-                           g_ppcContext->r22.u32, g_ppcContext->r23.u32,
-                           g_ppcContext->r24.u32, g_ppcContext->r25.u32,
-                           g_ppcContext->r26.u32, g_ppcContext->r27.u32,
-                           g_ppcContext->r28.u32, g_ppcContext->r29.u32,
-                           g_ppcContext->r30.u32, g_ppcContext->r31.u32);
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        CrashWrite(crashFile, "[guest-crash] context unavailable\n");
-    }
-
-    __try {
-        const auto* stack = reinterpret_cast<const uintptr_t*>(rsp);
-        for (unsigned i = 0; i < 32; ++i) {
-            const uintptr_t value = stack[i];
-            if (value >= module && value < module + 0x40000000ull) {
-                CrashWrite(crashFile, "[host-crash] stack[%02u]=%llX rva=%llX\n", i,
-                           static_cast<unsigned long long>(value),
-                           static_cast<unsigned long long>(value - module));
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        CrashWrite(crashFile, "[host-crash] stack unreadable\n");
-    }
-    if (crashFile) {
-        std::fclose(crashFile);
-        std::fwprintf(stderr, L"[crash-log] report=%ls\n", reportPath);
-    } else {
-        std::fprintf(stderr, "[crash-log] failed to create report file\n");
-    }
-    std::fflush(stderr);
-    return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
 
@@ -502,6 +295,206 @@ bool ParseStartupOptions(int argc, char** argv, StartupOptions& options,
     return true;
 }
 
+#if defined(_WIN32)
+int RunCrashDumpSelfTest()
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        ("mojorecomp-crash-dump-test-" + std::to_string(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    error.clear();
+    std::filesystem::create_directories(root, error);
+    if (error)
+    {
+        std::fprintf(stderr, "FAIL: could not create crash dump self-test directory.\n");
+        return 1;
+    }
+
+    wchar_t executable[1024]{};
+    const DWORD executableLength = GetModuleFileNameW(
+        nullptr, executable, static_cast<DWORD>(std::size(executable)));
+    if (!executableLength || executableLength >= std::size(executable))
+    {
+        std::fprintf(stderr, "FAIL: could not resolve crash dump self-test executable.\n");
+        return 2;
+    }
+
+    const DWORD previousLength = GetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", nullptr, 0);
+    std::wstring previous;
+    if (previousLength > 0)
+    {
+        previous.resize(previousLength);
+        GetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", previous.data(), previousLength);
+        if (!previous.empty() && previous.back() == L'\0')
+            previous.pop_back();
+    }
+    SetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", root.wstring().c_str());
+
+    std::wstring commandLine = L"\"";
+    commandLine += executable;
+    commandLine += L"\" --crash-dump-self-test-child";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    const BOOL created = CreateProcessW(
+        executable, commandLine.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+    if (previousLength > 0)
+        SetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", previous.c_str());
+    else
+        SetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", nullptr);
+    if (!created)
+    {
+        std::fprintf(stderr, "FAIL: could not start crash dump self-test child.\n");
+        return 3;
+    }
+
+    const DWORD wait = WaitForSingleObject(process.hProcess, 15000);
+    DWORD exitCode = STILL_ACTIVE;
+    GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    if (wait != WAIT_OBJECT_0 || exitCode != EXCEPTION_ACCESS_VIOLATION)
+    {
+        std::fprintf(stderr, "FAIL: crash dump self-test child did not terminate with C0000005.\n");
+        return 4;
+    }
+
+    std::filesystem::path logPath;
+    std::filesystem::path dumpPath;
+    std::filesystem::path jsonPath;
+    for (const auto& entry : std::filesystem::directory_iterator(root))
+    {
+        if (!entry.is_regular_file())
+            continue;
+        const auto extension = entry.path().extension().wstring();
+        if (extension == L".log")
+            logPath = entry.path();
+        else if (extension == L".dmp")
+            dumpPath = entry.path();
+        else if (extension == L".json")
+            jsonPath = entry.path();
+    }
+    if (logPath.empty() || dumpPath.empty() || jsonPath.empty() ||
+        logPath.stem() != dumpPath.stem() || logPath.stem() != jsonPath.stem())
+    {
+        std::fprintf(stderr, "FAIL: crash dump self-test artifacts were not paired.\n");
+        return 5;
+    }
+
+    std::ifstream dump(dumpPath, std::ios::binary);
+    char signature[4]{};
+    dump.read(signature, sizeof(signature));
+    if (dump.gcount() != sizeof(signature) || std::memcmp(signature, "MDMP", 4) != 0)
+    {
+        std::fprintf(stderr, "FAIL: crash dump self-test did not create a valid minidump header.\n");
+        return 6;
+    }
+    std::ifstream log(logPath);
+    const std::string logText((std::istreambuf_iterator<char>(log)),
+                              std::istreambuf_iterator<char>());
+    if (logText.find("code=C0000005") == std::string::npos ||
+        logText.find("[minidump] status=created") == std::string::npos)
+    {
+        std::fprintf(stderr, "FAIL: crash report is missing exception or minidump status.\n");
+        return 7;
+    }
+
+    std::filesystem::remove_all(root, error);
+    const auto failureRoot = root / "forced-dump-failure";
+    std::filesystem::create_directories(failureRoot, error);
+    if (error)
+    {
+        std::fprintf(stderr, "FAIL: could not create forced dump failure directory.\n");
+        return 8;
+    }
+
+    const DWORD previousFailureLength =
+        GetEnvironmentVariableW(L"MOJORECOMP_CRASH_DUMP_FAIL_TEST", nullptr, 0);
+    std::wstring previousFailure;
+    if (previousFailureLength > 0)
+    {
+        previousFailure.resize(previousFailureLength);
+        GetEnvironmentVariableW(L"MOJORECOMP_CRASH_DUMP_FAIL_TEST",
+                                previousFailure.data(), previousFailureLength);
+        if (!previousFailure.empty() && previousFailure.back() == L'\0')
+            previousFailure.pop_back();
+    }
+    SetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", failureRoot.wstring().c_str());
+    SetEnvironmentVariableW(L"MOJORECOMP_CRASH_DUMP_FAIL_TEST", L"1");
+
+    std::wstring failureCommandLine = L"\"";
+    failureCommandLine += executable;
+    failureCommandLine += L"\" --crash-dump-self-test-child";
+    STARTUPINFOW failureStartup{};
+    failureStartup.cb = sizeof(failureStartup);
+    PROCESS_INFORMATION failureProcess{};
+    const BOOL failureCreated = CreateProcessW(
+        executable, failureCommandLine.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &failureStartup, &failureProcess);
+
+    if (previousLength > 0)
+        SetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", previous.c_str());
+    else
+        SetEnvironmentVariableW(L"MOJORECOMP_LOG_ROOT", nullptr);
+    if (previousFailureLength > 0)
+        SetEnvironmentVariableW(L"MOJORECOMP_CRASH_DUMP_FAIL_TEST", previousFailure.c_str());
+    else
+        SetEnvironmentVariableW(L"MOJORECOMP_CRASH_DUMP_FAIL_TEST", nullptr);
+
+    if (!failureCreated)
+    {
+        std::fprintf(stderr, "FAIL: could not start forced dump failure child.\n");
+        return 9;
+    }
+    const DWORD failureWait = WaitForSingleObject(failureProcess.hProcess, 15000);
+    DWORD failureExitCode = STILL_ACTIVE;
+    GetExitCodeProcess(failureProcess.hProcess, &failureExitCode);
+    CloseHandle(failureProcess.hThread);
+    CloseHandle(failureProcess.hProcess);
+    if (failureWait != WAIT_OBJECT_0 || failureExitCode != EXCEPTION_ACCESS_VIOLATION)
+    {
+        std::fprintf(stderr, "FAIL: forced dump failure child did not terminate with C0000005.\n");
+        return 10;
+    }
+
+    std::filesystem::path failureLog;
+    std::filesystem::path failureJson;
+    bool unexpectedDump = false;
+    for (const auto& entry : std::filesystem::directory_iterator(failureRoot))
+    {
+        if (!entry.is_regular_file())
+            continue;
+        const auto extension = entry.path().extension().wstring();
+        if (extension == L".log")
+            failureLog = entry.path();
+        else if (extension == L".json")
+            failureJson = entry.path();
+        else if (extension == L".dmp")
+            unexpectedDump = true;
+    }
+    if (failureLog.empty() || failureJson.empty() || unexpectedDump ||
+        failureLog.stem() != failureJson.stem())
+    {
+        std::fprintf(stderr, "FAIL: dump failure did not preserve paired log and JSON only.\n");
+        return 11;
+    }
+    std::ifstream failureLogFile(failureLog);
+    const std::string failureLogText((std::istreambuf_iterator<char>(failureLogFile)),
+                                     std::istreambuf_iterator<char>());
+    if (failureLogText.find("code=C0000005") == std::string::npos ||
+        failureLogText.find("[minidump] status=failed") == std::string::npos)
+    {
+        std::fprintf(stderr, "FAIL: dump failure suppressed or damaged the textual crash report.\n");
+        return 12;
+    }
+
+    std::filesystem::remove_all(root, error);
+    std::puts("OK: crash reporter created paired artifacts and preserved logs when minidump creation failed.");
+    return 0;
+}
+#endif
+
 } // namespace
 
 int RunFiberProbe();
@@ -509,7 +502,15 @@ int RunEventProbe();
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
-    SetUnhandledExceptionFilter(BootProbeExceptionFilter);
+    mojorecomp::host::CrashReporterConfig crashReporterConfig{};
+    crashReporterConfig.runtimeVersion = mojorecomp::version::kCotRuntime;
+    crashReporterConfig.buildId = mojorecomp::version::kBuildId;
+    if (const char* runtimeSha256 = std::getenv("MOJORECOMP_RUNTIME_SHA256");
+        runtimeSha256 && *runtimeSha256)
+        crashReporterConfig.runtimeSha256 = runtimeSha256;
+    if (const char* logRoot = std::getenv("MOJORECOMP_LOG_ROOT"); logRoot && *logRoot)
+        crashReporterConfig.outputDirectory = std::filesystem::path(logRoot);
+    mojorecomp::host::InitializeCrashReporter(crashReporterConfig);
 #endif
     if (argc == 2 && std::strcmp(argv[1], "--debug-clock-self-test") == 0) {
         if (!mojorecomp::timebase::Init()) {
@@ -539,9 +540,10 @@ int main(int argc, char** argv) {
             return 2;
         }
 
-        mojorecomp::timebase::AdvanceDebugFrame(30);
+        const auto framePolicy = mojorecomp::host::ActiveFrameRatePolicy();
+        mojorecomp::timebase::AdvanceDebugFrame(framePolicy.simulationHz);
         const uint64_t step = mojorecomp::timebase::GuestTicks() - pause1;
-        const uint64_t expectedStep = MOJORECOMP_TIMEBASE_HZ / 30;
+        const uint64_t expectedStep = MOJORECOMP_TIMEBASE_HZ / framePolicy.simulationHz;
         if (step != expectedStep) {
             std::fprintf(stderr,
                          "FAIL: frame step=%llu expected=%llu.\n",
@@ -561,37 +563,25 @@ int main(int argc, char** argv) {
             return 4;
         }
 
-        std::puts("OK: debug clock pause, 1/30 frame-step and 4x fast-forward passed.");
+        std::printf("OK: debug clock pause, 1/%u frame-step and 4x fast-forward passed.\n",
+                    framePolicy.simulationHz);
         return 0;
     }
-    if (argc == 2 && std::strcmp(argv[1], "--crash-log-self-test") == 0) {
+    if (argc == 2 &&
+        (std::strcmp(argv[1], "--crash-log-self-test") == 0 ||
+         std::strcmp(argv[1], "--crash-dump-self-test") == 0)) {
 #if defined(_WIN32)
-        uintptr_t fakeStack[32]{};
-        PPCContext fakeGuest{};
-        fakeGuest.lr = 0x821DAED8u;
-        fakeGuest.ctr.u32 = 0x821D7BE0u;
-        fakeGuest.r1.u32 = 0x88000000u;
-        fakeGuest.r3.u32 = 0xA1001000u;
-        fakeGuest.r4.u32 = 1u;
-        fakeGuest.r13.u32 = 0x88001000u;
-        g_ppcContext = &fakeGuest;
-        MojoRecompTraceIndirectCall(0x821D7BE0u, 0x821DAED8u, 0xA1001000u);
-        EXCEPTION_RECORD record{};
-        record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
-        record.ExceptionAddress = reinterpret_cast<void*>(uintptr_t{0x1234});
-        record.NumberParameters = 2;
-        record.ExceptionInformation[0] = 8;
-        record.ExceptionInformation[1] = 0;
-        CONTEXT context{};
-        context.Rip = 0x1234;
-        context.Rsp = reinterpret_cast<DWORD64>(fakeStack);
-        EXCEPTION_POINTERS pointers{&record, &context};
-        BootProbeExceptionFilter(&pointers);
-        g_ppcContext = nullptr;
-        std::puts("OK: crash logger self-test report emitted.");
-        return 0;
+        return RunCrashDumpSelfTest();
 #else
         std::puts("SKIP: crash logger self-test is Windows-only.");
+        return 0;
+#endif
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--crash-dump-self-test-child") == 0) {
+#if defined(_WIN32)
+        volatile int* invalid = reinterpret_cast<volatile int*>(uintptr_t{0x10});
+        return *invalid;
+#else
         return 0;
 #endif
     }
@@ -630,7 +620,8 @@ int main(int argc, char** argv) {
             std::filesystem::temp_directory_path() / "MojoRecomp" / "cot";
         const std::filesystem::path config = titleRoot / "settings.toml";
         const std::filesystem::path expected = titleRoot / "logs";
-        const std::filesystem::path actual = CrashLogRootForConfig(config);
+        const std::filesystem::path actual =
+            mojorecomp::host::CrashReportDirectoryForConfig(config);
         if (actual.lexically_normal() != expected.lexically_normal()) {
             std::fprintf(stderr, "FAIL: crash log root did not resolve beside settings.toml.\n");
             return 1;
@@ -786,14 +777,28 @@ int main(int argc, char** argv) {
     mojorecomp::config::Set(runtimeConfig);
     std::fprintf(stderr, "cot-runtime: localization profile=%s xbox_language=%u\n",
                  runtimeConfig.localizationProfile.c_str(), runtimeConfig.xboxLanguage);
+    const auto frameRatePolicy = mojorecomp::host::ActiveFrameRatePolicy();
+    std::fprintf(stderr,
+                 "cot-runtime: frame policy simulation=%uHz presentation=%uHz display=%uHz vblank=%uHz title_patches=%u\n",
+                 frameRatePolicy.simulationHz, frameRatePolicy.presentationHz,
+                 frameRatePolicy.displayHz, frameRatePolicy.guestVblankHz,
+                 frameRatePolicy.requiresTitlePatches ? 1u : 0u);
     mojorecomp::debug::SetEnabled(false);
     if (options.configPath)
     {
 #if defined(_WIN32)
+        mojorecomp::host::CrashReporterConfig configuredCrashReporter{};
+        configuredCrashReporter.runtimeVersion = mojorecomp::version::kCotRuntime;
+        configuredCrashReporter.buildId = mojorecomp::version::kBuildId;
+        if (const char* runtimeSha256 = std::getenv("MOJORECOMP_RUNTIME_SHA256");
+            runtimeSha256 && *runtimeSha256)
+            configuredCrashReporter.runtimeSha256 = runtimeSha256;
         if (const char* logRoot = std::getenv("MOJORECOMP_LOG_ROOT"); logRoot && *logRoot)
-            g_crashLogRoot = std::filesystem::path(logRoot);
+            configuredCrashReporter.outputDirectory = std::filesystem::path(logRoot);
         else
-            g_crashLogRoot = CrashLogRootForConfig(*options.configPath);
+            configuredCrashReporter.outputDirectory =
+                mojorecomp::host::CrashReportDirectoryForConfig(*options.configPath);
+        mojorecomp::host::InitializeCrashReporter(configuredCrashReporter);
 #endif
     }
 

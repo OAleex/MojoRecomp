@@ -19,6 +19,14 @@ pub const LIBRARY_MARKER: &str = ".mojorecomp-library.toml";
 pub struct LauncherSettings {
     pub schema_version: u32,
     pub game_library: PathBuf,
+    #[serde(default = "default_discord_activity_enabled")]
+    pub discord_activity_enabled: bool,
+    #[serde(default)]
+    pub language_setup_completed_games: Vec<String>,
+}
+
+fn default_discord_activity_enabled() -> bool {
+    true
 }
 
 impl LauncherSettings {
@@ -26,6 +34,8 @@ impl LauncherSettings {
         Self {
             schema_version: LIBRARY_SCHEMA_VERSION,
             game_library,
+            discord_activity_enabled: true,
+            language_setup_completed_games: Vec::new(),
         }
     }
 }
@@ -855,6 +865,8 @@ mod tests {
             .save_launcher_settings(&LauncherSettings {
                 schema_version: 1,
                 game_library: chosen.clone(),
+                discord_activity_enabled: true,
+                language_setup_completed_games: vec!["cot".into()],
             })
             .expect("save launcher settings");
         let restored = layout
@@ -863,7 +875,22 @@ mod tests {
             .expect("settings exist");
 
         assert_eq!(restored.game_library, chosen);
+        assert!(restored.discord_activity_enabled);
+        assert_eq!(restored.language_setup_completed_games, ["cot"]);
         std::fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[test]
+    fn legacy_launcher_settings_default_discord_activity_on() {
+        let parsed: LauncherSettings = toml::from_str(
+            r#"
+schema_version = 1
+game_library = "C:\\Games\\MojoRecomp-Games"
+"#,
+        )
+        .expect("legacy launcher settings parse");
+        assert!(parsed.discord_activity_enabled);
+        assert!(parsed.language_setup_completed_games.is_empty());
     }
 
     #[test]
@@ -1056,6 +1083,159 @@ mod tests {
         assert!(!destination.exists());
         assert!(!staging.exists());
         std::fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_destination_preserves_source_and_journal_until_recovery_can_finish() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = std::env::temp_dir().join(format!(
+            "mojorecomp-storage-locked-destination-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let layout = StorageLayout::new(
+            root.join("local"),
+            root.join("saves"),
+            root.join("app"),
+            root.join("default-library"),
+        );
+        fs::create_dir_all(source.join("cot")).expect("source tree");
+        fs::write(source.join("cot").join("default.xex"), b"guest-data")
+            .expect("source file");
+        initialize_library(&destination).expect("destination marker");
+        layout
+            .save_launcher_settings(&LauncherSettings::new(source.clone()))
+            .expect("save current library");
+
+        let plan = plan_library_migration(&source, &destination).expect("migration plan");
+        layout
+            .begin_library_migration(&plan)
+            .expect("migration journal");
+        let marker = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(destination.join(LIBRARY_MARKER))
+            .expect("lock destination marker against deletion");
+
+        let error = execute_library_migration(&plan, |_, _| {})
+            .expect_err("locked destination must stop activation");
+        assert!(error.contains("Destination library is not empty"));
+        assert!(source.join("cot").join("default.xex").is_file());
+        assert!(destination.join(LIBRARY_MARKER).is_file());
+        assert!(rollback_library_migration(&plan).is_err());
+        assert!(layout.migration_journal_path().is_file());
+
+        drop(marker);
+        assert_eq!(
+            layout
+                .recover_library_migration()
+                .expect("recover after releasing destination"),
+            None
+        );
+        assert!(source.join("cot").join("default.xex").is_file());
+        assert!(!destination.exists());
+        assert!(!layout.migration_journal_path().exists());
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_source_before_migration_fails_closed_without_creating_partial_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "mojorecomp-storage-locked-source-preflight-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(source.join("cot")).expect("source tree");
+        let source_file = source.join("cot").join("default.xex");
+        fs::write(&source_file, b"guest-data").expect("source file");
+        let plan = plan_library_migration(&source, &destination).expect("migration plan");
+
+        let locked_source = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&source_file)
+            .expect("lock source exclusively");
+        let error = execute_library_migration(&plan, |_, _| {})
+            .expect_err("exclusive source lock must stop migration");
+
+        assert!(!error.is_empty());
+        assert!(source_file.is_file());
+        assert!(!destination.exists());
+        assert!(!migration_staging_path(&destination)
+            .expect("migration staging path")
+            .exists());
+
+        drop(locked_source);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_old_source_after_settings_commit_keeps_new_library_active_until_cleanup_recovers() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = std::env::temp_dir().join(format!(
+            "mojorecomp-storage-locked-source-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let layout = StorageLayout::new(
+            root.join("local"),
+            root.join("saves"),
+            root.join("app"),
+            root.join("default-library"),
+        );
+        fs::create_dir_all(source.join("cot")).expect("source tree");
+        let source_file = source.join("cot").join("default.xex");
+        fs::write(&source_file, b"guest-data").expect("source file");
+        let plan = plan_library_migration(&source, &destination).expect("migration plan");
+        layout
+            .begin_library_migration(&plan)
+            .expect("migration journal");
+        execute_library_migration(&plan, |_, _| {}).expect("verified copy");
+        layout
+            .save_launcher_settings(&LauncherSettings::new(destination.clone()))
+            .expect("commit destination setting");
+
+        let locked_source = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&source_file)
+            .expect("lock old source against deletion");
+        let notice = layout
+            .recover_library_migration()
+            .expect("deferred cleanup result")
+            .expect("locked source should defer cleanup");
+        assert!(notice.contains("needs cleanup"));
+        assert!(source_file.is_file());
+        assert!(destination.join("cot").join("default.xex").is_file());
+        assert!(layout.migration_journal_path().is_file());
+
+        drop(locked_source);
+        assert_eq!(
+            layout
+                .recover_library_migration()
+                .expect("recover after releasing source"),
+            None
+        );
+        assert!(!source.exists());
+        assert!(destination.join("cot").join("default.xex").is_file());
+        assert!(!layout.migration_journal_path().exists());
+        fs::remove_dir_all(root).expect("test cleanup");
     }
 
     #[test]

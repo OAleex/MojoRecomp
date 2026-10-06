@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -22,6 +23,8 @@
 #include "../kernel/memory.h"
 #include "../kernel/unimplemented.h"
 #include "../kernel/xex_loader.h"
+#include "../host/frame_rate_policy.h"
+#include "../host/timing.h"
 #include "pm4.h"
 #include "renderer_probe.h"
 
@@ -36,6 +39,9 @@ std::atomic<uint32_t> g_gpuIdentifierAddress{0};
 std::atomic<bool> g_interruptPumpRunning{false};
 thread_local GuestThreadContext* g_graphicsPumpContext = nullptr;
 std::mutex g_graphicsInterruptMutex;
+std::mutex g_graphicsPumpWakeMutex;
+std::condition_variable g_graphicsPumpWakeCv;
+std::atomic<uint64_t> g_graphicsPumpWakeGeneration{0};
 
 constexpr uint32_t kCpRbWptrAddress = 0x7FC80714u;
 constexpr uint32_t kDisplayControllerGate = 0x7FC86544u;
@@ -75,39 +81,19 @@ uint64_t KernelSystemTime100ns()
 
 void PumpIdleWait()
 {
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    thread_local HANDLE timer = []() -> HANDLE {
-        HANDLE value = CreateWaitableTimerExW(nullptr, nullptr,
-                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                              TIMER_MODIFY_STATE | SYNCHRONIZE);
-        if (!value)
-            value = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-        return value;
-    }();
-    if (timer)
-    {
-        LARGE_INTEGER due{};
-        // Relative 250 us delay in 100 ns units. Unlike sleep_for on Windows,
-        // this doesn't routinely turn an idle CP poll into a scheduler quantum.
-        due.QuadPart = -2500;
-        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-        {
-            WaitForSingleObject(timer, INFINITE);
-            return;
-        }
-    }
-    std::this_thread::yield();
+    // Sleep while the ring is idle, but let an interrupt handshake wake the CP
+    // immediately instead of paying the full polling timeout.
+    const uint64_t observed = g_graphicsPumpWakeGeneration.load(std::memory_order_acquire);
+    std::unique_lock<std::mutex> lock(g_graphicsPumpWakeMutex);
+    g_graphicsPumpWakeCv.wait_for(lock, std::chrono::microseconds(250), [&] {
+        return g_graphicsPumpWakeGeneration.load(std::memory_order_acquire) != observed;
+    });
 }
 
-bool CpStallYieldEnabled()
+void WakeGraphicsProgressPump()
 {
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_CP_STALL_YIELD");
-        return value && *value && std::strtoul(value, nullptr, 0) != 0;
-    }();
-    return enabled;
+    g_graphicsPumpWakeGeneration.fetch_add(1, std::memory_order_release);
+    g_graphicsPumpWakeCv.notify_one();
 }
 
 bool CpTimeProfileEnabled()
@@ -115,6 +101,20 @@ bool CpTimeProfileEnabled()
     static const bool enabled = [] {
         const char* value = std::getenv("MOJORECOMP_CP_TIME_PROFILE");
         return value && *value && std::strtoul(value, nullptr, 0) != 0;
+    }();
+    return enabled;
+}
+
+bool CpPeriodicDiagnosticsEnabled()
+{
+    static const bool enabled = [] {
+        if (CpTimeProfileEnabled() || MojoRecompVerboseDiagnosticsEnabled())
+            return true;
+        const char* packetProfile = std::getenv("MOJORECOMP_PM4_PROFILE");
+        if (packetProfile && packetProfile[0] && packetProfile[0] != '0')
+            return true;
+        const char* timeProfile = std::getenv("MOJORECOMP_PM4_TIME_PROFILE");
+        return timeProfile && timeProfile[0] && timeProfile[0] != '0';
     }();
     return enabled;
 }
@@ -129,7 +129,9 @@ std::chrono::nanoseconds GuestVblankPeriod()
     // The PM4 worker remains independent, so renderer stalls do not drag this
     // clock down. MOJORECOMP_GUEST_VBLANK_US=1000 remains available for explicit
     // regression/A-B comparisons with the old uncapped behavior.
-    uint32_t periodUs = 16667;
+    uint32_t periodUs = static_cast<uint32_t>(
+        mojorecomp::host::PeriodForHzRoundedUs(
+            mojorecomp::host::ActiveFrameRatePolicy().guestVblankHz).count());
     if (const char* value = std::getenv("MOJORECOMP_GUEST_VBLANK_US"))
     {
         const unsigned long parsed = std::strtoul(value, nullptr, 0);
@@ -146,41 +148,6 @@ std::chrono::nanoseconds GuestVblankPeriod()
 
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::microseconds(periodUs));
-}
-
-void WaitUntilDisplayDeadline(std::chrono::steady_clock::time_point deadline)
-{
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    const auto now = std::chrono::steady_clock::now();
-    if (deadline <= now)
-        return;
-
-    thread_local HANDLE timer = []() -> HANDLE {
-        HANDLE value = CreateWaitableTimerExW(nullptr, nullptr,
-                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                              TIMER_MODIFY_STATE | SYNCHRONIZE);
-        if (!value)
-            value = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-        return value;
-    }();
-    if (timer)
-    {
-        using HundredNs = std::chrono::duration<int64_t, std::ratio<1, 10000000>>;
-        const int64_t ticks = std::chrono::duration_cast<HundredNs>(deadline - now).count();
-        if (ticks > 0)
-        {
-            LARGE_INTEGER due{};
-            due.QuadPart = -ticks;
-            if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-            {
-                WaitForSingleObject(timer, INFINITE);
-                return;
-            }
-        }
-    }
-    std::this_thread::sleep_until(deadline);
 }
 
 void PublishTimeStampBundle()
@@ -259,7 +226,8 @@ void GraphicsVblankPump()
     GuestThreadContext threadContext(2, 0x10000, 64, 0xEF0);
     uint64_t vblankCount = 0;
     auto vblankPeriod = GuestVblankPeriod();
-    auto nextVblank = std::chrono::steady_clock::now() + vblankPeriod;
+    mojorecomp::host::PeriodicDeadline vblankTimer;
+    vblankTimer.Reset(std::chrono::steady_clock::now(), vblankPeriod);
     auto perfWindowStart = std::chrono::steady_clock::now();
     uint64_t perfVblankIsrNs = 0;
     uint64_t perfVblankCount = 0;
@@ -272,12 +240,12 @@ void GraphicsVblankPump()
         if (requestedPeriod != vblankPeriod)
         {
             vblankPeriod = requestedPeriod;
-            nextVblank = std::chrono::steady_clock::now() + vblankPeriod;
+            vblankTimer.Reset(std::chrono::steady_clock::now(), vblankPeriod);
             KLOG("graphics guest-vblank period changed to %.3f ms (fast-forward=%u)\n",
                  double(vblankPeriod.count()) / 1.0e6,
                  mojorecomp::debug::FastForward() ? 1u : 0u);
         }
-        WaitUntilDisplayDeadline(nextVblank);
+        mojorecomp::host::WaitUntil(vblankTimer.Deadline());
 
         // The kernel exports this bundle as shared data. Titles read it directly,
         // so update it from the display clock rather than from PM4 progress.
@@ -285,7 +253,7 @@ void GraphicsVblankPump()
 
         const auto now = std::chrono::steady_clock::now();
         uint32_t catchupVblanks = 0;
-        while (now >= nextVblank && catchupVblanks < 64)
+        while (now >= vblankTimer.Deadline() && catchupVblanks < 64)
         {
             try
             {
@@ -341,7 +309,7 @@ void GraphicsVblankPump()
                      exit.code);
                 g_interruptCallback = 0;
             }
-            nextVblank += vblankPeriod;
+            vblankTimer.Advance();
             ++catchupVblanks;
         }
 
@@ -349,11 +317,9 @@ void GraphicsVblankPump()
         // guest-vblanks behind. Don't execute an unbounded ISR storm; after 64
         // catch-up deliveries, skip only the excess periods. GPU/PM4 stalls can
         // no longer reach this path because they run on the other worker.
-        if (now >= nextVblank)
+        if (now >= vblankTimer.Deadline())
         {
-            const auto behind = now - nextVblank;
-            const auto missed = behind / vblankPeriod + 1;
-            nextVblank += vblankPeriod * missed;
+            const uint64_t missed = vblankTimer.SkipPast(now);
             static std::atomic<uint32_t> catchupReports{0};
             if (catchupReports.fetch_add(1, std::memory_order_relaxed) < 8)
                 KLOG("graphics vblank catch-up capped; skipped %lld excess periods\n",
@@ -369,13 +335,17 @@ void GraphicsProgressPump()
     SetThreadDescription(GetCurrentThread(), L"MojoRecomp PM4");
     GuestThreadContext threadContext(2, 0x10000, 64, 0xEF1);
     uint32_t lastPublishedRptr = 0xFFFFFFFFu;
-    auto perfWindowStart = std::chrono::steady_clock::now();
+    const bool periodicDiagnostics = CpPeriodicDiagnosticsEnabled();
+    auto perfWindowStart = periodicDiagnostics
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     uint64_t perfFrameStart = Pm4_FrameCount();
     uint64_t perfPm4Ns = 0;
     uint64_t perfDrawSinkStart = Pm4_DrawSinkCpuNs();
     uint64_t perfPumpLoops = 0;
     g_graphicsPumpContext = &threadContext;
     Pm4_SetInterruptSink(DeliverCommandProcessorInterrupt);
+    Pm4_SetInterruptWakeSink(WakeGraphicsProgressPump);
     RendererProbe_Init();
     KLOG("graphics command processor pump started (PM4) tid=%lu\n",
          static_cast<unsigned long>(GetCurrentThreadId()));
@@ -394,11 +364,16 @@ void GraphicsProgressPump()
             const uint32_t wptr =
                 *reinterpret_cast<be<uint32_t>*>(g_guestMemory.Translate(kCpRbWptrAddress));
             Pm4_SetReadPointerSlot(rptrSlot);
-            const auto pm4Start = std::chrono::steady_clock::now();
+            const auto pm4Start = periodicDiagnostics
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
             const uint32_t consumed = Pm4_Execute(g_guestMemory.base, wptr);
-            perfPm4Ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - pm4Start).count());
+            if (periodicDiagnostics)
+            {
+                perfPm4Ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - pm4Start).count());
+            }
             *reinterpret_cast<be<uint32_t>*>(g_guestMemory.Translate(rptrSlot)) = consumed;
             pm4Advanced = consumed != before;
             const uint32_t ringDwords = ringSize / 4u;
@@ -413,78 +388,71 @@ void GraphicsProgressPump()
                 lastPublishedRptr = consumed;
             }
         }
-        ++perfPumpLoops;
-
-        const auto now = std::chrono::steady_clock::now();
-        const double perfWindowMs =
-            std::chrono::duration<double, std::milli>(now - perfWindowStart).count();
-        if (perfWindowMs >= 1000.0)
+        if (periodicDiagnostics)
         {
-            const uint64_t perfFrameEnd = Pm4_FrameCount();
-            const uint64_t perfFrames = perfFrameEnd - perfFrameStart;
-            const double pm4WindowMs = double(perfPm4Ns) / 1.0e6;
-            const double pm4FrameMs = perfFrames ? pm4WindowMs / double(perfFrames) : 0.0;
-            const uint64_t drawSinkEnd = Pm4_DrawSinkCpuNs();
-            const uint64_t drawSinkNs = drawSinkEnd - perfDrawSinkStart;
-            const uint64_t parserNs = perfPm4Ns > drawSinkNs ? perfPm4Ns - drawSinkNs : 0;
-            const double drawSinkMs = double(drawSinkNs) / 1.0e6;
-            const double parserMs = double(parserNs) / 1.0e6;
-            const double drawSinkFrameMs = perfFrames ? drawSinkMs / double(perfFrames) : 0.0;
-            const double parserFrameMs = perfFrames ? parserMs / double(perfFrames) : 0.0;
-            if (CpTimeProfileEnabled())
-                KLOG("graphics CP perf: frame=%llu frames=%llu window=%.1f ms PM4=%.2f ms/window PM4/frame=%.3f ms sink/frame=%.3f ms parser/frame=%.3f ms loops=%llu\n",
-                     static_cast<unsigned long long>(perfFrameEnd),
-                     static_cast<unsigned long long>(perfFrames),
-                     perfWindowMs, pm4WindowMs, pm4FrameMs, drawSinkFrameMs, parserFrameMs,
-                     static_cast<unsigned long long>(perfPumpLoops));
-            else
-                KLOG_DIAG("graphics CP perf: frame=%llu frames=%llu window=%.1f ms PM4=%.2f ms/window PM4/frame=%.3f ms sink/frame=%.3f ms parser/frame=%.3f ms loops=%llu\n",
-                     static_cast<unsigned long long>(perfFrameEnd),
-                     static_cast<unsigned long long>(perfFrames),
-                     perfWindowMs, pm4WindowMs, pm4FrameMs, drawSinkFrameMs, parserFrameMs,
-                     static_cast<unsigned long long>(perfPumpLoops));
-            const uint32_t wptr = *reinterpret_cast<be<uint32_t>*>(
-                g_guestMemory.Translate(kCpRbWptrAddress));
-            KLOG_DIAG("PM4 health: wptr=%u rptr=%u packets=%llu ib=%llu stores=%llu "
-                 "ints=%llu waits=%llu stalls=%llu draws=%llu frames=%llu shaders=%llu shaderCache=%llu "
-                 "sceneIbSkip=%llu sceneIbDwords=%llu renderPktSkip=%llu renderPktDwords=%llu "
-                 "type0Skip=%llu type0Dwords=%llu\n",
-                 wptr, Pm4_Cursor(),
-                 static_cast<unsigned long long>(Pm4_PacketCount()),
-                 static_cast<unsigned long long>(Pm4_IndirectBufferCount()),
-                 static_cast<unsigned long long>(Pm4_GpuStoreCount()),
-                 static_cast<unsigned long long>(Pm4_InterruptCount()),
-                 static_cast<unsigned long long>(Pm4_WaitCount()),
-                 static_cast<unsigned long long>(Pm4_WaitStallCount()),
-                 static_cast<unsigned long long>(Pm4_DrawCount()),
-                 static_cast<unsigned long long>(Pm4_FrameCount()),
-                 static_cast<unsigned long long>(Pm4_ShaderBindCount()),
-                 static_cast<unsigned long long>(Pm4_ShaderCacheHitCount()),
-                 static_cast<unsigned long long>(Pm4_SceneIbSkipCount()),
-                 static_cast<unsigned long long>(Pm4_SceneIbSkippedDwords()),
-                 static_cast<unsigned long long>(Pm4_SceneRenderPacketSkipCount()),
-                 static_cast<unsigned long long>(Pm4_SceneRenderSkippedDwords()),
-                 static_cast<unsigned long long>(Pm4_SceneType0ReplaySkipCount()),
-                 static_cast<unsigned long long>(Pm4_SceneType0ReplaySkippedDwords()));
-            Pm4_LogPacketProfile();
-            Pm4_LogTimingProfile();
-            perfWindowStart = now;
-            perfFrameStart = perfFrameEnd;
-            perfPm4Ns = 0;
-            perfDrawSinkStart = drawSinkEnd;
-            perfPumpLoops = 0;
+            ++perfPumpLoops;
+            const auto now = std::chrono::steady_clock::now();
+            const double perfWindowMs =
+                std::chrono::duration<double, std::milli>(now - perfWindowStart).count();
+            if (perfWindowMs >= 1000.0)
+            {
+                const uint64_t perfFrameEnd = Pm4_FrameCount();
+                const uint64_t perfFrames = perfFrameEnd - perfFrameStart;
+                const double pm4WindowMs = double(perfPm4Ns) / 1.0e6;
+                const double pm4FrameMs = perfFrames ? pm4WindowMs / double(perfFrames) : 0.0;
+                const uint64_t drawSinkEnd = Pm4_DrawSinkCpuNs();
+                const uint64_t drawSinkNs = drawSinkEnd - perfDrawSinkStart;
+                const uint64_t parserNs = perfPm4Ns > drawSinkNs ? perfPm4Ns - drawSinkNs : 0;
+                const double drawSinkMs = double(drawSinkNs) / 1.0e6;
+                const double parserMs = double(parserNs) / 1.0e6;
+                const double drawSinkFrameMs = perfFrames ? drawSinkMs / double(perfFrames) : 0.0;
+                const double parserFrameMs = perfFrames ? parserMs / double(perfFrames) : 0.0;
+                if (CpTimeProfileEnabled())
+                    KLOG("graphics CP perf: frame=%llu frames=%llu window=%.1f ms PM4=%.2f ms/window PM4/frame=%.3f ms sink/frame=%.3f ms parser/frame=%.3f ms loops=%llu\n",
+                         static_cast<unsigned long long>(perfFrameEnd),
+                         static_cast<unsigned long long>(perfFrames),
+                         perfWindowMs, pm4WindowMs, pm4FrameMs, drawSinkFrameMs, parserFrameMs,
+                         static_cast<unsigned long long>(perfPumpLoops));
+                else
+                    KLOG_DIAG("graphics CP perf: frame=%llu frames=%llu window=%.1f ms PM4=%.2f ms/window PM4/frame=%.3f ms sink/frame=%.3f ms parser/frame=%.3f ms loops=%llu\n",
+                         static_cast<unsigned long long>(perfFrameEnd),
+                         static_cast<unsigned long long>(perfFrames),
+                         perfWindowMs, pm4WindowMs, pm4FrameMs, drawSinkFrameMs, parserFrameMs,
+                         static_cast<unsigned long long>(perfPumpLoops));
+                const uint32_t wptr = *reinterpret_cast<be<uint32_t>*>(
+                    g_guestMemory.Translate(kCpRbWptrAddress));
+                KLOG_DIAG("PM4 health: wptr=%u rptr=%u packets=%llu ib=%llu stores=%llu "
+                     "ints=%llu waits=%llu stalls=%llu draws=%llu frames=%llu shaders=%llu shaderCache=%llu\n",
+                     wptr, Pm4_Cursor(),
+                     static_cast<unsigned long long>(Pm4_PacketCount()),
+                     static_cast<unsigned long long>(Pm4_IndirectBufferCount()),
+                     static_cast<unsigned long long>(Pm4_GpuStoreCount()),
+                     static_cast<unsigned long long>(Pm4_InterruptCount()),
+                     static_cast<unsigned long long>(Pm4_WaitCount()),
+                     static_cast<unsigned long long>(Pm4_WaitStallCount()),
+                     static_cast<unsigned long long>(Pm4_DrawCount()),
+                     static_cast<unsigned long long>(Pm4_FrameCount()),
+                     static_cast<unsigned long long>(Pm4_ShaderBindCount()),
+                     static_cast<unsigned long long>(Pm4_ShaderCacheHitCount()));
+                Pm4_LogPacketProfile();
+                Pm4_LogTimingProfile();
+                perfWindowStart = now;
+                perfFrameStart = perfFrameEnd;
+                perfPm4Ns = 0;
+                perfDrawSinkStart = drawSinkEnd;
+                perfPumpLoops = 0;
+            }
         }
 
-        // Don't voluntarily park the command processor while it is making
-        // progress. The title submits many small tiled batches per frame, and a
-        // coarse Windows sleep here can add several milliseconds between each
-        // batch. Only use the precise short wait once the ring is caught up (or
-        // genuinely stalled on a wait packet).
-        if (pm4Advanced)
-            std::this_thread::yield();
-        else if (pm4Backlogged && CpStallYieldEnabled())
-            std::this_thread::yield();
-        else
+        // When a pass just consumed everything currently published by the guest,
+        // immediately poll once more instead of voluntarily yielding the Windows
+        // quantum. Crash submits many small batches around a frame boundary; a
+        // yield here can turn a sub-millisecond hand-off into scheduler jitter.
+        // The very next empty poll still takes the precise 250 us idle wait, so
+        // this adds at most one cheap repoll and never becomes a busy loop.
+        if (pm4Backlogged)
+            PumpIdleWait();
+        else if (!pm4Advanced)
             PumpIdleWait();
     }
 }
@@ -509,6 +477,7 @@ void VdShutdownEngines_x()
     g_ringBase = 0;
     g_ringSize = 0;
     g_readPointerWriteback = 0;
+    Pm4_SetInterruptWakeSink(nullptr);
     Pm4_SetReadPointerSlot(0);
     Pm4_SetReadPointerUpdateFrequency(1);
 }
@@ -596,7 +565,8 @@ void VdGetCurrentDisplayInformation_x(uint8_t* info)
     *at16(0x46) = 180;
     *at16(0x48) = 1280;
     *at16(0x4A) = 720;
-    *reinterpret_cast<be<float>*>(info + 0x4C) = 60.0f;
+    *reinterpret_cast<be<float>*>(info + 0x4C) =
+        static_cast<float>(mojorecomp::host::ActiveFrameRatePolicy().displayHz);
     *at16(0x56) = 1280;
 }
 

@@ -37,9 +37,9 @@ struct RuntimeConfig {
     AspectRatio aspectRatio = AspectRatio::Native16x9;
     // Preserve the current timing-safe COT baseline when no launcher config exists.
     bool vsync = false;
-    AntiAliasing antiAliasing = AntiAliasing::Off;
+    AntiAliasing antiAliasing = AntiAliasing::FxaaExtreme;
     // 0 means Default. Other accepted values are 1, 2, 4, 8 and 16.
-    uint32_t textureFiltering = 0;
+    uint32_t textureFiltering = 8;
 };
 
 struct RuntimeConfigOverrides {

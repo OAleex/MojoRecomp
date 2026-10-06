@@ -23,9 +23,11 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -35,16 +37,27 @@
 #include "../kernel/klog.h"
 #include "primitive_utils.h"
 #include "../host/host_paths.h"
+#include "../host/crash_reporter.h"
+#include "../host/frame_rate_policy.h"
+#include "../host/presentation_metrics.h"
+#include "../host/stutter_profiler.h"
 #include "../host/system_font_atlas.h"
 #include "../subtitles/subtitle_runtime.h"
 #include "pm4.h"
+#include "guest_memory_snapshot.h"
 #include "shader_cache.h"
+#include "shader_metadata.h"
 #include "shader_translator.h"
 #include "texture_abi.h"
 #include "render_policy.h"
+#include "vulkan_adapter_policy.h"
 #include "xenos.h"
 
 namespace {
+inline const uint8_t* GuestReadPtr(const uint8_t* base, uint32_t address, size_t bytes)
+{
+    return mojorecomp::gpu::GuestReadPtr(base, address, bytes);
+}
 
 constexpr uint32_t kMaxFramesInFlight = 3;
 // Level startup can publish a large batch of persistent guest textures before
@@ -82,31 +95,6 @@ constexpr uint32_t kDescriptorBundles = 2048;
 VkDescriptorSetLayout g_textureLayouts[4]{};
 VkDescriptorPool g_texturePool = VK_NULL_HANDLE;
 
-// Host-side 2x MSAA resolve helper. The Vega 8 driver faults in both dynamic
-// rendering resolves and vkCmdResolveImage for this path, so average color
-// samples 0/1 in a tiny fullscreen shader instead.
-VkDescriptorSetLayout g_msaaResolveSetLayout = VK_NULL_HANDLE;
-VkDescriptorPool g_msaaResolvePool = VK_NULL_HANDLE;
-VkPipelineLayout g_msaaResolvePipelineLayout = VK_NULL_HANDLE;
-VkPipeline g_msaaResolvePipeline = VK_NULL_HANDLE;
-VkShaderModule g_msaaResolveVs = VK_NULL_HANDLE;
-VkShaderModule g_msaaResolvePs = VK_NULL_HANDLE;
-// Depth MSAA fallback for devices that can't resolve depth with SAMPLE_ZERO
-// through dynamic rendering. Xenos depth resolves select sample 0, so unlike
-// color this is a straight per-pixel sample load rather than an average.
-VkDescriptorSetLayout g_depthMsaaResolveSetLayout = VK_NULL_HANDLE;
-VkDescriptorPool g_depthMsaaResolvePool = VK_NULL_HANDLE;
-VkPipelineLayout g_depthMsaaResolvePipelineLayout = VK_NULL_HANDLE;
-VkShaderModule g_depthMsaaResolveVs = VK_NULL_HANDLE;
-VkShaderModule g_depthMsaaResolvePs = VK_NULL_HANDLE;
-VkPipeline g_depthMsaaResolveUnormPipeline = VK_NULL_HANDLE;
-VkPipeline g_depthMsaaResolveFloatPipeline = VK_NULL_HANDLE;
-// Guest pixel shaders are ignored in Xenos DepthOnly mode. D24FS8 still needs
-// the host precision boundary, so this tiny renderer-owned fragment shader is
-// used only to quantize rasterized Z to guest float20e4 without executing any
-// guest texture fetches, kills or color logic.
-VkShaderModule g_float24DepthOnlyPs = VK_NULL_HANDLE;
-bool g_float24DepthOnlyPsAttempted = false;
 struct SampledImage
 {
     VkImage image = VK_NULL_HANDLE;
@@ -126,24 +114,18 @@ struct TextureBundle
 };
 std::deque<TextureBundle> g_textureBundles;
 std::unordered_multimap<uint64_t, size_t> g_textureBundleLookup;
-std::atomic<uint64_t> g_texturedDraws{0};
-std::atomic<uint64_t> g_collapsedTileDraws{0};
+uint64_t g_texturedDraws = 0;
 bool g_textureCompressionBC = false;
-uint64_t g_sceneTilingLastIndexedFrame = 0;
-uint64_t g_sceneTilingLastDepthFrame = 0;
-uint64_t g_sceneStitchLastIndexedFrame = 0;
-// Diagnostic-only synchronization between a stable indexed-mesh signature and
-// a subsequent full scene-color resolve.  This avoids comparing unrelated host
-// frame numbers across separate headless runs.
-std::atomic<uint64_t> g_indexHashEventFrame{0};
-std::atomic<uint64_t> g_indexHashCaptureFrame{0};
 thread_local const char* g_texturePrepareFailure = "none";
 thread_local uint32_t g_texturePrepareFailureSlot = UINT32_MAX;
-std::atomic<uint32_t> g_indexHashCaptureSnapshotKey{UINT32_MAX};
 
 using PerfClock = std::chrono::steady_clock;
 uint64_t g_perfFenceWaitNs = 0;
 uint64_t g_perfPresentNs = 0;
+uint64_t g_perfAcquireNs = 0;
+uint64_t g_perfPresentPrepNs = 0;
+uint64_t g_perfQueueSubmitNs = 0;
+uint64_t g_perfQueuePresentNs = 0;
 uint64_t g_perfTextureNs = 0;
 uint64_t g_perfPipelineNs = 0;
 uint64_t g_perfConstantsNs = 0;
@@ -166,6 +148,50 @@ uint64_t g_perfEdramOwnershipTransfers = 0;
 uint64_t g_perfEdramOwnershipTiles = 0;
 uint64_t g_perfEdramOwnershipRects = 0;
 uint64_t g_perfEdramOwnershipPixels = 0;
+uint64_t g_perfEdramPipelineNs = 0;
+uint64_t g_perfEdramTransferNs = 0;
+
+bool DetailedCpuProfileEnabled()
+{
+    static const bool enabled = [] {
+        if (const char* overrideValue = std::getenv("MOJORECOMP_DETAILED_CPU_PROFILE");
+            overrideValue && *overrideValue)
+        {
+            return overrideValue[0] != '0';
+        }
+        const char* logRoot = std::getenv("MOJORECOMP_LOG_ROOT");
+        return logRoot && *logRoot;
+    }();
+    return enabled;
+}
+
+PerfClock::time_point DetailedCpuTimerStart()
+{
+    return DetailedCpuProfileEnabled() ? PerfClock::now() : PerfClock::time_point{};
+}
+
+void DetailedCpuTimerAccumulate(PerfClock::time_point start, uint64_t& target)
+{
+    if (start == PerfClock::time_point{})
+        return;
+    target += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            PerfClock::now() - start).count());
+}
+
+struct DetailedCpuScope
+{
+    uint64_t& target;
+    PerfClock::time_point start;
+
+    explicit DetailedCpuScope(uint64_t& targetRef)
+        : target(targetRef), start(DetailedCpuTimerStart()) {}
+
+    ~DetailedCpuScope()
+    {
+        DetailedCpuTimerAccumulate(start, target);
+    }
+};
 uint64_t g_perfTextureUploadBytesR8 = 0;
 uint64_t g_perfTextureUploadBytesRGBA = 0;
 uint64_t g_perfTextureUploadBytesBC1 = 0;
@@ -190,6 +216,105 @@ uint64_t g_perfVertexReuseBytes = 0;
 uint64_t g_perfVertexReuseHits = 0;
 uint64_t g_perfIndexUploadBytes = 0;
 uint64_t g_perfIndexUploadCopies = 0;
+uint64_t g_perfIndexReuseBytes = 0;
+uint64_t g_perfIndexReuseHits = 0;
+uint64_t g_perfTextureIdentityBytes = 0;
+uint64_t g_perfTextureIdentityCalls = 0;
+uint64_t g_perfDescriptorBundleRequests = 0;
+uint64_t g_perfDescriptorAdjacentHits = 0;
+uint64_t g_perfDescriptorHashHits = 0;
+uint64_t g_perfDescriptorMisses = 0;
+uint64_t g_perfDescriptorSetAllocations = 0;
+uint64_t g_perfDescriptorUpdateCalls = 0;
+uint64_t g_perfDescriptorWrittenDescriptors = 0;
+uint64_t g_perfDescriptorLookupNs = 0;
+uint64_t g_perfDescriptorBindCalls = 0;
+uint64_t g_perfDescriptorBindSuppressed = 0;
+
+struct StutterCounterSnapshot
+{
+    uint64_t pm4ExecuteNs = 0;
+    uint64_t pm4DrawSinkNs = 0;
+    uint64_t pm4ExecuteCalls = 0;
+    uint64_t fenceWaitNs = 0;
+    uint64_t acquireNs = 0;
+    uint64_t presentPrepNs = 0;
+    uint64_t queueSubmitNs = 0;
+    uint64_t queuePresentNs = 0;
+    uint64_t drawNs = 0;
+    uint64_t attachmentNs = 0;
+    uint64_t textureNs = 0;
+    uint64_t pipelineNs = 0;
+    uint64_t constantsNs = 0;
+    uint64_t vertexNs = 0;
+    uint64_t resolveNs = 0;
+    uint64_t edramPipelineNs = 0;
+    uint64_t edramTransferNs = 0;
+    uint64_t pipelineCreates = 0;
+    uint64_t textureUploadBytes = 0;
+    uint64_t textureRefreshBytes = 0;
+    uint64_t vertexUploadBytes = 0;
+    uint64_t drawCalls = 0;
+    uint64_t resolveCalls = 0;
+};
+
+mojorecomp::host::StutterProfiler g_stutterProfiler{};
+mojorecomp::host::FramePacingProfiler g_framePacingProfiler{120};
+StutterCounterSnapshot g_stutterPrevious{};
+bool g_stutterPreviousValid = false;
+std::filesystem::path g_stutterLogPath;
+
+uint64_t CounterDelta(uint64_t current, uint64_t previous)
+{
+    // The legacy 120-frame profiler resets its counters after each report. Treat
+    // a smaller current value as a reset so hitch sampling stays frame-local.
+    return current >= previous ? current - previous : current;
+}
+
+uint32_t StutterThresholdMs()
+{
+    static const uint32_t threshold = [] {
+        constexpr uint32_t kDefaultMs = 100;
+        const char* value = std::getenv("MOJORECOMP_STUTTER_THRESHOLD_MS");
+        if (!value || !*value)
+            return kDefaultMs;
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end != '\0')
+            return kDefaultMs;
+        return std::clamp<uint32_t>(static_cast<uint32_t>(parsed), 33u, 5000u);
+    }();
+    return threshold;
+}
+
+void ResetStutterTracking()
+{
+    g_stutterProfiler.SetThreshold(std::chrono::milliseconds(StutterThresholdMs()));
+    g_stutterProfiler.Reset();
+    g_framePacingProfiler.Reset();
+    g_stutterPrevious = {};
+    g_stutterPreviousValid = false;
+
+    g_stutterLogPath.clear();
+    if (const char* logRoot = std::getenv("MOJORECOMP_LOG_ROOT");
+        logRoot && *logRoot)
+    {
+        g_stutterLogPath = std::filesystem::path(logRoot) / "stutter.log";
+        std::error_code ec;
+        std::filesystem::create_directories(g_stutterLogPath.parent_path(), ec);
+        std::ofstream output(g_stutterLogPath, std::ios::trunc);
+        if (output)
+        {
+            output << "# MojoRecomp stutter log\n"
+                   << "# threshold_ms=" << StutterThresholdMs() << "\n";
+        }
+        else
+        {
+            g_stutterLogPath.clear();
+        }
+    }
+}
+
 struct ShaderPairPerf
 {
     uint64_t vs = 0;
@@ -390,19 +515,6 @@ std::array<float, 2> AspectScaleForDraw(bool scene3D)
     return mojorecomp::gpu::SafeAreaViewportScale(targetAspect);
 }
 
-VkViewport ApplySafeAreaViewport(const VkViewport& viewport)
-{
-    const auto scale = mojorecomp::gpu::SafeAreaViewportScale(ConfiguredAspectRatio());
-    VkViewport out = viewport;
-    const float centerX = static_cast<float>(g_extent.width) * 0.5f;
-    const float centerY = static_cast<float>(g_extent.height) * 0.5f;
-    out.x = centerX + (viewport.x - centerX) * scale[0];
-    out.y = centerY + (viewport.y - centerY) * scale[1];
-    out.width = viewport.width * scale[0];
-    out.height = viewport.height * scale[1];
-    return out;
-}
-
 VkRect2D ScaleRectToInternal(const VkRect2D& logical)
 {
     VkRect2D scaled = logical;
@@ -527,59 +639,8 @@ bool g_gpuTimestampSupported = false;
 uint32_t g_gpuTimestampValidBits = 0;
 float g_gpuTimestampPeriodNs = 0.0f;
 
-bool g_hostMsaa2x = false;
-bool g_hostMsaaDepthSampleZero = false;
-VkSampleCountFlags g_hostColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-VkSampleCountFlags g_hostDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-VkSampleCountFlags g_hostStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-// Keep EDRAM attachment capabilities per host format. Requiring D24S8 and
-// D24FS8 to intersect globally rejects devices that support the format used by
-// the current guest surface but not the other depth representation. Color and
-// the actual depth format are intersected when a backing/pipeline is selected.
-VkSampleCountFlags g_hostEdramColorSampleCounts = VK_SAMPLE_COUNT_1_BIT;
-VkSampleCountFlags g_hostEdramDepthUnormSampleCounts = 0;
-VkSampleCountFlags g_hostEdramDepthFloatSampleCounts = 0;
 bool g_hostDepthUnormUsesFloatFormat = false;
 bool g_shaderStencilExport = false;
-bool g_sampleRateShading = false;
-
-bool HostMsaaEnabled()
-{
-    // Native host MSAA is substantially more expensive than the 1x ownership
-    // path, so keep it as an explicit diagnostic opt-in.
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_HOST_MSAA");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-VkSampleCountFlagBits GuestSurfaceSamples(uint32_t surfaceInfo,
-                                          uint32_t depthInfo = UINT32_MAX)
-{
-    if (!HostMsaaEnabled())
-        return VK_SAMPLE_COUNT_1_BIT;
-
-    VkSampleCountFlagBits requested = VK_SAMPLE_COUNT_1_BIT;
-    switch (xenos::SurfaceMsaaSamples(surfaceInfo))
-    {
-        case xenos::MsaaSamples::k2X: requested = VK_SAMPLE_COUNT_2_BIT; break;
-        case xenos::MsaaSamples::k4X: requested = VK_SAMPLE_COUNT_4_BIT; break;
-        default: break;
-    }
-    VkSampleCountFlags common = g_hostEdramColorSampleCounts;
-    if (depthInfo != UINT32_MAX)
-    {
-        const bool floatDepth = ((depthInfo >> 16) & 1u) != 0;
-        common &= floatDepth ? g_hostEdramDepthFloatSampleCounts
-                             : g_hostEdramDepthUnormSampleCounts;
-    }
-    // Do not silently turn a guest 2x/4x surface into a 1x host image. EDRAM
-    // tile dimensions and sample addressing are part of the physical layout;
-    // pretending the surface is 1x would make ownership transfers target the
-    // wrong pixels. Callers treat zero as an unsupported attachment layout.
-    return (common & requested) ? requested : VkSampleCountFlagBits(0);
-}
 
 VkSampleCountFlagBits GuestEdramSamples(uint32_t surfaceInfo)
 {
@@ -599,10 +660,6 @@ uint64_t ColorSurfaceKey(uint32_t surfaceInfo, uint32_t colorInfo)
 VkImage g_colorImage = VK_NULL_HANDLE;
 VkImageView g_colorView = VK_NULL_HANDLE;
 VkDeviceMemory g_colorMemory = VK_NULL_HANDLE;
-VkImage g_colorResolveImage = VK_NULL_HANDLE;
-VkImageView g_colorResolveView = VK_NULL_HANDLE;
-VkDeviceMemory g_colorResolveMemory = VK_NULL_HANDLE;
-VkImageLayout g_colorResolveLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 bool g_colorInitialized = false;
 
 constexpr VkFormat kDepthUnormFormat = VK_FORMAT_D24_UNORM_S8_UINT;
@@ -622,10 +679,6 @@ VkFormat HostDepthFormat(uint32_t depthInfo)
 VkImage g_depthImage = VK_NULL_HANDLE;
 VkImageView g_depthView = VK_NULL_HANDLE;
 VkDeviceMemory g_depthMemory = VK_NULL_HANDLE;
-VkImage g_depthResolveImage = VK_NULL_HANDLE;
-VkImageView g_depthResolveView = VK_NULL_HANDLE;
-VkDeviceMemory g_depthResolveMemory = VK_NULL_HANDLE;
-VkImageLayout g_depthResolveLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 bool g_depthInitialized = false;
 
 VkBuffer g_uploadBuffer = VK_NULL_HANDLE;
@@ -641,6 +694,103 @@ bool g_readbackReported = false;
 uint32_t g_readbackAttempts = 0;
 uint64_t g_frontReadbackFrame = 0;
 uint32_t g_readbackFrameSlot = UINT32_MAX;
+
+size_t MixCacheHash(size_t seed, uint64_t value)
+{
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdull;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ull;
+    value ^= value >> 33;
+    return seed ^ (static_cast<size_t>(value) + 0x9E3779B97F4A7C15ull +
+                   (seed << 6) + (seed >> 2));
+}
+
+struct VertexUploadCacheKey
+{
+    uint64_t token = 0;
+    uint64_t offset = 0;
+    uint64_t bytes = 0;
+    uint32_t endian = 0;
+
+    bool operator==(const VertexUploadCacheKey& other) const noexcept
+    {
+        return token == other.token && offset == other.offset &&
+               bytes == other.bytes && endian == other.endian;
+    }
+};
+
+struct VertexUploadCacheKeyHash
+{
+    size_t operator()(const VertexUploadCacheKey& key) const noexcept
+    {
+        size_t hash = 0;
+        hash = MixCacheHash(hash, key.token);
+        hash = MixCacheHash(hash, key.offset);
+        hash = MixCacheHash(hash, key.bytes);
+        hash = MixCacheHash(hash, key.endian);
+        return hash;
+    }
+};
+
+struct IndexUploadCacheKey
+{
+    uint64_t token = 0;
+    uint64_t offset = 0;
+    uint64_t sourceBytes = 0;
+    uint32_t count = 0;
+    uint32_t indexOffset = 0;
+    uint32_t minVertex = 0;
+    uint32_t maxVertex = 0;
+    uint32_t restartIndex = 0;
+    uint32_t endian = 0;
+    bool index32 = false;
+    bool primitiveRestart = false;
+    bool rewritten = false;
+
+    bool operator==(const IndexUploadCacheKey& other) const noexcept
+    {
+        return token == other.token && offset == other.offset &&
+               sourceBytes == other.sourceBytes && count == other.count &&
+               indexOffset == other.indexOffset && minVertex == other.minVertex &&
+               maxVertex == other.maxVertex && restartIndex == other.restartIndex &&
+               endian == other.endian && index32 == other.index32 &&
+               primitiveRestart == other.primitiveRestart && rewritten == other.rewritten;
+    }
+};
+
+struct IndexUploadCacheKeyHash
+{
+    size_t operator()(const IndexUploadCacheKey& key) const noexcept
+    {
+        size_t hash = 0;
+        hash = MixCacheHash(hash, key.token);
+        hash = MixCacheHash(hash, key.offset);
+        hash = MixCacheHash(hash, key.sourceBytes);
+        hash = MixCacheHash(hash, key.count);
+        hash = MixCacheHash(hash, key.indexOffset);
+        hash = MixCacheHash(hash, key.minVertex);
+        hash = MixCacheHash(hash, key.maxVertex);
+        hash = MixCacheHash(hash, key.restartIndex);
+        hash = MixCacheHash(hash, key.endian);
+        hash = MixCacheHash(hash, key.index32);
+        hash = MixCacheHash(hash, key.primitiveRestart);
+        hash = MixCacheHash(hash, key.rewritten);
+        return hash;
+    }
+};
+
+struct IndexUploadCacheValue
+{
+    VkDeviceSize at = VK_WHOLE_SIZE;
+    VkIndexType type = VK_INDEX_TYPE_UINT16;
+    uint64_t bytes = 0;
+};
+
+std::unordered_map<VertexUploadCacheKey, VkDeviceSize, VertexUploadCacheKeyHash>
+    g_frameVertexUploadCache;
+std::unordered_map<IndexUploadCacheKey, IndexUploadCacheValue, IndexUploadCacheKeyHash>
+    g_frameIndexUploadCache;
 
 bool FrontDiagnosticFrame(uint64_t frame)
 {
@@ -721,370 +871,6 @@ bool FrontCaptureTrigger(uint64_t frame)
     return true;
 }
 
-bool CollapseTiledDrawsEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_COLLAPSE_TILED_DRAWS");
-        // Native Xenos behavior is to replay every tile selected by PM4
-        // predication. The collapsed path remains opt-in for diagnostics only.
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool StitchTiledDrawsEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_TILED_DRAWS");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
-
-int StitchBroadenMode()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_BROADEN_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return -1;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mode = 0;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(toggleFile);
-        int next = 0;
-        if (input)
-            input >> next;
-        mode = std::clamp(next, 0, 3);
-    }
-    return mode;
-}
-
-int StitchResolveSourceMode()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_RESOLVE_SOURCE_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return 0;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mode = 0;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(toggleFile);
-        int next = 0;
-        if (input)
-            input >> next;
-        mode = std::clamp(next, 0, 7);
-    }
-    return mode;
-}
-
-bool StitchPhysicalTileRasterEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_PHYSICAL_TILES");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool HostMsaa2xRequested()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_EDRAM_MSAA_2X");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool HostMsaa2xDepthResolveRequested()
-{
-    static const int mode = [] {
-        const char* value = std::getenv("MOJORECOMP_EDRAM_MSAA_DEPTH_RESOLVE");
-        if (!value || !value[0])
-            return -1;
-        return value[0] != '0' ? 1 : 0;
-    }();
-    // Depth SAMPLE_ZERO is the Xenos-compatible default; the environment
-    // variable remains an explicit diagnostic opt-out.
-    return mode != 0;
-}
-
-bool HostMsaa2xDepthResolveEnabled()
-{
-    return g_hostMsaa2x && g_hostMsaaDepthSampleZero &&
-           HostMsaa2xDepthResolveRequested();
-}
-
-bool DiagnosticClearOnDepthSurfaceSwitchEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_CLEAR_ON_DEPTH_SURFACE_SWITCH");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool DiagnosticInvalidateColorOnDepthAliasEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_INVALIDATE_COLOR_ON_DEPTH_ALIAS");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool DiagnosticInvalidateColorAfterDepthWriteEnabled()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_EDRAM_DEPTH_WRITE_ALIAS_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return false;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static bool enabled = false;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(toggleFile);
-        int next = 0;
-        if (input)
-            input >> next;
-        enabled = next != 0;
-    }
-    return enabled;
-}
-
-VkSampleCountFlagBits HostRasterSamples()
-{
-    return g_hostMsaa2x ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT;
-}
-
-int SceneColorResolveTileMask()
-{
-    static const std::string maskFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SCENE_RESOLVE_TILE_MASK_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (maskFile.empty())
-        return 7;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mask = 7;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(maskFile);
-        int next = 7;
-        if (input)
-            input >> next;
-        mask = std::clamp(next, 0, 7);
-    }
-    return mask;
-}
-
-int StableSceneFeedbackMode()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SCENE_FEEDBACK_STABLE_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return 0;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mode = 0;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(toggleFile);
-        int next = 0;
-        if (input)
-            input >> next;
-        mode = std::clamp(next, 0, 2);
-    }
-    return mode;
-}
-
-bool StableSceneFeedbackEnabled()
-{
-    return StableSceneFeedbackMode() != 0;
-}
-
-int DiagnosticTileBoundaryClearMode()
-{
-    static const std::string modeFile = [] {
-        const char* value = std::getenv("MOJORECOMP_DIAGNOSTIC_TILE_CLEAR_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (modeFile.empty())
-        return 0;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mode = 0;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(modeFile);
-        int next = 0;
-        if (input)
-            input >> next;
-        mode = std::clamp(next, 0, 3);
-    }
-    return mode;
-}
-
-bool StitchUnpredicatedTileDrawsEnabled()
-{
-    const int broadenMode = StitchBroadenMode();
-    if (broadenMode >= 0)
-        return (broadenMode & 1) != 0;
-
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_UNPREDICATED_TILE_DRAWS");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool TraceUnpredicatedTileDrawsEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_TRACE_UNPREDICATED");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool TraceStitchMissesEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_TRACE_MISSES");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool StitchOffsetPredicatedDrawsEnabled()
-{
-    const int broadenMode = StitchBroadenMode();
-    if (broadenMode >= 0)
-        return (broadenMode & 2) != 0;
-
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_OFFSET_PREDICATED_DRAWS");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool StitchRotateTileClearsEnabled()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_ROTATE_TILE_CLEARS");
-        return value && value[0] && value[0] != '0';
-    }();
-    return enabled;
-}
-
-int StitchTileClearMode()
-{
-    static const std::string modeFile = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_CLEAR_MODE_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (modeFile.empty())
-        return -1;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mode = 0;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(modeFile);
-        int value = 0;
-        if (input)
-            input >> value;
-        mode = std::clamp(value, 0, 2);
-    }
-    return mode;
-}
-
-bool StitchSkipTransitionReplayEnabled()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_STITCH_TRANSITION_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return false;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static bool enabled = false;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(toggleFile);
-        int value = 0;
-        if (input)
-            input >> value;
-        enabled = value != 0;
-    }
-    return enabled;
-}
-
-bool StableFrontEnabled()
-{
-    // Diagnostic fallback that retains a second fullscreen snapshot instead of
-    // presenting only the surface selected by XE_SWAP.
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_STABLE_FRONT");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
-
-bool EmulateReverseZLikeD3D12()
-{
-    // Match Xenia/ReXGlue's D3D12-safe reversed-depth handling by default:
-    // expose a monotonic host depth range and reflect NDC Z in the VS when the
-    // guest requests a reversed viewport. Vulkan permits reversed viewport
-    // ranges, but keeping this representation avoids driver/API convention
-    // differences and reproduces the Xenos depth ordering used by Crash.
-    // Set MOJORECOMP_EMULATE_REVERSE_Z=0 only for diagnostics/A-B comparisons.
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_EMULATE_REVERSE_Z");
-        return !value || !*value || value[0] != '0';
-    }();
-    return enabled;
-}
-
 bool UiDiagnosticsEnabled()
 {
     static const bool enabled = [] {
@@ -1134,22 +920,6 @@ bool TraceDrawFrame(uint64_t frame)
     }
     keyWasDown = keyDown;
     return tracedFrame == frame;
-}
-
-bool EdramOwnershipEnabled(uint64_t frame)
-{
-    // Diagnostic-only gate for reaching late title scenes at the old renderer
-    // speed before measuring the currently expensive physical ownership path.
-    // Zero (the default) keeps ownership enabled from the first frame.
-    static const uint64_t firstFrame = [] {
-        const char* value = std::getenv("MOJORECOMP_EDRAM_OWNERSHIP_AFTER_FRAME");
-        if (!value || !*value)
-            return uint64_t{0};
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(value, &end, 10);
-        return end != value ? static_cast<uint64_t>(parsed) : uint64_t{0};
-    }();
-    return frame >= firstFrame;
 }
 
 bool EdramOwnershipPairProfileEnabled()
@@ -1237,16 +1007,17 @@ bool g_active = false;
 
 std::atomic<uint64_t> g_frames{0};
 uint64_t g_physicalTileContentFrame = 0;
-std::atomic<uint64_t> g_draws{0};
+uint64_t g_draws = 0;
+std::atomic<uint64_t> g_publishedDraws{0};
 std::atomic<uint64_t> g_skippedMode{0};
 std::atomic<uint64_t> g_skippedIndexed{0};
-std::atomic<uint64_t> g_indexedDraws{0};
+uint64_t g_indexedDraws = 0;
 std::atomic<uint64_t> g_skippedShader{0};
 std::atomic<uint64_t> g_skippedTexture{0};
 std::atomic<uint64_t> g_skippedVertex{0};
 std::atomic<uint64_t> g_skippedTopology{0};
 std::atomic<uint64_t> g_skippedPipeline{0};
-std::atomic<uint64_t> g_alphaTestDraws{0};
+uint64_t g_alphaTestDraws = 0;
 std::atomic<uint64_t> g_alphaTestUnsupported{0};
 std::atomic<uint64_t> g_resolves{0};
 std::atomic<uint64_t> g_resolveCopies{0};
@@ -1260,6 +1031,50 @@ std::atomic<uint64_t> g_resolveUnsupportedSnapshot{0};
 std::atomic<uint64_t> g_snapshotPresents{0};
 std::atomic<uint64_t> g_fallbackPresents{0};
 uint64_t g_renderWriteGeneration = 1;
+
+const char* VkResultName(VkResult result)
+{
+    switch (result)
+    {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_NOT_READY: return "VK_NOT_READY";
+        case VK_TIMEOUT: return "VK_TIMEOUT";
+        case VK_EVENT_SET: return "VK_EVENT_SET";
+        case VK_EVENT_RESET: return "VK_EVENT_RESET";
+        case VK_INCOMPLETE: return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
+        case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+        case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+        case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+        default: return "VK_RESULT_UNKNOWN";
+    }
+}
+
+void ReportVulkanFailureResult(const char* call, VkResult result, const char* stage)
+{
+    const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
+    const uint64_t sequence = g_draws;
+    const char* name = VkResultName(result);
+    KLOG("[vulkan-error] call=%s result=%d name=%s frame=%llu sequence=%llu thread=%lu stage=%s\n",
+         call, static_cast<int>(result), name,
+         static_cast<unsigned long long>(frame),
+         static_cast<unsigned long long>(sequence),
+         static_cast<unsigned long>(GetCurrentThreadId()), stage);
+    mojorecomp::host::RecordVulkanFailure(
+        call, static_cast<int32_t>(result), name, frame, sequence, stage);
+}
 
 struct ResolveDedupEntry
 {
@@ -1364,7 +1179,6 @@ struct ResolveSnapshot
     // Backing pixels remain in canonical render-target channel order. Compose
     // the resolve's destination R/B swap with the consumer's fetch swizzle.
     bool resolveSwap = false;
-    bool presentResolveSwap = false;
     // Front-buffer resolves arrive as several EDRAM tiles. Keep coverage across
     // host presents so a present between tile 0/1/2 cannot expose a partially
     // updated snapshot (the source of the frontend text flicker).
@@ -1372,13 +1186,6 @@ struct ResolveSnapshot
     bool coverageStarted = false;
     bool coverageComplete = false;
     uint64_t coverageGeneration = 0;
-    uint64_t presentedGeneration = 0;
-    VkImage presentImage = VK_NULL_HANDLE;
-    VkDeviceMemory presentMemory = VK_NULL_HANDLE;
-    VkImageView presentView = VK_NULL_HANDLE;
-    VkImageView presentBgraView = VK_NULL_HANDLE;
-    VkImageLayout presentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    bool presentValid = false;
 };
 
 // Creation helpers return pointers that remain live while later texture slots
@@ -1473,11 +1280,6 @@ struct ColorBacking
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImage resolveImage = VK_NULL_HANDLE;
-    VkDeviceMemory resolveMemory = VK_NULL_HANDLE;
-    VkImageView resolveView = VK_NULL_HANDLE;
-    VkImageLayout resolveLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkDescriptorSet resolveDescriptor = VK_NULL_HANDLE;
     VkDescriptorSet transferDescriptor = VK_NULL_HANDLE;
     bool initialized = false;
     bool logicalRaster = false;
@@ -1508,11 +1310,6 @@ struct DepthBacking
     VkImageView depthSampleView = VK_NULL_HANDLE;
     VkImageView stencilSampleView = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImage resolveImage = VK_NULL_HANDLE;
-    VkDeviceMemory resolveMemory = VK_NULL_HANDLE;
-    VkImageView resolveView = VK_NULL_HANDLE;
-    VkImageLayout resolveLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkDescriptorSet resolveDescriptor = VK_NULL_HANDLE;
     VkDescriptorSet transferDescriptor = VK_NULL_HANDLE;
     bool initialized = false;
 };
@@ -1570,8 +1367,6 @@ struct EdramTransferPipeline
     VkSampleCountFlagBits destSamples = VK_SAMPLE_COUNT_1_BIT;
     VkSampleCountFlagBits sourceGuestSamples = VK_SAMPLE_COUNT_1_BIT;
     VkSampleCountFlagBits destGuestSamples = VK_SAMPLE_COUNT_1_BIT;
-    uint32_t sourcePitchTiles = 0;
-    uint32_t destPitchTiles = 0;
     bool sourceDepthFloat24 = false;
     bool destDepthFloat24 = false;
     VkFormat destDepthFormat = VK_FORMAT_UNDEFINED;
@@ -1580,6 +1375,10 @@ struct EdramTransferPipeline
     VkShaderModule ps = VK_NULL_HANDLE;
 };
 std::vector<EdramTransferPipeline> g_edramTransferPipelines;
+std::thread g_edramShaderPrewarmThread;
+std::atomic<bool> g_edramShaderPrewarmStop{false};
+std::atomic<uint64_t> g_edramShaderPrewarmPrepared{0};
+std::atomic<uint64_t> g_edramShaderPrewarmFailed{0};
 struct DepthSnapshotPackPipeline
 {
     VkSampleCountFlagBits sourceSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -1597,7 +1396,6 @@ ColorBacking* FindColorBacking(uint64_t key);
 ColorBacking* FindColorBacking(uint32_t surfaceInfo, uint32_t info);
 ColorBacking* FindColorBackingByInfo(uint32_t info);
 void TransitionColorBacking(ColorBacking& backing, VkImageLayout next);
-void TransitionColorResolveBacking(ColorBacking& backing, VkImageLayout next);
 DepthBacking* FindDepthBacking(uint64_t key);
 void TransitionDepthBacking(DepthBacking& backing, VkImageLayout next);
 
@@ -1678,7 +1476,7 @@ void ReportResolve(const uint32_t* regs, const ResolveSnapshot& snapshot)
          regs[xenos::kRbColorClear], regs[xenos::kRbCopyControl],
          regs[xenos::kRbCopyDestBase], regs[xenos::kRbCopyDestPitch],
          regs[xenos::kPaScWindowScissorTl], regs[xenos::kPaScWindowScissorBr],
-         g_draws.load(std::memory_order_relaxed));
+         g_draws);
 }
 
 struct GuestTexture
@@ -1704,25 +1502,13 @@ struct GuestTexture
 std::vector<GuestTexture> g_guestTextures;
 std::unordered_multimap<uint64_t, size_t> g_guestTextureLookup;
 
-struct VertexAttribute
-{
-    int32_t location = -1;
-    uint32_t fetchSlot = 0;
-    uint32_t format = 0;
-    uint32_t isSigned = 0;
-    uint32_t isInteger = 0;
-    uint32_t strideDwords = 0;
-    uint32_t offsetDwords = 0;
-    uint32_t indirect = 0;
-};
+using VertexAttribute = mojorecomp::gpu::ShaderAttributeMetadata;
 
 struct ShaderModuleRec
 {
     uint32_t type = 0;
     uint64_t hash = 0;
     VkShaderModule module = VK_NULL_HANDLE;
-    VkShaderModule float24DepthModule = VK_NULL_HANDLE;
-    bool float24DepthModuleAttempted = false;
     std::vector<VertexAttribute> attributes;
     bool usesTextures = false;
     std::vector<uint32_t> textureSlots;
@@ -1749,7 +1535,6 @@ struct PipelineRec
     bool primitiveRestart = false;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     VkFormat depthFormat = kDepthUnormFormat;
-    bool depthFloat24 = false;
     uint64_t layoutHash = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
@@ -1759,8 +1544,19 @@ struct PipelineRec
 // the PS was inserted and produced a bogus hash in the very first pipeline key.
 std::deque<ShaderModuleRec> g_modules;
 std::vector<PipelineRec> g_pipelines;
+std::mutex g_pipelineMutex;
 VkPipelineCache g_pipelineCache = VK_NULL_HANDLE;
+VkPipelineCache g_pipelinePrewarmCache = VK_NULL_HANDLE;
+thread_local VkPipelineCache g_threadPipelineCacheOverride = VK_NULL_HANDLE;
 std::filesystem::path g_pipelineCachePath;
+std::filesystem::path g_pipelineManifestPath;
+std::vector<PipelineRec> g_pipelineManifest;
+std::mutex g_pipelineManifestMutex;
+std::thread g_pipelinePrewarmThread;
+std::atomic<bool> g_pipelinePrewarmStop{false};
+std::atomic<bool> g_pipelinePrewarmActive{false};
+std::atomic<uint64_t> g_pipelinePrewarmCompiled{0};
+std::atomic<uint64_t> g_pipelinePrewarmSkipped{0};
 
 bool BeginFrame();
 
@@ -1771,7 +1567,6 @@ PFN_vkDestroyInstance p_vkDestroyInstance = nullptr;
 PFN_vkEnumeratePhysicalDevices p_vkEnumeratePhysicalDevices = nullptr;
 PFN_vkEnumerateDeviceExtensionProperties p_vkEnumerateDeviceExtensionProperties = nullptr;
 PFN_vkGetPhysicalDeviceProperties p_vkGetPhysicalDeviceProperties = nullptr;
-PFN_vkGetPhysicalDeviceProperties2 p_vkGetPhysicalDeviceProperties2 = nullptr;
 PFN_vkGetPhysicalDeviceFeatures2 p_vkGetPhysicalDeviceFeatures2 = nullptr;
 PFN_vkGetPhysicalDeviceMemoryProperties p_vkGetPhysicalDeviceMemoryProperties = nullptr;
 PFN_vkGetPhysicalDeviceQueueFamilyProperties p_vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
@@ -1800,7 +1595,6 @@ PFN_vkEndCommandBuffer p_vkEndCommandBuffer = nullptr;
 PFN_vkCmdPipelineBarrier p_vkCmdPipelineBarrier = nullptr;
 PFN_vkCmdBlitImage p_vkCmdBlitImage = nullptr;
 PFN_vkCmdCopyImage p_vkCmdCopyImage = nullptr;
-PFN_vkCmdResolveImage p_vkCmdResolveImage = nullptr;
 PFN_vkCmdCopyImageToBuffer p_vkCmdCopyImageToBuffer = nullptr;
 PFN_vkCmdCopyBufferToImage p_vkCmdCopyBufferToImage = nullptr;
 PFN_vkCmdClearColorImage p_vkCmdClearColorImage = nullptr;
@@ -1843,6 +1637,7 @@ PFN_vkDestroyPipelineLayout p_vkDestroyPipelineLayout = nullptr;
 PFN_vkCreatePipelineCache p_vkCreatePipelineCache = nullptr;
 PFN_vkDestroyPipelineCache p_vkDestroyPipelineCache = nullptr;
 PFN_vkGetPipelineCacheData p_vkGetPipelineCacheData = nullptr;
+PFN_vkMergePipelineCaches p_vkMergePipelineCaches = nullptr;
 PFN_vkCreateGraphicsPipelines p_vkCreateGraphicsPipelines = nullptr;
 PFN_vkDestroyPipeline p_vkDestroyPipeline = nullptr;
 PFN_vkCmdBindPipeline p_vkCmdBindPipeline = nullptr;
@@ -1951,8 +1746,12 @@ void CmdBindDescriptorSetsCached(VkCommandBuffer commandBuffer, VkPipelineLayout
         }
     }
     if (same)
+    {
+        ++g_perfDescriptorBindSuppressed;
         return;
+    }
 
+    ++g_perfDescriptorBindCalls;
     p_vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                               layout, firstSet, descriptorCount, descriptorSets,
                               0, nullptr);
@@ -2001,6 +1800,130 @@ std::filesystem::path PipelineCachePath(const VkPhysicalDeviceProperties& proper
     std::snprintf(fileName, sizeof(fileName), "pipeline-v2-%04X-%04X-%08X.bin",
                   properties.vendorID, properties.deviceID, properties.driverVersion);
     return dir / fileName;
+}
+
+bool SamePipelineKey(const PipelineRec& a, const PipelineRec& b)
+{
+    return a.vs == b.vs && a.ps == b.ps && a.prim == b.prim &&
+           a.colorMask == b.colorMask && a.blendControl0 == b.blendControl0 &&
+           a.blendControl1 == b.blendControl1 && a.depthControl == b.depthControl &&
+           a.rasterState == b.rasterState && a.alphaTest == b.alphaTest &&
+           a.mode == b.mode && a.primitiveRestart == b.primitiveRestart &&
+           a.samples == b.samples && a.depthFormat == b.depthFormat &&
+           a.layoutHash == b.layoutHash;
+}
+
+size_t PipelineCount()
+{
+    std::lock_guard<std::mutex> lock(g_pipelineMutex);
+    return g_pipelines.size();
+}
+
+std::filesystem::path PipelineManifestPath(const VkPhysicalDeviceProperties& properties,
+                                           uint32_t version = 2)
+{
+    std::filesystem::path dir;
+    if (const char* custom = std::getenv("MOJORECOMP_PIPELINE_CACHE_DIR"); custom && *custom)
+        dir = custom;
+    else
+        dir = HostPaths::ExeDir() / "cache" / "vulkan";
+
+    char fileName[144]{};
+    std::snprintf(fileName, sizeof(fileName), "pipeline-manifest-v%u-%04X-%04X-%08X.txt",
+                  version, properties.vendorID, properties.deviceID, properties.driverVersion);
+    return dir / fileName;
+}
+
+void WritePipelineManifestLine(std::ostream& output, const PipelineRec& p)
+{
+    output << std::hex
+           << p.vs << ' ' << p.ps << ' ' << p.prim << ' ' << p.colorMask << ' '
+           << p.blendControl0 << ' ' << p.blendControl1 << ' ' << p.depthControl << ' '
+           << p.rasterState << ' ' << p.alphaTest << ' ' << p.mode << ' '
+           << (p.primitiveRestart ? 1u : 0u) << ' ' << uint32_t(p.samples) << ' '
+           << uint32_t(p.depthFormat) << ' ' << p.layoutHash << '\n';
+}
+
+void InitializePipelineManifest(const VkPhysicalDeviceProperties& properties)
+{
+    std::lock_guard<std::mutex> lock(g_pipelineManifestMutex);
+    g_pipelineManifest.clear();
+    g_pipelineManifestPath = PipelineManifestPath(properties);
+
+    auto loadManifest = [&](const std::filesystem::path& path, bool legacyV1) {
+        size_t imported = 0;
+        std::ifstream input(path);
+        std::string line;
+        while (g_pipelineManifest.size() < 8192 && std::getline(input, line))
+        {
+            if (line.empty() || line[0] == '#')
+                continue;
+            std::istringstream stream(line);
+            uint64_t vs = 0, ps = 0, layoutHash = 0;
+            uint32_t prim = 0, colorMask = 0, blend0 = 0, blend1 = 0;
+            uint32_t depth = 0, raster = 0, alpha = 0, mode = 0;
+            uint32_t restart = 0, samples = 0, depthFormat = 0;
+            uint32_t legacyDepthFloat24 = 0;
+            stream >> std::hex >> vs >> ps >> prim >> colorMask >> blend0 >> blend1 >> depth >>
+                raster >> alpha >> mode >> restart >> samples >> depthFormat;
+            if (legacyV1)
+                stream >> legacyDepthFloat24 >> layoutHash;
+            else
+                stream >> layoutHash;
+            if (!stream || !vs || samples == 0)
+                continue;
+            PipelineRec rec{vs, ps, prim, colorMask, blend0, blend1, depth, raster, alpha, mode,
+                            restart != 0, static_cast<VkSampleCountFlagBits>(samples),
+                            static_cast<VkFormat>(depthFormat), layoutHash,
+                            VK_NULL_HANDLE};
+            const auto duplicate = std::find_if(g_pipelineManifest.begin(), g_pipelineManifest.end(),
+                [&](const PipelineRec& existing) { return SamePipelineKey(existing, rec); });
+            if (duplicate == g_pipelineManifest.end())
+            {
+                g_pipelineManifest.push_back(rec);
+                ++imported;
+            }
+        }
+        return imported;
+    };
+
+    const size_t v2Imported = loadManifest(g_pipelineManifestPath, false);
+    const std::filesystem::path legacyPath = PipelineManifestPath(properties, 1);
+    const size_t legacyImported = loadManifest(legacyPath, true);
+
+    std::error_code ec;
+    std::filesystem::create_directories(g_pipelineManifestPath.parent_path(), ec);
+    if (legacyImported || !std::filesystem::exists(g_pipelineManifestPath, ec))
+    {
+        std::ofstream output(g_pipelineManifestPath, std::ios::trunc);
+        if (output)
+        {
+            output << "# MojoRecomp Vulkan pipeline manifest v2\n";
+            for (const PipelineRec& record : g_pipelineManifest)
+                WritePipelineManifestLine(output, record);
+        }
+    }
+    KLOG("Vulkan pipeline manifest: %zu known pipelines (v2=%zu legacy-v1=%zu imported)\n",
+         g_pipelineManifest.size(), v2Imported, legacyImported);
+}
+
+void RecordPipelineManifest(const PipelineRec& pipeline)
+{
+    std::lock_guard<std::mutex> lock(g_pipelineManifestMutex);
+    const auto duplicate = std::find_if(g_pipelineManifest.begin(), g_pipelineManifest.end(),
+        [&](const PipelineRec& existing) { return SamePipelineKey(existing, pipeline); });
+    if (duplicate != g_pipelineManifest.end())
+        return;
+
+    PipelineRec record = pipeline;
+    record.pipeline = VK_NULL_HANDLE;
+    g_pipelineManifest.push_back(record);
+    if (!g_pipelineManifestPath.empty())
+    {
+        std::ofstream output(g_pipelineManifestPath, std::ios::app);
+        if (output)
+            WritePipelineManifestLine(output, record);
+    }
 }
 
 bool CreatePersistentPipelineCache(const VkPhysicalDeviceProperties& properties)
@@ -2203,32 +2126,23 @@ bool UpdateEdramSampleCountSupport()
     const VkSampleCountFlags color = ImageSampleCounts(g_swapFormat, colorUsage);
     const VkSampleCountFlags d24 = ImageSampleCounts(kDepthUnormFormat, depthUsage);
     const VkSampleCountFlags d32 = ImageSampleCounts(kDepthFloatFormat, depthUsage);
-    g_hostEdramColorSampleCounts = g_hostColorSampleCounts & color;
-    const VkSampleCountFlags genericDepth =
-        g_hostDepthSampleCounts & g_hostStencilSampleCounts;
-    const VkSampleCountFlags d24Usable = genericDepth & d24;
-    const VkSampleCountFlags d32Usable = genericDepth & d32;
-    const VkSampleCountFlags guestRelevantSamples =
-        g_hostEdramColorSampleCounts &
-        (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT);
-    g_hostDepthUnormUsesFloatFormat =
-        guestRelevantSamples != 0 &&
-        (d24Usable & guestRelevantSamples) != guestRelevantSamples &&
-        (d32Usable & guestRelevantSamples) == guestRelevantSamples;
-    g_hostEdramDepthUnormSampleCounts =
-        g_hostDepthUnormUsesFloatFormat ? d32Usable : d24Usable;
-    g_hostEdramDepthFloatSampleCounts = d32Usable;
+    const bool color1x = (color & VK_SAMPLE_COUNT_1_BIT) != 0;
+    const bool d24_1x = (d24 & VK_SAMPLE_COUNT_1_BIT) != 0;
+    const bool d32_1x = (d32 & VK_SAMPLE_COUNT_1_BIT) != 0;
+    g_hostDepthUnormUsesFloatFormat = !d24_1x && d32_1x;
 
-    KLOG("Vulkan EDRAM format samples: color(%u)=%02X D24S8=%02X D24FS8=%02X "
-         "usableColor=%02X usableD24S8=%02X usableD24FS8=%02X D24host=%s\n",
-         uint32_t(g_swapFormat), uint32_t(color), uint32_t(d24), uint32_t(d32),
-         uint32_t(g_hostEdramColorSampleCounts),
-         uint32_t(g_hostEdramDepthUnormSampleCounts),
-         uint32_t(g_hostEdramDepthFloatSampleCounts),
+    KLOG("Vulkan EDRAM 1x formats: color(%u)=%u D24S8=%u D24FS8=%u D24host=%s\n",
+         uint32_t(g_swapFormat), color1x ? 1u : 0u, d24_1x ? 1u : 0u,
+         d32_1x ? 1u : 0u,
          g_hostDepthUnormUsesFloatFormat ? "D32S8" : "D24S8");
-    if (!(g_hostEdramColorSampleCounts & VK_SAMPLE_COUNT_1_BIT))
+    if (!color1x)
     {
         KLOG("Vulkan EDRAM color format lacks required 1x sampled/transfer/attachment support\n");
+        return false;
+    }
+    if (!d32_1x || (!d24_1x && !g_hostDepthUnormUsesFloatFormat))
+    {
+        KLOG("Vulkan EDRAM depth formats lack required 1x sampled/transfer/attachment support\n");
         return false;
     }
     return true;
@@ -2386,8 +2300,16 @@ bool WaitForFrameQueueIdle()
     for (uint32_t i = 0; i < g_framesInFlight; ++i)
     {
         const VkFence fence = g_frameContexts[i].fence;
-        if (fence && p_vkWaitForFences(g_device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-            return false;
+        if (fence)
+        {
+            const VkResult result =
+                p_vkWaitForFences(g_device, 1, &fence, VK_TRUE, UINT64_MAX);
+            if (result != VK_SUCCESS)
+            {
+                ReportVulkanFailureResult("vkWaitForFences", result, "swapchain_recreate");
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -2556,7 +2478,7 @@ bool CreateColorTarget()
     ii.extent = {g_internalExtent.width, g_internalExtent.height, 1};
     ii.mipLevels = 1;
     ii.arrayLayers = 1;
-    ii.samples = HostRasterSamples();
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     // ResolveColorSurface also clears the live surface via vkCmdClearColorImage.
     ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -2587,31 +2509,7 @@ bool CreateColorTarget()
     vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     vi.subresourceRange.levelCount = 1;
     vi.subresourceRange.layerCount = 1;
-    if (p_vkCreateImageView(g_device, &vi, nullptr, &g_colorView) != VK_SUCCESS)
-        return false;
-
-    if (!g_hostMsaa2x)
-        return true;
-
-    // Keep a single-sample mirror for Xenos resolves and presentation. Dynamic
-    // rendering resolves the 2x host attachment into this image whenever the
-    // render scope ends, matching color CopySampleSelect::k01.
-    VkImageCreateInfo resolveInfo = ii;
-    resolveInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    if (p_vkCreateImage(g_device, &resolveInfo, nullptr, &g_colorResolveImage) != VK_SUCCESS)
-        return false;
-    p_vkGetImageMemoryRequirements(g_device, g_colorResolveImage, &req);
-    const uint32_t resolveType = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (resolveType == UINT32_MAX)
-        return false;
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = resolveType;
-    if (p_vkAllocateMemory(g_device, &ai, nullptr, &g_colorResolveMemory) != VK_SUCCESS)
-        return false;
-    if (p_vkBindImageMemory(g_device, g_colorResolveImage, g_colorResolveMemory, 0) != VK_SUCCESS)
-        return false;
-    vi.image = g_colorResolveImage;
-    return p_vkCreateImageView(g_device, &vi, nullptr, &g_colorResolveView) == VK_SUCCESS;
+    return p_vkCreateImageView(g_device, &vi, nullptr, &g_colorView) == VK_SUCCESS;
 }
 
 bool CreateDepthTarget()
@@ -2622,7 +2520,7 @@ bool CreateDepthTarget()
     ii.extent = {g_internalExtent.width, g_internalExtent.height, 1};
     ii.mipLevels = 1;
     ii.arrayLayers = 1;
-    ii.samples = HostRasterSamples();
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
     ii.tiling = VK_IMAGE_TILING_OPTIMAL;
     ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -2651,118 +2549,15 @@ bool CreateDepthTarget()
     vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     vi.subresourceRange.levelCount = 1;
     vi.subresourceRange.layerCount = 1;
-    if (p_vkCreateImageView(g_device, &vi, nullptr, &g_depthView) != VK_SUCCESS)
-        return false;
-
-    if (!g_hostMsaa2x)
-        return true;
-
-    VkImageCreateInfo resolveInfo = ii;
-    resolveInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    if (p_vkCreateImage(g_device, &resolveInfo, nullptr, &g_depthResolveImage) != VK_SUCCESS)
-        return false;
-    p_vkGetImageMemoryRequirements(g_device, g_depthResolveImage, &req);
-    const uint32_t resolveType = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (resolveType == UINT32_MAX)
-        return false;
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = resolveType;
-    if (p_vkAllocateMemory(g_device, &ai, nullptr, &g_depthResolveMemory) != VK_SUCCESS)
-        return false;
-    if (p_vkBindImageMemory(g_device, g_depthResolveImage, g_depthResolveMemory, 0) != VK_SUCCESS)
-        return false;
-    vi.image = g_depthResolveImage;
-    return p_vkCreateImageView(g_device, &vi, nullptr, &g_depthResolveView) == VK_SUCCESS;
+    return p_vkCreateImageView(g_device, &vi, nullptr, &g_depthView) == VK_SUCCESS;
 }
 
 void EndColorRendering()
 {
     if (!g_rendering)
         return;
-    if (g_hostMsaa2x)
-    {
-        static uint32_t reports = 0;
-        if (reports++ < 16)
-            KLOG("[msaa2x scope] end begin frame=%llu draws=%llu\n",
-                 static_cast<unsigned long long>(g_frames.load(std::memory_order_relaxed) + 1),
-                 static_cast<unsigned long long>(g_draws.load(std::memory_order_relaxed)));
-    }
     p_vkCmdEndRendering(g_commandBuffer);
-    if (g_hostMsaa2x)
-    {
-        static uint32_t reports = 0;
-        if (reports++ < 16)
-            KLOG("[msaa2x scope] end returned\n");
-    }
     g_rendering = false;
-}
-
-void TransitionResolveTarget(VkImage image, VkImageLayout& layout, VkImageAspectFlags aspect,
-                             VkImageLayout next)
-{
-    if (!image || layout == next)
-        return;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkAccessFlags srcAccess = 0;
-    if (layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        srcAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    }
-    else if (layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                   VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        srcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    }
-    else if (layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        srcAccess = VK_ACCESS_TRANSFER_READ_BIT;
-    }
-    else if (layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkAccessFlags dstAccess = VK_ACCESS_TRANSFER_READ_BIT;
-    if (next == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-    {
-        dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dstAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    }
-    else if (next == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-    {
-        dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                   VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        dstAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    }
-    else if (next == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-    {
-        dstAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-    else if (next == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
-    {
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        dstAccess = VK_ACCESS_SHADER_READ_BIT;
-    }
-
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.srcAccessMask = srcAccess;
-    barrier.dstAccessMask = dstAccess;
-    barrier.oldLayout = layout;
-    barrier.newLayout = next;
-    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange = {aspect, 0, 1, 0, 1};
-    p_vkCmdPipelineBarrier(g_commandBuffer, srcStage, dstStage,
-                           0, 0, nullptr, 0, nullptr, 1, &barrier);
-    layout = next;
 }
 
 void ResumeColorRendering(bool clearColor = false)
@@ -2770,19 +2565,8 @@ void ResumeColorRendering(bool clearColor = false)
     if (g_rendering)
         return;
 
-    ColorBacking* color0 = ActiveColorBacking();
     ColorBacking* color1 = ActiveColor1Backing();
     DepthBacking* depthBacking = ActiveDepthBacking();
-
-    if (color0 && color0->samples != VK_SAMPLE_COUNT_1_BIT)
-        TransitionColorResolveBacking(*color0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (color1 && color1->samples != VK_SAMPLE_COUNT_1_BIT)
-        TransitionColorResolveBacking(*color1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (depthBacking && depthBacking->samples != VK_SAMPLE_COUNT_1_BIT &&
-        g_hostMsaaDepthSampleZero && depthBacking->resolveImage)
-        TransitionResolveTarget(depthBacking->resolveImage, depthBacking->resolveLayout,
-                                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
     std::array<VkRenderingAttachmentInfo, 2> attachments{};
     attachments[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -2791,13 +2575,6 @@ void ResumeColorRendering(bool clearColor = false)
     attachments[0].loadOp = clearColor ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
     attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     attachments[0].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
-    if (color0 && color0->samples != VK_SAMPLE_COUNT_1_BIT && color0->resolveView)
-    {
-        attachments[0].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
-        attachments[0].resolveImageView = color0->resolveView;
-        attachments[0].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    }
-
     attachments[1].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     if (color1)
     {
@@ -2805,12 +2582,6 @@ void ResumeColorRendering(bool clearColor = false)
         attachments[1].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        if (color1->samples != VK_SAMPLE_COUNT_1_BIT && color1->resolveView)
-        {
-            attachments[1].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
-            attachments[1].resolveImageView = color1->resolveView;
-            attachments[1].resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        }
     }
     else
     {
@@ -2829,18 +2600,7 @@ void ResumeColorRendering(bool clearColor = false)
         depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        if (depthBacking->samples != VK_SAMPLE_COUNT_1_BIT &&
-            g_hostMsaaDepthSampleZero && depthBacking->resolveView)
-        {
-            depth.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-            depth.resolveImageView = depthBacking->resolveView;
-            depth.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        }
         stencil = depth;
-        // Xenos stencil does not need a multisample resolve for the Crash path;
-        // preserve it only in the multisample owner image.
-        stencil.resolveMode = VK_RESOLVE_MODE_NONE;
-        stencil.resolveImageView = VK_NULL_HANDLE;
     }
 
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -3130,71 +2890,6 @@ bool CreateSnapshot(uint32_t key, uint32_t width, uint32_t height, ResolveSnapsh
     return true;
 }
 
-bool EnsureSnapshotPresentImage(ResolveSnapshot& snapshot)
-{
-    if (snapshot.presentImage)
-        return true;
-    if (snapshot.depth || !snapshot.width || !snapshot.height)
-        return false;
-
-    VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ii.imageType = VK_IMAGE_TYPE_2D;
-    ii.format = snapshot.format;
-    const VkExtent2D internalExtent = InternalExtentForLogical(snapshot.width, snapshot.height);
-    ii.extent = {internalExtent.width, internalExtent.height, 1};
-    ii.mipLevels = 1;
-    ii.arrayLayers = 1;
-    ii.samples = VK_SAMPLE_COUNT_1_BIT;
-    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-               VK_IMAGE_USAGE_SAMPLED_BIT;
-    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (p_vkCreateImage(g_device, &ii, nullptr, &snapshot.presentImage) != VK_SUCCESS)
-        return false;
-
-    VkMemoryRequirements req{};
-    p_vkGetImageMemoryRequirements(g_device, snapshot.presentImage, &req);
-    const uint32_t type = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (type == UINT32_MAX)
-    {
-        p_vkDestroyImage(g_device, snapshot.presentImage, nullptr);
-        snapshot.presentImage = VK_NULL_HANDLE;
-        return false;
-    }
-
-    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = req.size;
-    ai.memoryTypeIndex = type;
-    if (p_vkAllocateMemory(g_device, &ai, nullptr, &snapshot.presentMemory) != VK_SUCCESS ||
-        p_vkBindImageMemory(g_device, snapshot.presentImage, snapshot.presentMemory, 0) != VK_SUCCESS)
-    {
-        if (snapshot.presentMemory)
-            p_vkFreeMemory(g_device, snapshot.presentMemory, nullptr);
-        p_vkDestroyImage(g_device, snapshot.presentImage, nullptr);
-        snapshot.presentImage = VK_NULL_HANDLE;
-        snapshot.presentMemory = VK_NULL_HANDLE;
-        return false;
-    }
-
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = snapshot.presentImage;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = snapshot.format;
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (p_vkCreateImageView(g_device, &vi, nullptr, &snapshot.presentView) != VK_SUCCESS)
-    {
-        p_vkFreeMemory(g_device, snapshot.presentMemory, nullptr);
-        p_vkDestroyImage(g_device, snapshot.presentImage, nullptr);
-        snapshot.presentImage = VK_NULL_HANDLE;
-        snapshot.presentMemory = VK_NULL_HANDLE;
-        return false;
-    }
-    snapshot.presentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    snapshot.presentValid = false;
-    return true;
-}
-
 bool CreateDepthSnapshot(uint32_t key, uint32_t width, uint32_t height,
                          VkFormat format, bool depthFloat24, ResolveSnapshot*& out)
 {
@@ -3340,13 +3035,7 @@ bool CreateColorBacking(uint32_t surfaceInfo, uint32_t info, ColorBacking*& out)
     backing.baseTiles = xenos::ColorBaseTiles(info);
     backing.pitchTiles = xenos::SurfacePitchTiles(surfaceInfo,
                                                    xenos::ColorFormatIs64Bpp(info));
-    backing.samples = GuestSurfaceSamples(surfaceInfo);
-    if (!backing.samples)
-    {
-        KLOG("Vulkan EDRAM color surface uses unsupported guest MSAA: surface=%08X info=%08X\n",
-             surfaceInfo, info);
-        return false;
-    }
+    backing.samples = VK_SAMPLE_COUNT_1_BIT;
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = g_swapFormat;
@@ -3393,28 +3082,7 @@ bool CreateColorBacking(uint32_t surfaceInfo, uint32_t info, ColorBacking*& out)
         p_vkFreeMemory(g_device, backing.memory, nullptr);
         return false;
     }
-    if (backing.samples != VK_SAMPLE_COUNT_1_BIT)
-    {
-        VkImageCreateInfo resolveInfo = ii;
-        resolveInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        if (p_vkCreateImage(g_device, &resolveInfo, nullptr, &backing.resolveImage) != VK_SUCCESS)
-            return false;
-        p_vkGetImageMemoryRequirements(g_device, backing.resolveImage, &req);
-        const uint32_t resolveType = FindMemoryType(req.memoryTypeBits,
-                                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (resolveType == UINT32_MAX)
-            return false;
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex = resolveType;
-        if (p_vkAllocateMemory(g_device, &ai, nullptr, &backing.resolveMemory) != VK_SUCCESS ||
-            p_vkBindImageMemory(g_device, backing.resolveImage,
-                                backing.resolveMemory, 0) != VK_SUCCESS)
-            return false;
-        vi.image = backing.resolveImage;
-        if (p_vkCreateImageView(g_device, &vi, nullptr, &backing.resolveView) != VK_SUCCESS)
-            return false;
-    }
-    backing.logicalRaster = !StitchPhysicalTileRasterEnabled();
+    backing.logicalRaster = true;
     g_colorBackings.push_back(backing);
     out = &g_colorBackings.back();
     KLOG("Vulkan EDRAM color backing created: key=%016llX surface=%08X info=%08X "
@@ -3452,13 +3120,7 @@ bool CreateDepthBacking(uint64_t key, DepthBacking*& out)
     backing.info = uint32_t(key);
     backing.baseTiles = xenos::DepthBaseTiles(backing.info);
     backing.pitchTiles = xenos::SurfacePitchTiles(backing.surfaceInfo, false);
-    backing.samples = GuestSurfaceSamples(backing.surfaceInfo, backing.info);
-    if (!backing.samples)
-    {
-        KLOG("Vulkan EDRAM depth surface uses unsupported guest MSAA: surface=%08X info=%08X\n",
-             backing.surfaceInfo, backing.info);
-        return false;
-    }
+    backing.samples = VK_SAMPLE_COUNT_1_BIT;
     backing.format = HostDepthFormat(backing.info);
     VkImageCreateInfo ii{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
@@ -3508,32 +3170,6 @@ bool CreateDepthBacking(uint64_t key, DepthBacking*& out)
     vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
     if (p_vkCreateImageView(g_device, &vi, nullptr, &backing.stencilSampleView) != VK_SUCCESS)
         return false;
-
-    if (backing.samples != VK_SAMPLE_COUNT_1_BIT)
-    {
-        VkImageCreateInfo resolveInfo = ii;
-        resolveInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        resolveInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                            VK_IMAGE_USAGE_SAMPLED_BIT |
-                            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        if (p_vkCreateImage(g_device, &resolveInfo, nullptr, &backing.resolveImage) != VK_SUCCESS)
-            return false;
-        p_vkGetImageMemoryRequirements(g_device, backing.resolveImage, &req);
-        const uint32_t resolveType = FindMemoryType(req.memoryTypeBits,
-                                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (resolveType == UINT32_MAX)
-            return false;
-        ai.allocationSize = req.size;
-        ai.memoryTypeIndex = resolveType;
-        if (p_vkAllocateMemory(g_device, &ai, nullptr, &backing.resolveMemory) != VK_SUCCESS ||
-            p_vkBindImageMemory(g_device, backing.resolveImage, backing.resolveMemory, 0) != VK_SUCCESS)
-            return false;
-        vi.image = backing.resolveImage;
-        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-        if (p_vkCreateImageView(g_device, &vi, nullptr, &backing.resolveView) != VK_SUCCESS)
-            return false;
-    }
 
     g_depthBackings.push_back(backing);
     out = &g_depthBackings.back();
@@ -3606,520 +3242,6 @@ void TransitionDepthBacking(DepthBacking& backing, VkImageLayout next)
     p_vkCmdPipelineBarrier(g_commandBuffer, srcStage, dstStage,
                            0, 0, nullptr, 0, nullptr, 1, &barrier);
     backing.layout = next;
-}
-
-void TransitionColorResolveBacking(ColorBacking& backing, VkImageLayout next)
-{
-    if (!backing.resolveImage || backing.resolveLayout == next)
-        return;
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkAccessFlags srcAccess = 0;
-    if (backing.resolveLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        srcAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    }
-    else if (backing.resolveLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-    else if (backing.resolveLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        srcAccess = VK_ACCESS_TRANSFER_READ_BIT;
-    }
-
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkAccessFlags dstAccess = VK_ACCESS_TRANSFER_READ_BIT;
-    if (next == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-    {
-        dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dstAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    }
-    else if (next == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-    {
-        dstAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.srcAccessMask = srcAccess;
-    barrier.dstAccessMask = dstAccess;
-    barrier.oldLayout = backing.resolveLayout;
-    barrier.newLayout = next;
-    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = backing.resolveImage;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    p_vkCmdPipelineBarrier(g_commandBuffer, srcStage, dstStage,
-                           0, 0, nullptr, 0, nullptr, 1, &barrier);
-    backing.resolveLayout = next;
-}
-
-bool EnsureMsaaResolvePipeline()
-{
-    if (g_msaaResolvePipeline)
-        return true;
-
-    static constexpr const char* kVs = R"(
-struct VSOut { float4 position : SV_Position; };
-VSOut main(uint id : SV_VertexID)
-{
-    float2 p = id == 0 ? float2(-1.0, -1.0) :
-               id == 1 ? float2(-1.0,  3.0) : float2(3.0, -1.0);
-    VSOut o;
-    o.position = float4(p, 0.0, 1.0);
-    return o;
-}
-)";
-    static constexpr const char* kPs = R"(
-Texture2DMS<float4> g_Source : register(t0, space0);
-struct PackOut
-{
-    float4 packed : SV_Target0;
-    float decoded : SV_Target1;
-};
-
-PackOut main(float4 position : SV_Position)
-{
-    int2 p = int2(position.xy);
-    return (g_Source.Load(p, 0) + g_Source.Load(p, 1)) * 0.5;
-}
-)";
-
-    std::vector<uint8_t> vsSpv, psSpv;
-    std::string err;
-    if (!ShaderTranslator::CompileHostHlsl(kVs, true, vsSpv, err))
-    {
-        KLOG("Vulkan MSAA resolve VS compile failed: %s\n", err.c_str());
-        return false;
-    }
-    if (!ShaderTranslator::CompileHostHlsl(kPs, false, psSpv, err))
-    {
-        KLOG("Vulkan MSAA resolve PS compile failed: %s\n", err.c_str());
-        return false;
-    }
-
-    auto makeModule = [](const std::vector<uint8_t>& spv, VkShaderModule& module) {
-        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        ci.codeSize = spv.size();
-        ci.pCode = reinterpret_cast<const uint32_t*>(spv.data());
-        return p_vkCreateShaderModule(g_device, &ci, nullptr, &module) == VK_SUCCESS;
-    };
-    if (!makeModule(vsSpv, g_msaaResolveVs) || !makeModule(psSpv, g_msaaResolvePs))
-        return false;
-
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    setInfo.bindingCount = 1;
-    setInfo.pBindings = &binding;
-    if (p_vkCreateDescriptorSetLayout(g_device, &setInfo, nullptr, &g_msaaResolveSetLayout) != VK_SUCCESS)
-        return false;
-
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16};
-    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 16;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
-    if (p_vkCreateDescriptorPool(g_device, &poolInfo, nullptr, &g_msaaResolvePool) != VK_SUCCESS)
-        return false;
-
-    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layoutInfo.setLayoutCount = 1;
-    layoutInfo.pSetLayouts = &g_msaaResolveSetLayout;
-    if (p_vkCreatePipelineLayout(g_device, &layoutInfo, nullptr, &g_msaaResolvePipelineLayout) != VK_SUCCESS)
-        return false;
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = g_msaaResolveVs;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = g_msaaResolvePs;
-    stages[1].pName = "main";
-
-    VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    vp.viewportCount = 1;
-    vp.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = uint32_t(std::size(dynamicStates));
-    dynamic.pDynamicStates = dynamicStates;
-    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &g_swapFormat;
-    VkGraphicsPipelineCreateInfo pipe{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pipe.pNext = &rendering;
-    pipe.stageCount = 2;
-    pipe.pStages = stages;
-    pipe.pVertexInputState = &vertex;
-    pipe.pInputAssemblyState = &ia;
-    pipe.pViewportState = &vp;
-    pipe.pRasterizationState = &raster;
-    pipe.pMultisampleState = &ms;
-    pipe.pColorBlendState = &blend;
-    pipe.pDynamicState = &dynamic;
-    pipe.layout = g_msaaResolvePipelineLayout;
-    if (p_vkCreateGraphicsPipelines(g_device, g_pipelineCache, 1, &pipe, nullptr,
-                                    &g_msaaResolvePipeline) != VK_SUCCESS)
-        return false;
-
-    KLOG("Vulkan MSAA shader resolve ready (2x sample0+1 average)\n");
-    return true;
-}
-
-bool EnsureMsaaResolveDescriptor(ColorBacking& backing)
-{
-    if (backing.resolveDescriptor)
-        return true;
-    if (!EnsureMsaaResolvePipeline())
-        return false;
-    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = g_msaaResolvePool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &g_msaaResolveSetLayout;
-    if (p_vkAllocateDescriptorSets(g_device, &ai, &backing.resolveDescriptor) != VK_SUCCESS)
-        return false;
-    VkDescriptorImageInfo image{};
-    image.imageView = backing.view;
-    image.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = backing.resolveDescriptor;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    write.pImageInfo = &image;
-    p_vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
-    return true;
-}
-
-bool ResolveColorBackingMsaa(ColorBacking& backing, const VkImageCopy& copy)
-{
-    if (!g_hostMsaa2x)
-        return true;
-    if (!backing.resolveImage || !EnsureMsaaResolveDescriptor(backing))
-        return false;
-
-    static uint32_t reports = 0;
-    const bool report = reports++ < 12;
-    if (report)
-        KLOG("[msaa2x resolve] begin info=%08X src=%d,%d dstLogical=%d,%d size=%ux%u primaryLayout=%u mirrorLayout=%u\n",
-             backing.info, copy.srcOffset.x, copy.srcOffset.y,
-             copy.dstOffset.x, copy.dstOffset.y,
-             copy.extent.width, copy.extent.height,
-             uint32_t(backing.layout), uint32_t(backing.resolveLayout));
-    TransitionColorBacking(backing, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (report)
-        KLOG("[msaa2x resolve] source-ready info=%08X layout=%u\n",
-             backing.info, uint32_t(backing.layout));
-    TransitionColorResolveBacking(backing, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (report)
-        KLOG("[msaa2x resolve] mirror-ready info=%08X layout=%u\n",
-             backing.info, uint32_t(backing.resolveLayout));
-
-    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    attachment.imageView = backing.resolveView;
-    attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    // Preserve parts of the single-sample mirror written by previous tiled
-    // resolves. Only the physical source region for this resolve is updated.
-    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    const int32_t rx = std::max<int32_t>(0, copy.srcOffset.x);
-    const int32_t ry = std::max<int32_t>(0, copy.srcOffset.y);
-    const uint32_t rw = std::min<uint32_t>(copy.extent.width,
-        g_extent.width > uint32_t(rx) ? g_extent.width - uint32_t(rx) : 0u);
-    const uint32_t rh = std::min<uint32_t>(copy.extent.height,
-        g_extent.height > uint32_t(ry) ? g_extent.height - uint32_t(ry) : 0u);
-    if (!rw || !rh)
-    {
-        TransitionColorBacking(backing, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        return true;
-    }
-    const VkRect2D logicalRect{{rx, ry}, {rw, rh}};
-    rendering.renderArea = ScaleRectToInternal(logicalRect);
-    rendering.layerCount = 1;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &attachment;
-    p_vkCmdBeginRendering(g_commandBuffer, &rendering);
-
-    VkViewport viewport{};
-    viewport.width = float(g_internalExtent.width);
-    viewport.height = float(g_internalExtent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    const VkRect2D scissor = ScaleRectToInternal(logicalRect);
-    CmdSetViewportCached(g_commandBuffer, viewport);
-    CmdSetScissorCached(g_commandBuffer, scissor);
-    CmdBindGraphicsPipelineCached(g_commandBuffer, g_msaaResolvePipeline);
-    CmdBindDescriptorSetsCached(g_commandBuffer, g_msaaResolvePipelineLayout,
-                                0, 1, &backing.resolveDescriptor);
-    p_vkCmdDraw(g_commandBuffer, 3, 1, 0, 0);
-    p_vkCmdEndRendering(g_commandBuffer);
-    if (report)
-        KLOG("[msaa2x resolve] shader-average issued info=%08X\n", backing.info);
-    TransitionColorResolveBacking(backing, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    TransitionColorBacking(backing, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (report)
-        KLOG("[msaa2x resolve] complete info=%08X mirrorLayout=%u\n",
-             backing.info, uint32_t(backing.resolveLayout));
-    return true;
-}
-
-bool EnsureDepthMsaaResolveInfrastructure()
-{
-    if (g_depthMsaaResolvePipelineLayout)
-        return true;
-
-    static constexpr const char* kVs = R"(
-struct VSOut { float4 position : SV_Position; };
-VSOut main(uint id : SV_VertexID)
-{
-    float2 p = id == 0 ? float2(-1.0, -1.0) :
-               id == 1 ? float2(-1.0,  3.0) : float2(3.0, -1.0);
-    VSOut o;
-    o.position = float4(p, 0.0, 1.0);
-    return o;
-}
-)";
-    static constexpr const char* kPs = R"(
-Texture2DMS<float> g_Source : register(t0, space0);
-float main(float4 position : SV_Position) : SV_Depth
-{
-    return g_Source.Load(int2(position.xy), 0);
-}
-)";
-
-    std::vector<uint8_t> vsSpv, psSpv;
-    std::string err;
-    if (!ShaderTranslator::CompileHostHlsl(kVs, true, vsSpv, err))
-    {
-        KLOG("Vulkan depth MSAA fallback VS compile failed: %s\n", err.c_str());
-        return false;
-    }
-    if (!ShaderTranslator::CompileHostHlsl(kPs, false, psSpv, err))
-    {
-        KLOG("Vulkan depth MSAA fallback PS compile failed: %s\n", err.c_str());
-        return false;
-    }
-
-    auto makeModule = [](const std::vector<uint8_t>& spv, VkShaderModule& module) {
-        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        ci.codeSize = spv.size();
-        ci.pCode = reinterpret_cast<const uint32_t*>(spv.data());
-        return p_vkCreateShaderModule(g_device, &ci, nullptr, &module) == VK_SUCCESS;
-    };
-    if (!makeModule(vsSpv, g_depthMsaaResolveVs) ||
-        !makeModule(psSpv, g_depthMsaaResolvePs))
-        return false;
-
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    setInfo.bindingCount = 1;
-    setInfo.pBindings = &binding;
-    if (p_vkCreateDescriptorSetLayout(g_device, &setInfo, nullptr,
-                                      &g_depthMsaaResolveSetLayout) != VK_SUCCESS)
-        return false;
-
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32};
-    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 32;
-    poolInfo.poolSizeCount = 1;
-    poolInfo.pPoolSizes = &poolSize;
-    if (p_vkCreateDescriptorPool(g_device, &poolInfo, nullptr,
-                                 &g_depthMsaaResolvePool) != VK_SUCCESS)
-        return false;
-
-    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layoutInfo.setLayoutCount = 1;
-    layoutInfo.pSetLayouts = &g_depthMsaaResolveSetLayout;
-    if (p_vkCreatePipelineLayout(g_device, &layoutInfo, nullptr,
-                                 &g_depthMsaaResolvePipelineLayout) != VK_SUCCESS)
-        return false;
-
-    KLOG("Vulkan depth MSAA shader SAMPLE_ZERO fallback ready\n");
-    return true;
-}
-
-VkPipeline GetDepthMsaaResolvePipeline(VkFormat format)
-{
-    VkPipeline* pipeline = nullptr;
-    if (format == kDepthUnormFormat)
-        pipeline = &g_depthMsaaResolveUnormPipeline;
-    else if (format == kDepthFloatFormat)
-        pipeline = &g_depthMsaaResolveFloatPipeline;
-    else
-        return VK_NULL_HANDLE;
-    if (*pipeline)
-        return *pipeline;
-    if (!EnsureDepthMsaaResolveInfrastructure())
-        return VK_NULL_HANDLE;
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = g_depthMsaaResolveVs;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = g_depthMsaaResolvePs;
-    stages[1].pName = "main";
-
-    VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
-    VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = uint32_t(std::size(dynamicStates));
-    dynamic.pDynamicStates = dynamicStates;
-    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.depthAttachmentFormat = format;
-
-    VkGraphicsPipelineCreateInfo pipe{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    pipe.pNext = &rendering;
-    pipe.stageCount = 2;
-    pipe.pStages = stages;
-    pipe.pVertexInputState = &vertex;
-    pipe.pInputAssemblyState = &ia;
-    pipe.pViewportState = &viewport;
-    pipe.pRasterizationState = &raster;
-    pipe.pMultisampleState = &ms;
-    pipe.pDepthStencilState = &depth;
-    pipe.pColorBlendState = &blend;
-    pipe.pDynamicState = &dynamic;
-    pipe.layout = g_depthMsaaResolvePipelineLayout;
-    if (p_vkCreateGraphicsPipelines(g_device, g_pipelineCache, 1, &pipe, nullptr,
-                                    pipeline) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
-
-    KLOG("Vulkan depth MSAA shader resolve pipeline ready: format=%u\n",
-         uint32_t(format));
-    return *pipeline;
-}
-
-bool EnsureDepthMsaaResolveDescriptor(DepthBacking& backing)
-{
-    if (backing.resolveDescriptor)
-        return true;
-    if (!EnsureDepthMsaaResolveInfrastructure())
-        return false;
-    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = g_depthMsaaResolvePool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &g_depthMsaaResolveSetLayout;
-    if (p_vkAllocateDescriptorSets(g_device, &ai, &backing.resolveDescriptor) != VK_SUCCESS)
-        return false;
-    VkDescriptorImageInfo image{};
-    image.imageView = backing.depthSampleView;
-    image.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = backing.resolveDescriptor;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    write.pImageInfo = &image;
-    p_vkUpdateDescriptorSets(g_device, 1, &write, 0, nullptr);
-    return true;
-}
-
-bool ResolveDepthBackingMsaaSampleZero(DepthBacking& backing, const VkImageCopy& copy)
-{
-    if (backing.samples == VK_SAMPLE_COUNT_1_BIT)
-        return true;
-    if (!backing.resolveImage || !backing.resolveView ||
-        !EnsureDepthMsaaResolveDescriptor(backing))
-        return false;
-    const VkPipeline pipeline = GetDepthMsaaResolvePipeline(backing.format);
-    if (!pipeline)
-        return false;
-
-    const int32_t rx = std::max<int32_t>(0, copy.srcOffset.x);
-    const int32_t ry = std::max<int32_t>(0, copy.srcOffset.y);
-    const uint32_t rw = std::min<uint32_t>(copy.extent.width,
-        g_extent.width > uint32_t(rx) ? g_extent.width - uint32_t(rx) : 0u);
-    const uint32_t rh = std::min<uint32_t>(copy.extent.height,
-        g_extent.height > uint32_t(ry) ? g_extent.height - uint32_t(ry) : 0u);
-    if (!rw || !rh)
-        return true;
-
-    EndColorRendering();
-    TransitionDepthBacking(backing, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
-    TransitionResolveTarget(backing.resolveImage, backing.resolveLayout,
-                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-
-    VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    depth.imageView = backing.resolveView;
-    depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    const VkRect2D logicalRect{{rx, ry}, {rw, rh}};
-    rendering.renderArea = ScaleRectToInternal(logicalRect);
-    rendering.layerCount = 1;
-    rendering.pDepthAttachment = &depth;
-    p_vkCmdBeginRendering(g_commandBuffer, &rendering);
-
-    VkViewport vp{};
-    vp.width = float(g_internalExtent.width);
-    vp.height = float(g_internalExtent.height);
-    vp.minDepth = 0.0f;
-    vp.maxDepth = 1.0f;
-    const VkRect2D scissor = ScaleRectToInternal(logicalRect);
-    CmdSetViewportCached(g_commandBuffer, vp);
-    CmdSetScissorCached(g_commandBuffer, scissor);
-    CmdBindGraphicsPipelineCached(g_commandBuffer, pipeline);
-    CmdBindDescriptorSetsCached(g_commandBuffer, g_depthMsaaResolvePipelineLayout,
-                                0, 1, &backing.resolveDescriptor);
-    p_vkCmdDraw(g_commandBuffer, 3, 1, 0, 0);
-    p_vkCmdEndRendering(g_commandBuffer);
-
-    TransitionDepthBacking(backing, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    static uint32_t reports = 0;
-    if (reports++ < 12)
-        KLOG("[depth msaa fallback] SAMPLE_ZERO info=%08X samples=%u rect=%d,%d %ux%u\n",
-             backing.info, uint32_t(backing.samples), rx, ry, rw, rh);
-    return true;
 }
 
 void TransitionColorBacking(ColorBacking& backing, VkImageLayout next)
@@ -4418,8 +3540,6 @@ std::string BuildEdramTransferPixelShader(EdramOwnerKind sourceKind,
                                           VkSampleCountFlagBits destSamples,
                                           VkSampleCountFlagBits sourceGuestSamples,
                                           VkSampleCountFlagBits destGuestSamples,
-                                          uint32_t sourcePitchTiles,
-                                          uint32_t destPitchTiles,
                                           bool sourceDepthFloat24,
                                           bool destDepthFloat24,
                                           EdramTransferPass pass)
@@ -4431,8 +3551,6 @@ std::string BuildEdramTransferPixelShader(EdramOwnerKind sourceKind,
     h << "#define DST_MSAA " << dstSamples << "\n";
     h << "#define SRC_GUEST_MSAA " << uint32_t(sourceGuestSamples) << "\n";
     h << "#define DST_GUEST_MSAA " << uint32_t(destGuestSamples) << "\n";
-    h << "#define SRC_PITCH_TILES " << sourcePitchTiles << "u\n";
-    h << "#define DST_PITCH_TILES " << destPitchTiles << "u\n";
     h << "#define SRC_DEPTH " << (sourceKind == EdramOwnerKind::Depth ? 1 : 0) << "\n";
     h << "#define DST_DEPTH " << (destKind == EdramOwnerKind::Depth ? 1 : 0) << "\n";
     h << "#define SRC_DEPTH_FLOAT24 " << (sourceDepthFloat24 ? 1 : 0) << "\n";
@@ -4608,11 +3726,11 @@ void MapPhysical(float4 position, uint destSample, out uint2 srcPixel, out uint 
 
     uint2 dstTile = dstPixel / uint2(dstTileWidth, dstTileHeight);
     uint2 dstLocalPixel = dstPixel % uint2(dstTileWidth, dstTileHeight);
-    uint dstLocalTile = dstTile.y * DST_PITCH_TILES + dstTile.x;
+    uint dstLocalTile = dstTile.y * g_Push.destPitchTiles + dstTile.x;
     uint physicalTile = (g_Push.destBaseTiles + dstLocalTile) & 2047u;
     uint srcLocalTile = (physicalTile - g_Push.sourceBaseTiles) & 2047u;
-    uint2 srcTile = uint2(srcLocalTile % SRC_PITCH_TILES,
-                          srcLocalTile / SRC_PITCH_TILES);
+    uint2 srcTile = uint2(srcLocalTile % g_Push.sourcePitchTiles,
+                          srcLocalTile / g_Push.sourcePitchTiles);
 
     uint2 canonical = CanonicalizeDest(dstLocalPixel, destSample);
     uint2 srcLocalPixel;
@@ -4726,6 +3844,132 @@ uint LoadPhysical(float4 position, uint destSample)
     return h.str();
 }
 
+void StartEdramShaderPrewarmWorker()
+{
+    if (g_edramShaderPrewarmThread.joinable())
+        return;
+
+    const bool shaderStencilExport = g_shaderStencilExport;
+    const std::array<VkSampleCountFlagBits, 3> guestSamples{
+        VK_SAMPLE_COUNT_1_BIT,
+        VK_SAMPLE_COUNT_2_BIT,
+        VK_SAMPLE_COUNT_4_BIT,
+    };
+
+    g_edramShaderPrewarmStop.store(false, std::memory_order_release);
+    g_edramShaderPrewarmPrepared.store(0, std::memory_order_relaxed);
+    g_edramShaderPrewarmFailed.store(0, std::memory_order_relaxed);
+    g_edramShaderPrewarmThread = std::thread(
+        [shaderStencilExport, guestSamples]() {
+#ifdef _WIN32
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+            const auto start = PerfClock::now();
+
+            auto compileVariant = [&](EdramOwnerKind sourceKind,
+                                      EdramOwnerKind destKind,
+                                      VkSampleCountFlagBits sourceGuestSamples,
+                                      VkSampleCountFlagBits destGuestSamples,
+                                      bool sourceDepthFloat24,
+                                      bool destDepthFloat24,
+                                      EdramTransferPass pass) {
+                if (g_edramShaderPrewarmStop.load(std::memory_order_acquire))
+                    return false;
+                const VkSampleCountFlagBits sourceSamples = VK_SAMPLE_COUNT_1_BIT;
+                const VkSampleCountFlagBits destSamples = VK_SAMPLE_COUNT_1_BIT;
+                const std::string hlsl = BuildEdramTransferPixelShader(
+                    sourceKind, destKind,
+                    sourceSamples, destSamples,
+                    sourceGuestSamples, destGuestSamples,
+                    sourceDepthFloat24, destDepthFloat24, pass);
+                std::vector<uint8_t> spirv;
+                std::string err;
+                const bool ok = ShaderTranslator::CompileHostHlsl(
+                    hlsl, false, spirv, err,
+                    pass == EdramTransferPass::DepthStencilExport);
+                if (ok)
+                    g_edramShaderPrewarmPrepared.fetch_add(1, std::memory_order_relaxed);
+                else
+                    g_edramShaderPrewarmFailed.fetch_add(1, std::memory_order_relaxed);
+                // Stay opportunistic. This worker is intended to fill the disk
+                // shader cache during logos/menu/loading, not compete with the
+                // guest, audio or render threads for an entire core.
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                return ok;
+            };
+
+            for (EdramOwnerKind sourceKind : {EdramOwnerKind::Color, EdramOwnerKind::Depth})
+            {
+                for (EdramOwnerKind destKind : {EdramOwnerKind::Color, EdramOwnerKind::Depth})
+                {
+                    for (VkSampleCountFlagBits sourceGuest : guestSamples)
+                    {
+                        for (VkSampleCountFlagBits destGuest : guestSamples)
+                        {
+                            const uint32_t sourceFloatVariants =
+                                sourceKind == EdramOwnerKind::Depth ? 2u : 1u;
+                            const uint32_t destFloatVariants =
+                                destKind == EdramOwnerKind::Depth ? 2u : 1u;
+                            for (uint32_t sourceFloat = 0;
+                                 sourceFloat < sourceFloatVariants; ++sourceFloat)
+                            {
+                                for (uint32_t destFloat = 0;
+                                     destFloat < destFloatVariants; ++destFloat)
+                                {
+                                    if (g_edramShaderPrewarmStop.load(std::memory_order_acquire))
+                                        goto finished;
+
+                                    if (destKind == EdramOwnerKind::Color)
+                                    {
+                                        compileVariant(sourceKind, destKind,
+                                                       sourceGuest, destGuest,
+                                                       sourceFloat != 0, false,
+                                                       EdramTransferPass::Color);
+                                    }
+                                    else if (shaderStencilExport)
+                                    {
+                                        compileVariant(sourceKind, destKind,
+                                                       sourceGuest, destGuest,
+                                                       sourceFloat != 0, destFloat != 0,
+                                                       EdramTransferPass::DepthStencilExport);
+                                    }
+                                    else
+                                    {
+                                        compileVariant(sourceKind, destKind,
+                                                       sourceGuest, destGuest,
+                                                       sourceFloat != 0, destFloat != 0,
+                                                       EdramTransferPass::DepthOnly);
+                                        compileVariant(sourceKind, destKind,
+                                                       sourceGuest, destGuest,
+                                                       sourceFloat != 0, destFloat != 0,
+                                                       EdramTransferPass::StencilBitPlanes);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+finished:
+            const double elapsedMs = std::chrono::duration<double, std::milli>(
+                PerfClock::now() - start).count();
+            KLOG("Vulkan EDRAM shader prewarm: prepared=%llu failed=%llu elapsed=%.1f ms\n",
+                 static_cast<unsigned long long>(
+                     g_edramShaderPrewarmPrepared.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     g_edramShaderPrewarmFailed.load(std::memory_order_relaxed)),
+                 elapsedMs);
+        });
+}
+
+void StopEdramShaderPrewarmWorker()
+{
+    g_edramShaderPrewarmStop.store(true, std::memory_order_release);
+    if (g_edramShaderPrewarmThread.joinable())
+        g_edramShaderPrewarmThread.join();
+}
+
 EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
                                                 EdramOwnerKind destKind,
                                                 VkSampleCountFlagBits sourceSamples,
@@ -4744,27 +3988,19 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
             rec.sourceSamples == sourceSamples && rec.destSamples == destSamples &&
             rec.sourceGuestSamples == sourceGuestSamples &&
             rec.destGuestSamples == destGuestSamples &&
-            rec.sourcePitchTiles == sourcePitchTiles &&
-            rec.destPitchTiles == destPitchTiles &&
             rec.sourceDepthFloat24 == sourceDepthFloat24 &&
             rec.destDepthFloat24 == destDepthFloat24 &&
             rec.destDepthFormat == destDepthFormat && rec.pass == pass)
             return rec.pipeline ? &rec : nullptr;
 
+    DetailedCpuScope pipelineTiming(g_perfEdramPipelineNs);
+
     if (!EnsureEdramTransferInfrastructure())
         return nullptr;
-    if (destSamples != VK_SAMPLE_COUNT_1_BIT && !g_sampleRateShading)
-    {
-        KLOG("Vulkan EDRAM transfer needs sampleRateShading for %ux destination\n",
-             uint32_t(destSamples));
-        return nullptr;
-    }
     const std::string hlsl = BuildEdramTransferPixelShader(sourceKind, destKind,
                                                            sourceSamples, destSamples,
                                                            sourceGuestSamples,
                                                            destGuestSamples,
-                                                           sourcePitchTiles,
-                                                           destPitchTiles,
                                                            sourceDepthFloat24,
                                                            destDepthFloat24, pass);
     std::vector<uint8_t> psSpv;
@@ -4803,8 +4039,6 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
     rec.destSamples = destSamples;
     rec.sourceGuestSamples = sourceGuestSamples;
     rec.destGuestSamples = destGuestSamples;
-    rec.sourcePitchTiles = sourcePitchTiles;
-    rec.destPitchTiles = destPitchTiles;
     rec.sourceDepthFloat24 = sourceDepthFloat24;
     rec.destDepthFloat24 = destDepthFloat24;
     rec.destDepthFormat = destDepthFormat;
@@ -4938,15 +4172,14 @@ EdramTransferPipeline* GetEdramTransferPipeline(EdramOwnerKind sourceKind,
     }
 
     g_edramTransferPipelines.push_back(rec);
-    KLOG_DIAG("Vulkan EDRAM transfer pipeline ready src=%s host=%ux guest=%ux%s pitch=%u "
-              "dst=%s host=%ux guest=%ux%s pitch=%u\n",
+    KLOG_DIAG("Vulkan EDRAM transfer pipeline ready src=%s host=%ux guest=%ux%s "
+              "dst=%s host=%ux guest=%ux%s (pitch dynamic)\n",
               sourceKind == EdramOwnerKind::Color ? "color" : "depth", uint32_t(sourceSamples),
               uint32_t(sourceGuestSamples),
               sourceDepthFloat24 ? "/f24" : "",
-              sourcePitchTiles,
               destKind == EdramOwnerKind::Color ? "color" : "depth", uint32_t(destSamples),
               uint32_t(destGuestSamples),
-              destDepthFloat24 ? "/f24" : "", destPitchTiles);
+              destDepthFloat24 ? "/f24" : "");
     return &g_edramTransferPipelines.back();
 }
 
@@ -5231,8 +4464,9 @@ bool PackDepthResolveSnapshot(ResolveSnapshot& snapshot, DepthBacking& source,
         {EdramOwnerKind::Depth, source.key});
     if (!pipeline || !descriptor)
     {
-        KLOG("Vulkan packed depth resolve prerequisites missing: key=%08X pipeline=%u descriptor=%u samples=%u f24=%u endian=%u\n",
-             source.key, pipeline ? 1u : 0u, descriptor ? 1u : 0u,
+        KLOG("Vulkan packed depth resolve prerequisites missing: key=%016llX pipeline=%u descriptor=%u samples=%u f24=%u endian=%u\n",
+             static_cast<unsigned long long>(source.key),
+             pipeline ? 1u : 0u, descriptor ? 1u : 0u,
              uint32_t(source.samples), sourceFloat24 ? 1u : 0u, resolveEndian & 3u);
         return false;
     }
@@ -5346,6 +4580,8 @@ bool TransferEdramOwnershipSpan(const EdramOwner& sourceOwner,
                                 const EdramOwner& destOwner,
                                 uint32_t destLocalStart, uint32_t tileCount)
 {
+    DetailedCpuScope transferTiming(g_perfEdramTransferNs);
+
     EdramBackingMeta source{}, dest{};
     if (!GetEdramBackingMeta(sourceOwner, source) ||
         !GetEdramBackingMeta(destOwner, dest))
@@ -5650,10 +4886,6 @@ bool DiscardAndClaimEdramOwnership(const EdramOwner& destOwner)
 bool PrepareActiveEdramOwnersForFullOverwrite(bool writeColor0, bool writeColor1,
                                               bool writeDepth)
 {
-    const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
-    if (!EdramOwnershipEnabled(frame))
-        return true;
-
     // Match normal ownership precedence: depth first, then color attachments.
     if (writeDepth && g_activeDepthEnabled && g_activeDepthSurfaceKey != UINT64_MAX &&
         !DiscardAndClaimEdramOwnership({EdramOwnerKind::Depth, g_activeDepthSurfaceKey}))
@@ -5670,8 +4902,6 @@ bool PrepareActiveEdramOwnersForFullOverwrite(bool writeColor0, bool writeColor1
 bool MaterializeEdramOwnerForResolve(const EdramOwner& owner,
                                      uint64_t frame, const char* sourceName)
 {
-    if (!EdramOwnershipEnabled(frame))
-        return true;
     const uint64_t transfersBefore = g_edramOwnershipTransfers;
     if (!ClaimEdramOwnership(owner))
         return false;
@@ -5700,9 +4930,6 @@ bool PrepareActiveEdramOwnersForWrite(bool writeColor0, bool writeColor1,
                                       bool writeDepth, const char* reason)
 {
     const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
-    if (!EdramOwnershipEnabled(frame))
-        return true;
-
     const bool haveDepth = writeDepth && g_activeDepthEnabled &&
                            g_activeDepthSurfaceKey != UINT64_MAX;
     const bool haveColor0 = writeColor0 && g_activeColorSurfaceKey != UINT64_MAX;
@@ -5753,8 +4980,6 @@ bool SwitchActiveColorSurface(uint32_t surfaceInfo, uint32_t info, bool resume =
 
     const bool firstUse = !newBacking->initialized;
     TransitionColorBacking(*newBacking, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (newBacking->samples != VK_SAMPLE_COUNT_1_BIT)
-        TransitionColorResolveBacking(*newBacking, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     g_activeColorSurfaceKey = key;
     g_activeColor1SurfaceKey = UINT64_MAX;
     g_activeColorInfo = info;
@@ -5793,8 +5018,6 @@ bool SwitchActiveColorSurfaces(uint32_t surfaceInfo, uint32_t color0Info,
         return false;
     const bool firstUse0 = !color0->initialized;
     TransitionColorBacking(*color0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (color0->samples != VK_SAMPLE_COUNT_1_BIT)
-        TransitionColorResolveBacking(*color0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
     ColorBacking* color1 = nullptr;
     bool firstUse1 = false;
@@ -5804,8 +5027,6 @@ bool SwitchActiveColorSurfaces(uint32_t surfaceInfo, uint32_t color0Info,
             return false;
         firstUse1 = !color1->initialized;
         TransitionColorBacking(*color1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        if (color1->samples != VK_SAMPLE_COUNT_1_BIT)
-            TransitionColorResolveBacking(*color1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
 
     g_activeColorSurfaceKey = color0Key;
@@ -5856,30 +5077,6 @@ bool SwitchActiveDepthSurface(uint32_t surfaceInfo, uint32_t depthInfo, bool dep
         return true;
 
     EndColorRendering();
-    if (DiagnosticInvalidateColorOnDepthAliasEnabled())
-    {
-        const uint32_t depthBase = xenos::DepthBaseTiles(depthInfo);
-        for (auto& color : g_colorBackings)
-        {
-            if (!color.initialized || color.baseTiles != depthBase)
-                continue;
-
-            VkClearColorValue clear{};
-            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            TransitionColorBacking(color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            p_vkCmdClearColorImage(g_commandBuffer, color.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                   &clear, 1, &range);
-            if (color.key == g_activeColorSurfaceKey ||
-                (g_activeColor1Enabled && color.key == g_activeColor1SurfaceKey))
-                TransitionColorBacking(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-            static uint32_t reports = 0;
-            if (reports++ < 32)
-                KLOG("[edram alias A/B] depth base=%03X invalidated color key=%016llX\n",
-                     depthBase, static_cast<unsigned long long>(color.key));
-        }
-    }
 
     DepthBacking* backing = nullptr;
     if (!CreateDepthBacking(key, backing) || !backing)
@@ -6052,149 +5249,6 @@ void TransitionSampledDepthSnapshot(ResolveSnapshot& snapshot, VkImageLayout nex
     snapshot.sampledDepthLayout = next;
 }
 
-void TransitionSnapshotPresent(ResolveSnapshot& snapshot, VkImageLayout next)
-{
-    if (!snapshot.presentImage || snapshot.presentLayout == next)
-        return;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkAccessFlags srcAccess = 0;
-    if (snapshot.presentLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        srcAccess = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-    else if (snapshot.presentLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        srcAccess = VK_ACCESS_TRANSFER_READ_BIT;
-    }
-    else if (snapshot.presentLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        srcStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        srcAccess = VK_ACCESS_SHADER_READ_BIT;
-    }
-
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkAccessFlags dstAccess = next == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-                                  ? VK_ACCESS_TRANSFER_WRITE_BIT
-                                  : VK_ACCESS_TRANSFER_READ_BIT;
-    if (next == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        dstStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        dstAccess = VK_ACCESS_SHADER_READ_BIT;
-    }
-
-    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    barrier.srcAccessMask = srcAccess;
-    barrier.dstAccessMask = dstAccess;
-    barrier.oldLayout = snapshot.presentLayout;
-    barrier.newLayout = next;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = snapshot.presentImage;
-    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    p_vkCmdPipelineBarrier(g_commandBuffer, srcStage, dstStage,
-                           0, 0, nullptr, 0, nullptr, 1, &barrier);
-    snapshot.presentLayout = next;
-}
-
-bool CommitSnapshotForPresent(ResolveSnapshot& snapshot)
-{
-    if (!snapshot.coverageComplete || snapshot.depth)
-        return false;
-    if (snapshot.presentValid && snapshot.presentedGeneration == snapshot.coverageGeneration)
-        return true;
-    if (!EnsureSnapshotPresentImage(snapshot))
-        return false;
-
-    TransitionSnapshot(snapshot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    TransitionSnapshotPresent(snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = copy.srcSubresource;
-    copy.extent = {snapshot.width, snapshot.height, 1};
-    copy = ScaleImageCopyToInternal(copy);
-    p_vkCmdCopyImage(g_commandBuffer, snapshot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     snapshot.presentImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    TransitionSnapshotPresent(snapshot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    snapshot.presentValid = true;
-    snapshot.presentResolveSwap = snapshot.resolveSwap;
-    snapshot.presentedGeneration = snapshot.coverageGeneration;
-
-    static std::atomic<uint32_t> reports{0};
-    if (reports.fetch_add(1, std::memory_order_relaxed) < 12)
-        KLOG("Vulkan stable front commit: key=%08X generation=%llu copies=%llu\n",
-             snapshot.key,
-             static_cast<unsigned long long>(snapshot.coverageGeneration),
-             static_cast<unsigned long long>(snapshot.copies));
-    return true;
-}
-
-bool CommitSnapshotForSceneFeedback(ResolveSnapshot& snapshot)
-{
-    if (snapshot.depth || !EnsureSnapshotPresentImage(snapshot))
-        return false;
-
-    const int stableMode = StableSceneFeedbackMode();
-    if (stableMode >= 2)
-    {
-        // Strict diagnostic mode: publish only a fully assembled scene-color
-        // generation, and never republish later tile-2 resolves into the same
-        // generation. This tests whether consumers are observing intermediate
-        // history while the Xenos tiled sweep is still being assembled.
-        if (!snapshot.coverageComplete)
-        {
-            static uint32_t incompleteReports = 0;
-            if (incompleteReports++ < 32)
-                KLOG("[scene feedback strict] key=%08X generation=%llu copies=%llu incomplete; publish deferred\n",
-                     snapshot.key,
-                     static_cast<unsigned long long>(snapshot.coverageGeneration),
-                     static_cast<unsigned long long>(snapshot.copies));
-            return false;
-        }
-        if (snapshot.presentValid &&
-            snapshot.presentedGeneration == snapshot.coverageGeneration)
-        {
-            static uint32_t duplicateReports = 0;
-            if (duplicateReports++ < 32)
-                KLOG("[scene feedback strict] key=%08X generation=%llu copies=%llu already published\n",
-                     snapshot.key,
-                     static_cast<unsigned long long>(snapshot.coverageGeneration),
-                     static_cast<unsigned long long>(snapshot.copies));
-            return true;
-        }
-    }
-
-    // Scene-color feedback is assembled through three overlapping horizontal
-    // EDRAM tiles. Publish only after the last tile of the sweep has arrived so
-    // shaders never observe a new left tile together with stale middle/right
-    // tiles. Unlike front presentation, publish every qualifying tile-2 resolve:
-    // the title performs several feedback resolves per tile and later tile-2
-    // resolves may contain additional transparent/effect passes.
-    TransitionSnapshot(snapshot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    TransitionSnapshotPresent(snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkImageCopy copy{};
-    copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.dstSubresource = copy.srcSubresource;
-    copy.extent = {snapshot.width, snapshot.height, 1};
-    copy = ScaleImageCopyToInternal(copy);
-    p_vkCmdCopyImage(g_commandBuffer, snapshot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     snapshot.presentImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-    TransitionSnapshotPresent(snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    snapshot.presentValid = true;
-    snapshot.presentResolveSwap = snapshot.resolveSwap;
-    snapshot.presentedGeneration = snapshot.coverageGeneration;
-
-    static uint32_t reports = 0;
-    if (reports++ < 24)
-        KLOG("[scene feedback stable] key=%08X generation=%llu copies=%llu published\n",
-             snapshot.key,
-             static_cast<unsigned long long>(snapshot.coverageGeneration),
-             static_cast<unsigned long long>(snapshot.copies));
-    return true;
-}
-
 uint32_t MacroTileOffset(uint32_t x, uint32_t y, uint32_t pitch)
 {
     const uint32_t tilesPerRow = std::max(pitch, 32u) >> 5;
@@ -6250,7 +5304,9 @@ ResolveRectDecode DecodeResolveRectFromVertices(uint8_t* guestBase, const uint32
         return ResolveRectDecode::Invalid;
 
     std::array<uint32_t, 6> words{};
-    CopySwapped(reinterpret_cast<uint8_t*>(words.data()), guestBase + va,
+    CopySwapped(reinterpret_cast<uint8_t*>(words.data()),
+                GuestReadPtr(guestBase, va,
+                                               words.size() * sizeof(uint32_t)),
                 words.size() * sizeof(uint32_t), fetch.endian);
 
     if (MojoRecompVerboseDiagnosticsEnabled() && surfW == 1280 && surfH == 720)
@@ -6466,219 +5522,15 @@ bool ResolveCopyRegion(const uint32_t* regs, uint32_t x0, uint32_t y0,
     return true;
 }
 
-bool IsCollapsedHorizontalTileResolve(uint32_t surfW, uint32_t surfH,
-                                      uint32_t x0, uint32_t y0,
-                                      uint32_t x1, uint32_t y1)
-{
-    const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
-    const bool sceneTilingActive = CollapseTiledDrawsEnabled() &&
-                                   g_sceneTilingLastIndexedFrame != 0 &&
-                                   frame <= g_sceneTilingLastIndexedFrame + 1;
-    if (!sceneTilingActive || surfW != g_extent.width || surfH != g_extent.height ||
-        y0 != 0 || y1 != surfH || x1 <= x0)
-        return false;
-
-    // Crash's 1280x720 EDRAM pass is replayed as three overlapping 448-pixel
-    // horizontal windows: 0..448, 416..864 and 832..1280. Once the host path
-    // collapses the matching predicated draws into one full-size raster pass,
-    // those resolves must read the logical host coordinates rather than remap
-    // all three windows back onto the same physical EDRAM tile.
-    const uint32_t tileWidth = 448;
-    const uint32_t tileStep = 416;
-    return (x0 == 0 && x1 == tileWidth) ||
-           (x0 == tileStep && x1 == tileStep + tileWidth) ||
-           (x0 == tileStep * 2 && x1 == surfW);
-}
-
-bool IsStitchedHorizontalTileResolve(uint32_t surfW, uint32_t surfH,
-                                     uint32_t x0, uint32_t y0,
-                                     uint32_t x1, uint32_t y1)
-{
-    const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
-    const bool sceneTilingActive = StitchTiledDrawsEnabled() &&
-                                   g_sceneStitchLastIndexedFrame != 0 &&
-                                   frame <= g_sceneStitchLastIndexedFrame + 1;
-    if (!sceneTilingActive || surfW != g_extent.width || surfH != g_extent.height ||
-        y0 != 0 || y1 != surfH || x1 <= x0)
-        return false;
-
-    const uint32_t tileWidth = 448;
-    const uint32_t tileStep = 416;
-    return (x0 == 0 && x1 == tileWidth) ||
-           (x0 == tileStep && x1 == tileStep + tileWidth) ||
-           (x0 == tileStep * 2 && x1 == surfW);
-}
-
-bool StitchedNextTileClearRect(uint32_t surfW, uint32_t surfH,
-                              uint32_t x0, uint32_t y0,
-                              uint32_t x1, uint32_t y1,
-                              VkRect2D& rect)
-{
-    const int dynamicMode = StitchTileClearMode();
-    const bool rotate = dynamicMode >= 1 || StitchRotateTileClearsEnabled();
-    if (!rotate ||
-        !IsStitchedHorizontalTileResolve(surfW, surfH, x0, y0, x1, y1))
-        return false;
-
-    constexpr uint32_t tileWidth = 448;
-    constexpr uint32_t tileStep = 416;
-    uint32_t nextX = 0;
-    if (x0 == 0)
-        nextX = tileStep;
-    else if (x0 == tileStep)
-        nextX = tileStep * 2;
-    else
-        nextX = 0;
-
-    const uint32_t nextX1 = std::min(nextX + tileWidth, surfW);
-    rect.offset = {static_cast<int32_t>(nextX), 0};
-    rect.extent = {nextX1 - nextX, surfH};
-    return rect.extent.width != 0 && rect.extent.height != 0;
-}
-
-bool SuppressStitchedWrapClear(uint32_t surfW, uint32_t surfH,
-                               uint32_t x0, uint32_t y0,
-                               uint32_t x1, uint32_t y1)
-{
-    return StitchTileClearMode() == 2 &&
-           IsStitchedHorizontalTileResolve(surfW, surfH, x0, y0, x1, y1) &&
-           x0 == 832;
-}
-
 bool ResolveCopyRegionForHost(const uint32_t* regs,
                               uint32_t surfW, uint32_t surfH,
                               uint32_t x0, uint32_t y0,
                               uint32_t x1, uint32_t y1,
                               VkImageCopy& copy)
 {
-    if (IsStitchedHorizontalTileResolve(surfW, surfH, x0, y0, x1, y1))
-    {
-        // Diagnostic source-address switch. Keep the destination logical in both
-        // models; only choose whether the source is the host-stitched logical
-        // rectangle or the physical Xenos EDRAM window selected by WINDOW_OFFSET.
-        // Bits: 1=color0, 2=depth, 4=RT1.
-        const uint32_t srcSelect = regs[xenos::kRbCopyControl] & 7u;
-        const int sourceMode = StitchResolveSourceMode();
-        const int sourceBit = srcSelect == 0 ? 1 : (srcSelect == 4 ? 2 : (srcSelect == 1 ? 4 : 0));
-        if (StitchPhysicalTileRasterEnabled() || (sourceBit && (sourceMode & sourceBit)))
-        {
-            if (!ResolveCopyRegion(regs, x0, y0, x1, y1, copy))
-                return false;
-            static uint32_t reports = 0;
-            if (reports++ < 36)
-                KLOG("[stitch resolve source] mode=%d src=%u logical=%u..%u physical=%d..%d dst=%d..%d\n",
-                     sourceMode, srcSelect, x0, x1,
-                     copy.srcOffset.x, copy.srcOffset.x + int32_t(copy.extent.width),
-                     copy.dstOffset.x, copy.dstOffset.x + int32_t(copy.extent.width));
-            return true;
-        }
-
-        // In stitch mode each Xenos tile is rasterized directly into its logical
-        // 1280x720 host coordinates. Resolve from that same logical rectangle;
-        // applying PA_SC_WINDOW_OFFSET here would incorrectly remap tile 1/2
-        // back onto the physical 0..448 EDRAM window a second time.
-        copy.srcOffset = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), 0};
-        copy.dstOffset = copy.srcOffset;
-        copy.extent = {x1 - x0, y1 - y0, 1};
-        return true;
-    }
-
-    if (!IsCollapsedHorizontalTileResolve(surfW, surfH, x0, y0, x1, y1))
-    {
-        if (!ResolveCopyRegion(regs, x0, y0, x1, y1, copy))
-            return false;
-
-        // Diagnostic model for the title's 448-wide / 416-step EDRAM windows.
-        // The 32-pixel overlap is raster guard-band coverage, not two logical
-        // destinations that both need to survive in the assembled snapshot.
-        // Keep a single writer for each logical pixel: 416 + 416 + 448 = 1280.
-        static const bool trimTileOverlap = [] {
-            const char* value = std::getenv("MOJORECOMP_TRIM_TILE_RESOLVE_OVERLAP");
-            return value && std::strcmp(value, "1") == 0;
-        }();
-        if (trimTileOverlap && surfW == 1280 && surfH == 720 && y0 == 0 && y1 == 720)
-        {
-            constexpr uint32_t kTileStep = 416;
-            constexpr uint32_t kTileWidth = 448;
-            if ((x0 == 0 && x1 == kTileWidth) ||
-                (x0 == kTileStep && x1 == kTileStep + kTileWidth))
-            {
-                copy.extent.width = kTileStep;
-            }
-        }
-        return true;
-    }
-
-    // The first collapsed tile already contains the full logical scene in the
-    // host render target. Resolve the complete image once; the caller discards
-    // the middle/last tile copies as redundant replays.
-    if (x0 == 0)
-    {
-        copy.srcOffset = {0, 0, 0};
-        copy.dstOffset = {0, 0, 0};
-        copy.extent = {surfW, surfH, 1};
-        return true;
-    }
-
-    copy.srcOffset = {static_cast<int32_t>(x0), static_cast<int32_t>(y0), 0};
-    copy.dstOffset = copy.srcOffset;
-    copy.extent = {x1 - x0, y1 - y0, 1};
-    return true;
-}
-
-bool IsFirstCollapsedHorizontalTile(uint32_t surfW, uint32_t surfH,
-                                    uint32_t x0, uint32_t y0,
-                                    uint32_t x1, uint32_t y1)
-{
-    return IsCollapsedHorizontalTileResolve(surfW, surfH, x0, y0, x1, y1) && x0 == 0;
-}
-
-bool IsLastCollapsedHorizontalTile(uint32_t surfW, uint32_t surfH,
-                                   uint32_t x0, uint32_t y0,
-                                   uint32_t x1, uint32_t y1)
-{
-    return IsCollapsedHorizontalTileResolve(surfW, surfH, x0, y0, x1, y1) && x1 == surfW;
-}
-
-bool ClearFullResolveAttachments(const uint32_t* regs, bool clearColor, bool clearDepth)
-{
-    if (!clearColor && !clearDepth)
-        return true;
-    if (!PrepareActiveEdramOwnersForFullOverwrite(clearColor, false, clearDepth))
-        return false;
-    ResumeColorRendering(false);
-    std::array<VkClearAttachment, 2> attachments{};
-    uint32_t attachmentCount = 0;
-    if (clearColor)
-    {
-        ++g_perfColorClears;
-        const uint32_t c = regs[xenos::kRbColorClear];
-        auto& attachment = attachments[attachmentCount++];
-        attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        attachment.colorAttachment = 0;
-        attachment.clearValue.color.float32[0] = float(c & 0xFFu) / 255.0f;
-        attachment.clearValue.color.float32[1] = float((c >> 8) & 0xFFu) / 255.0f;
-        attachment.clearValue.color.float32[2] = float((c >> 16) & 0xFFu) / 255.0f;
-        attachment.clearValue.color.float32[3] = float((c >> 24) & 0xFFu) / 255.0f;
-    }
-    if (clearDepth)
-    {
-        ++g_perfDepthClears;
-        const uint32_t d = regs[xenos::kRbDepthClear];
-        auto& attachment = attachments[attachmentCount++];
-        attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-        attachment.clearValue.depthStencil.depth =
-            DecodeDepthClearValue(regs[xenos::kRbDepthInfo], d);
-        attachment.clearValue.depthStencil.stencil = d & 0xFFu;
-    }
-    g_perfClearRectPixels += uint64_t(g_extent.width) * g_extent.height;
-    VkClearRect rect{};
-    rect.rect = {{0, 0}, g_internalExtent};
-    rect.baseArrayLayer = 0;
-    rect.layerCount = 1;
-    p_vkCmdClearAttachments(g_commandBuffer, attachmentCount, attachments.data(), 1, &rect);
-    ++g_renderWriteGeneration;
-    return true;
+    (void)surfW;
+    (void)surfH;
+    return ResolveCopyRegion(regs, x0, y0, x1, y1, copy);
 }
 
 bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t control)
@@ -6797,24 +5649,6 @@ bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t cont
     // diagnostic switch.
     const bool multisampledDepth =
         activeDepth && activeDepth->samples != VK_SAMPLE_COUNT_1_BIT;
-    const bool collapsedTileResolve =
-        IsCollapsedHorizontalTileResolve(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    if (collapsedTileResolve &&
-        !IsFirstCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1))
-    {
-        // The first collapsed depth resolve captured the entire host depth target.
-        // Preserve the console's post-resolve clear only when the last tile replay
-        // arrives, but do not recopy the already complete snapshot.
-        if (clearDepth &&
-            IsLastCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1))
-            if (!ClearFullResolveAttachments(regs, false, true))
-                return false;
-        return true;
-    }
-
-    // Do not allocate a new snapshot for the redundant middle/last EDRAM tile.
-    // Their destination pointer may still describe the physical tile, which would
-    // otherwise manufacture alias keys and permanently consume snapshot slots.
     ResolveSnapshot* snapshot = nullptr;
     if (!CreateDepthSnapshot(key, surfW, surfH, resolveDepthFormat,
                              resolveDepthFloat24, snapshot) || !snapshot)
@@ -6844,21 +5678,7 @@ bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t cont
         !MaterializeEdramOwnerForResolve(
             {EdramOwnerKind::Depth, activeDepth->key}, resolveFrame, "depth"))
         return false;
-    // Vulkan's native depth resolve is used when SAMPLE_ZERO is supported. On
-    // devices without it, materialize the same Xenos sample-zero semantics into
-    // the backing's single-sample mirror with a tiny depth-only shader before
-    // the normal snapshot copy below.
     activeDepth = ActiveDepthBacking();
-    if (activeDepth && activeDepth->samples != VK_SAMPLE_COUNT_1_BIT &&
-        !g_hostMsaaDepthSampleZero)
-    {
-        if (!ResolveDepthBackingMsaaSampleZero(*activeDepth, copy))
-        {
-            KLOG("Vulkan depth MSAA SAMPLE_ZERO fallback failed: key=%08X info=%08X samples=%u\n",
-                 key, activeDepth->info, uint32_t(activeDepth->samples));
-            return false;
-        }
-    }
     const VkImageCopy internalCopy = ScaleImageCopyToInternal(copy);
     if (activeDepth)
     {
@@ -6880,13 +5700,7 @@ bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t cont
 
     VkImageMemoryBarrier depthToRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     activeDepth = ActiveDepthBacking();
-    if (activeDepth && activeDepth->samples != VK_SAMPLE_COUNT_1_BIT)
-    {
-        TransitionResolveTarget(activeDepth->resolveImage, activeDepth->resolveLayout,
-                                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    }
-    else if (activeDepth)
+    if (activeDepth)
     {
         TransitionDepthBacking(*activeDepth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     }
@@ -6916,10 +5730,7 @@ bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t cont
     copy.srcSubresource.layerCount = 1;
     copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     copy.dstSubresource.layerCount = 1;
-    const VkImage depthCopySource =
-        activeDepth && activeDepth->samples != VK_SAMPLE_COUNT_1_BIT
-            ? activeDepth->resolveImage
-            : ActiveDepthImage();
+    const VkImage depthCopySource = ActiveDepthImage();
     p_vkCmdCopyImage(g_commandBuffer, depthCopySource,
                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                      snapshot->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &internalCopy);
@@ -6934,13 +5745,7 @@ bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t cont
     // resumed, instead of forcing PrepareTextures to end rendering a second
     // time on the first draw that samples this resolve.
     TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (activeDepth && activeDepth->samples != VK_SAMPLE_COUNT_1_BIT)
-    {
-        TransitionResolveTarget(activeDepth->resolveImage, activeDepth->resolveLayout,
-                                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    }
-    else if (activeDepth)
+    if (activeDepth)
     {
         TransitionDepthBacking(*activeDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     }
@@ -6962,39 +5767,15 @@ bool ResolveDepthSurface(uint8_t* guestBase, const uint32_t* regs, uint32_t cont
                                0, 0, nullptr, 0, nullptr, 1, &depthBack);
     }
 
-    const bool clearCollapsedTile =
-        !collapsedTileResolve || IsLastCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    const bool suppressStitchedWrapClear =
-        !collapsedTileResolve &&
-        SuppressStitchedWrapClear(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    if (clearDepth && clearCollapsedTile && !suppressStitchedWrapClear)
+    if (clearDepth)
     {
-        const bool fullOverwrite = collapsedTileResolve;
-        if (!(fullOverwrite
-                  ? PrepareActiveEdramOwnersForFullOverwrite(false, false, true)
-                  : PrepareActiveEdramOwnersForWrite(false, false, true,
-                                                     "depth-resolve-clear")))
+        if (!PrepareActiveEdramOwnersForWrite(false, false, true,
+                                              "depth-resolve-clear"))
             return false;
         ResumeColorRendering(false);
         ++g_perfDepthClears;
-        const bool stitchedTileResolve =
-            IsStitchedHorizontalTileResolve(surfW, surfH, copyX, copyY, copyX1, copyY1);
-        const bool physicalStitchedTile =
-            stitchedTileResolve && StitchPhysicalTileRasterEnabled();
-        VkRect2D clearRect = collapsedTileResolve
-            ? VkRect2D{{0, 0}, g_extent}
-            : physicalStitchedTile
-                ? VkRect2D{{copy.srcOffset.x, copy.srcOffset.y},
-                           {copy.extent.width, copy.extent.height}}
-            : stitchedTileResolve
-                ? VkRect2D{{static_cast<int32_t>(copyX), static_cast<int32_t>(copyY)},
-                           {copyX1 - copyX, copyY1 - copyY}}
-                : VkRect2D{{copy.srcOffset.x, copy.srcOffset.y},
-                           {copy.extent.width, copy.extent.height}};
-        VkRect2D stitchedClear{};
-        if (!collapsedTileResolve &&
-            StitchedNextTileClearRect(surfW, surfH, copyX, copyY, copyX1, copyY1, stitchedClear))
-            clearRect = stitchedClear;
+        const VkRect2D clearRect{{copy.srcOffset.x, copy.srcOffset.y},
+                                 {copy.extent.width, copy.extent.height}};
         g_perfClearRectPixels += uint64_t(clearRect.extent.width) * clearRect.extent.height;
         const uint32_t d = regs[xenos::kRbDepthClear];
         VkClearAttachment attachment{};
@@ -7062,12 +5843,6 @@ bool ResolveRt1Surface(uint8_t* guestBase, const uint32_t* regs, uint32_t contro
     if (copyX1 <= copyX || copyY1 <= copyY)
         return true;
 
-    const bool collapsedTileResolve =
-        IsCollapsedHorizontalTileResolve(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    if (collapsedTileResolve &&
-        !IsFirstCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1))
-        return true;
-
     ResolveSnapshot* snapshot = nullptr;
     if (!CreateSnapshot(key, surfW, surfH, snapshot) || !snapshot)
     {
@@ -7095,12 +5870,8 @@ bool ResolveRt1Surface(uint8_t* guestBase, const uint32_t* regs, uint32_t contro
     const bool sourceIsLive = backing->key == g_activeColorSurfaceKey ||
                               (g_activeColor1Enabled &&
                                backing->key == g_activeColor1SurfaceKey);
-    const bool multisampled = backing->samples != VK_SAMPLE_COUNT_1_BIT;
-    if (multisampled)
-        TransitionColorResolveBacking(*backing, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    else
-        TransitionColorBacking(*backing, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    const VkImage sourceImage = multisampled ? backing->resolveImage : backing->image;
+    TransitionColorBacking(*backing, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const VkImage sourceImage = backing->image;
 
     TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -7124,11 +5895,7 @@ bool ResolveRt1Surface(uint8_t* guestBase, const uint32_t* regs, uint32_t contro
     ReportResolve(regs, *snapshot);
     TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (sourceIsLive)
-    {
-        if (multisampled)
-            TransitionColorResolveBacking(*backing, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         TransitionColorBacking(*backing, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    }
     ResumeColorRendering();
     return true;
 }
@@ -7223,22 +5990,6 @@ bool ResolveColorSurface(uint8_t* guestBase, const uint32_t* regs)
 
     const bool clearColor = ((control >> 8) & 1u) != 0;
     const bool clearDepth = ((control >> 9) & 1u) != 0;
-    const bool collapsedTileResolve =
-        IsCollapsedHorizontalTileResolve(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    if (collapsedTileResolve &&
-        !IsFirstCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1))
-    {
-        if ((clearColor || clearDepth) &&
-            IsLastCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1))
-        {
-            if (!SwitchActiveColorSurface(regs[xenos::kRbSurfaceInfo], regs[xenos::kRbColorInfo]))
-                return false;
-            if (!ClearFullResolveAttachments(regs, clearColor, clearDepth))
-                return false;
-        }
-        return true;
-    }
-
     ResolveSnapshot* snapshot = nullptr;
     if (!CreateSnapshot(key, surfW, surfH, snapshot) || !snapshot)
     {
@@ -7265,23 +6016,7 @@ bool ResolveColorSurface(uint8_t* guestBase, const uint32_t* regs)
              regs[xenos::kRbSurfaceInfo], regs[xenos::kRbColorInfo],
              regs[xenos::kRbDepthInfo], regs[xenos::kPaScWindowOffset]);
     }
-    if (CollapseTiledDrawsEnabled() && g_sceneTilingLastIndexedFrame != 0 &&
-        surfW == g_extent.width && surfH == g_extent.height &&
-        y0 == 0 && y1 == surfH && (x0 == 0 || x0 == 416 || x0 == 832))
-    {
-        static uint32_t collapseResolveReports = 0;
-        if (collapseResolveReports++ < 96)
-            KLOG_DIAG("[collapse resolve] frame=%llu rect=%u..%u collapsed=%u first=%u last=%u "
-                 "copySrc=%d..%d copyDst=%d..%d extent=%ux%u lastIndexed=%llu\n",
-                 static_cast<unsigned long long>(g_frames.load(std::memory_order_relaxed) + 1),
-                 x0, x1, collapsedTileResolve ? 1u : 0u,
-                 IsFirstCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1) ? 1u : 0u,
-                 IsLastCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1) ? 1u : 0u,
-                 copy.srcOffset.x, copy.srcOffset.x + int32_t(copy.extent.width),
-                 copy.dstOffset.x, copy.dstOffset.x + int32_t(copy.extent.width),
-                 copy.extent.width, copy.extent.height,
-                 static_cast<unsigned long long>(g_sceneTilingLastIndexedFrame));
-    }    const uint64_t mapFrame = g_frames.load(std::memory_order_relaxed) + 1;
+    const uint64_t mapFrame = g_frames.load(std::memory_order_relaxed) + 1;
     if (mapFrame >= 390 && mapFrame <= 398)
     {
         KLOG_DIAG("PM4 color map frame=%llu dst=%u,%u size=%ux%u src=%d,%d "
@@ -7305,121 +6040,44 @@ bool ResolveColorSurface(uint8_t* guestBase, const uint32_t* regs)
     if (!MaterializeEdramOwnerForResolve(
             {EdramOwnerKind::Color, activeBacking->key}, dispatchFrame, "color0"))
         return false;
-    const bool sceneColorSnapshot = key == 0x0A63D000u || key == 0x09B75000u;
-    const bool stitchedSceneResolve =
-        IsStitchedHorizontalTileResolve(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    uint32_t sceneTileBit = 0;
-    if (stitchedSceneResolve)
-    {
-        if (copyX == 0)
-            sceneTileBit = 1;
-        else if (copyX == 416)
-            sceneTileBit = 2;
-        else if (copyX == 832)
-            sceneTileBit = 4;
-    }
-    const int sceneResolveMask = sceneColorSnapshot ? SceneColorResolveTileMask() : 7;
-    const bool skipSceneSnapshotCopy =
-        sceneColorSnapshot && sceneTileBit && (sceneResolveMask & int(sceneTileBit)) == 0;
+    TransitionColorBacking(*activeBacking, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.srcSubresource.layerCount = 1;
+    copy.dstSubresource = copy.srcSubresource;
+    const VkImageCopy internalCopy = ScaleImageCopyToInternal(copy);
+    p_vkCmdCopyImage(g_commandBuffer,
+                     activeBacking->image,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     snapshot->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     1, &internalCopy);
+    g_perfResolvePixels += uint64_t(copy.extent.width) * copy.extent.height;
+    const uint64_t resolveFrame = g_frames.load(std::memory_order_relaxed) + 1;
+    if (snapshot->frameSeen != resolveFrame)
+        ResetSnapshotCoverage(*snapshot);
+    snapshot->frameSeen = resolveFrame;
+    ++snapshot->copies;
+    const uint64_t n = g_resolveCopies.fetch_add(1, std::memory_order_relaxed) + 1;
+    snapshot->resolveSwap = (regs[xenos::kRbCopyDestInfo] & (1u << 24)) != 0;
 
-    uint64_t n = g_resolveCopies.load(std::memory_order_relaxed);
-    if (!skipSceneSnapshotCopy)
-    {
-        const bool multisampled = activeBacking->samples != VK_SAMPLE_COUNT_1_BIT;
-        if (multisampled)
-            TransitionColorResolveBacking(*activeBacking, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        else
-            TransitionColorBacking(*activeBacking, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copy.srcSubresource.layerCount = 1;
-        copy.dstSubresource = copy.srcSubresource;
-        const VkImageCopy internalCopy = ScaleImageCopyToInternal(copy);
-        p_vkCmdCopyImage(g_commandBuffer,
-                         multisampled ? activeBacking->resolveImage : activeBacking->image,
-                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                         snapshot->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         1, &internalCopy);
-        g_perfResolvePixels += uint64_t(copy.extent.width) * copy.extent.height;
-        const uint64_t resolveFrame = g_frames.load(std::memory_order_relaxed) + 1;
-        if (snapshot->frameSeen != resolveFrame)
-            ResetSnapshotCoverage(*snapshot);
-        snapshot->frameSeen = resolveFrame;
-        ++snapshot->copies;
-        n = g_resolveCopies.fetch_add(1, std::memory_order_relaxed) + 1;
-        snapshot->resolveSwap = (regs[xenos::kRbCopyDestInfo] & (1u << 24)) != 0;
+    MarkSnapshotCoverage(*snapshot,
+                         static_cast<uint32_t>(copy.dstOffset.x),
+                         static_cast<uint32_t>(copy.dstOffset.y),
+                         copy.extent.width, copy.extent.height);
 
-        MarkSnapshotCoverage(*snapshot,
-                             static_cast<uint32_t>(copy.dstOffset.x),
-                             static_cast<uint32_t>(copy.dstOffset.y),
-                             copy.extent.width, copy.extent.height);
-
-        ReportResolve(regs, *snapshot);
-        // For index-hash A/B diagnostics, synchronize the capture to rendering
-        // content rather than a host frame number. Once a selected mesh has been
-        // observed, the first complete scene-color resolve is the comparable
-        // evidence point for both the observe-only control and the skip run.
-        const uint64_t indexHashEvent = g_indexHashEventFrame.load(std::memory_order_relaxed);
-        if (sceneColorSnapshot && indexHashEvent && resolveFrame >= indexHashEvent &&
-            copy.dstOffset.x == 0 && copy.dstOffset.y == 0 &&
-            copy.extent.width == surfW && copy.extent.height == surfH)
-        {
-            uint64_t expected = 0;
-            if (g_indexHashCaptureFrame.compare_exchange_strong(
-                    expected, resolveFrame, std::memory_order_relaxed))
-            {
-                g_indexHashCaptureSnapshotKey.store(key, std::memory_order_relaxed);
-                KLOG("[index hash event] scene capture ready frame=%llu key=%08X eventFrame=%llu\n",
-                     static_cast<unsigned long long>(resolveFrame), key,
-                     static_cast<unsigned long long>(indexHashEvent));
-            }
-        }
-        // In collapse mode the title performs many guest 448-pixel resolves
-        // that the host expands to a full logical image. Those are intermediate
-        // feedback generations while the frame is still being built. Publish
-        // stable feedback only from the title's explicit final full-surface
-        // resolve, after scene geometry/effects have completed for this pass.
-        const bool finalFullSceneResolve =
-            sceneColorSnapshot && !collapsedTileResolve &&
-            copyX == 0 && copyY == 0 && copyX1 == surfW && copyY1 == surfH &&
-            copy.dstOffset.x == 0 && copy.dstOffset.y == 0 &&
-            copy.extent.width == surfW && copy.extent.height == surfH;
-        if (sceneColorSnapshot && StableSceneFeedbackEnabled() &&
-            (sceneTileBit == 4 || finalFullSceneResolve))
-        {
-            CommitSnapshotForSceneFeedback(*snapshot);
-        }
-        TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    }
-    else
-    {
-        static uint32_t reports = 0;
-        if (reports++ < 48)
-            KLOG("[scene resolve tile mask] frame=%llu key=%08X mask=%d tileBit=%u rect=%u..%u copy skipped\n",
-                 static_cast<unsigned long long>(g_frames.load(std::memory_order_relaxed) + 1),
-                 key, sceneResolveMask, sceneTileBit, copyX, copyX1);
-    }
+    ReportResolve(regs, *snapshot);
+    TransitionSnapshot(*snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (n <= 12)
         KLOG("Vulkan resolve copy #%llu: dest=%08X -> key=%08X tile=(%u,%u)-(%u,%u) "
              "surface=%ux%u frame=%llu\n",
              static_cast<unsigned long long>(n), dest, key, copyX, copyY, copyX1, copyY1,
              surfW, surfH, static_cast<unsigned long long>(snapshot->frameSeen));
 
-    if (activeBacking->samples != VK_SAMPLE_COUNT_1_BIT)
-        TransitionColorResolveBacking(*activeBacking, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     TransitionColorBacking(*activeBacking, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    const bool clearCollapsedTile =
-        !collapsedTileResolve || IsLastCollapsedHorizontalTile(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    const bool suppressStitchedWrapClear =
-        !collapsedTileResolve &&
-        SuppressStitchedWrapClear(surfW, surfH, copyX, copyY, copyX1, copyY1);
-    if ((clearColor || clearDepth) && clearCollapsedTile && !suppressStitchedWrapClear)
+    if (clearColor || clearDepth)
     {
-        const bool fullOverwrite = collapsedTileResolve;
-        if (!(fullOverwrite
-                  ? PrepareActiveEdramOwnersForFullOverwrite(clearColor, false, clearDepth)
-                  : PrepareActiveEdramOwnersForWrite(clearColor, false, clearDepth,
-                                                     "color-resolve-clear")))
+        if (!PrepareActiveEdramOwnersForWrite(clearColor, false, clearDepth,
+                                              "color-resolve-clear"))
             return false;
         ResumeColorRendering(false);
         std::array<VkClearAttachment, 2> attachments{};
@@ -7446,24 +6104,8 @@ bool ResolveColorSurface(uint8_t* guestBase, const uint32_t* regs)
                 DecodeDepthClearValue(regs[xenos::kRbDepthInfo], d);
             attachment.clearValue.depthStencil.stencil = d & 0xFFu;
         }
-        const bool stitchedTileResolve =
-            IsStitchedHorizontalTileResolve(surfW, surfH, copyX, copyY, copyX1, copyY1);
-        const bool physicalStitchedTile =
-            stitchedTileResolve && StitchPhysicalTileRasterEnabled();
-        VkRect2D clearRect = collapsedTileResolve
-            ? VkRect2D{{0, 0}, g_extent}
-            : physicalStitchedTile
-                ? VkRect2D{{copy.srcOffset.x, copy.srcOffset.y},
-                           {copy.extent.width, copy.extent.height}}
-            : stitchedTileResolve
-                ? VkRect2D{{static_cast<int32_t>(copyX), static_cast<int32_t>(copyY)},
-                           {copyX1 - copyX, copyY1 - copyY}}
-                : VkRect2D{{copy.srcOffset.x, copy.srcOffset.y},
-                           {copy.extent.width, copy.extent.height}};
-        VkRect2D stitchedClear{};
-        if (!collapsedTileResolve &&
-            StitchedNextTileClearRect(surfW, surfH, copyX, copyY, copyX1, copyY1, stitchedClear))
-            clearRect = stitchedClear;
+        const VkRect2D clearRect{{copy.srcOffset.x, copy.srcOffset.y},
+                                 {copy.extent.width, copy.extent.height}};
         g_perfClearRectPixels += uint64_t(clearRect.extent.width) * clearRect.extent.height;
         VkClearRect rect{};
         rect.rect = ScaleRectToInternal(clearRect);
@@ -7588,8 +6230,12 @@ bool CreateTextureDescriptors()
     // one-time submission completes before any guest command buffer is recorded.
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (p_vkBeginCommandBuffer(g_commandBuffer, &begin) != VK_SUCCESS)
+    const VkResult beginResult = p_vkBeginCommandBuffer(g_commandBuffer, &begin);
+    if (beginResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkBeginCommandBuffer", beginResult, "texture_descriptor_init");
         return false;
+    }
     ResetGraphicsCommandStateCache(g_commandBuffer);
     for (uint32_t dimension = 0; dimension < 3; ++dimension)
     {
@@ -7634,14 +6280,27 @@ bool CreateTextureDescriptors()
             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &b);
     }
-    if (p_vkEndCommandBuffer(g_commandBuffer) != VK_SUCCESS)
+    const VkResult endResult = p_vkEndCommandBuffer(g_commandBuffer);
+    if (endResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkEndCommandBuffer", endResult, "texture_descriptor_init");
         return false;
+    }
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &g_commandBuffer;
-    if (p_vkQueueSubmit(g_queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS ||
-        p_vkDeviceWaitIdle(g_device) != VK_SUCCESS)
+    const VkResult submitResult = p_vkQueueSubmit(g_queue, 1, &submit, VK_NULL_HANDLE);
+    if (submitResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkQueueSubmit", submitResult, "texture_descriptor_init");
         return false;
+    }
+    const VkResult waitIdleResult = p_vkDeviceWaitIdle(g_device);
+    if (waitIdleResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkDeviceWaitIdle", waitIdleResult, "texture_descriptor_init");
+        return false;
+    }
     KLOG("Vulkan texture ABI ready: sets=4 binding=0 slots=16 dummy=2D/3D/Cube neutralBlur=1x1\n");
     return true;
 }
@@ -7662,16 +6321,49 @@ uint64_t HashTextureBundle(const TextureBundle& bundle)
     return hash;
 }
 
+constexpr size_t kInvalidTextureBundleIndex = ~size_t{0};
+size_t g_lastTextureBundleIndex = kInvalidTextureBundleIndex;
+
+bool DescriptorAdjacentCacheEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOJORECOMP_DESCRIPTOR_ADJACENT_CACHE");
+        return value && *value && value[0] != '0';
+    }();
+    return enabled;
+}
+
 const TextureBundle* GetTextureBundle(const TextureBundle& wanted)
 {
+    ++g_perfDescriptorBundleRequests;
+    if (DescriptorAdjacentCacheEnabled() &&
+        g_lastTextureBundleIndex < g_textureBundles.size())
+    {
+        const auto& last = g_textureBundles[g_lastTextureBundleIndex];
+        if (last.views == wanted.views && last.samplers == wanted.samplers)
+        {
+            ++g_perfDescriptorAdjacentHits;
+            return &last;
+        }
+    }
+
+    const auto lookupStart = DetailedCpuTimerStart();
     const uint64_t hash = HashTextureBundle(wanted);
     const auto range = g_textureBundleLookup.equal_range(hash);
     for (auto it = range.first; it != range.second; ++it)
     {
         const auto& bundle = g_textureBundles[it->second];
         if (bundle.views == wanted.views && bundle.samplers == wanted.samplers)
+        {
+            DetailedCpuTimerAccumulate(lookupStart, g_perfDescriptorLookupNs);
+            ++g_perfDescriptorHashHits;
+            g_lastTextureBundleIndex = it->second;
             return &bundle;
+        }
     }
+    DetailedCpuTimerAccumulate(lookupStart, g_perfDescriptorLookupNs);
+    ++g_perfDescriptorMisses;
+
     // Never update a set already referenced by a recorded command buffer.
     // Pool exhaustion stays explicit; no descriptors silently alias slot zero.
     if (g_textureBundles.size() >= kDescriptorBundles)
@@ -7689,6 +6381,7 @@ const TextureBundle* GetTextureBundle(const TextureBundle& wanted)
     ai.pSetLayouts = g_textureLayouts;
     if (p_vkAllocateDescriptorSets(g_device, &ai, bundle.sets) != VK_SUCCESS)
         return nullptr;
+    g_perfDescriptorSetAllocations += ai.descriptorSetCount;
     VkDescriptorImageInfo images[4][kTextureSlots]{};
     VkWriteDescriptorSet writes[4]{};
     for (uint32_t set = 0; set < 4; ++set)
@@ -7710,8 +6403,11 @@ const TextureBundle* GetTextureBundle(const TextureBundle& wanted)
         writes[set].pImageInfo = images[set];
     }
     p_vkUpdateDescriptorSets(g_device, 4, writes, 0, nullptr);
+    ++g_perfDescriptorUpdateCalls;
+    g_perfDescriptorWrittenDescriptors += uint64_t(4) * kTextureSlots;
     g_textureBundles.push_back(bundle);
-    g_textureBundleLookup.emplace(hash, g_textureBundles.size() - 1);
+    g_lastTextureBundleIndex = g_textureBundles.size() - 1;
+    g_textureBundleLookup.emplace(hash, g_lastTextureBundleIndex);
     return &g_textureBundles.back();
 }
 
@@ -7853,31 +6549,6 @@ VkImageView GetSnapshotView(ResolveSnapshot& snapshot,
     if (p_vkCreateImageView(g_device, &vi, nullptr, &snapshot.bgraView) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     return snapshot.bgraView;
-}
-
-VkImageView GetSnapshotPresentView(ResolveSnapshot& snapshot,
-                                   const mojorecomp::texture_abi::Fetch2D& fetch)
-{
-    if (!snapshot.presentImage || !snapshot.presentValid)
-        return VK_NULL_HANDLE;
-    if (fetch.swizzle != 0x688u && fetch.swizzle != 0x60Au)
-        return VK_NULL_HANDLE;
-    const bool swap = (fetch.swizzle == 0x60Au) ^ snapshot.presentResolveSwap;
-    if (!swap)
-        return snapshot.presentView;
-    if (snapshot.presentBgraView)
-        return snapshot.presentBgraView;
-
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = snapshot.presentImage;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = snapshot.format;
-    vi.components = {VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G,
-                     VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_A};
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (p_vkCreateImageView(g_device, &vi, nullptr, &snapshot.presentBgraView) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
-    return snapshot.presentBgraView;
 }
 
 VkDeviceSize UploadAlloc(VkDeviceSize bytes, VkDeviceSize alignment = 16);
@@ -8046,6 +6717,28 @@ uint64_t HashGuestTextureSourceBytes(const uint8_t* data, size_t bytes)
     return hash;
 }
 
+uint64_t GuestTextureSourceFingerprint(uint8_t* guestBase, uint32_t address,
+                                       size_t bytes, bool& usedIdentity)
+{
+    mojorecomp::gpu::GuestMemoryIdentity identity{};
+    if (mojorecomp::gpu::GuestReadIdentity(address, bytes, identity))
+    {
+        usedIdentity = true;
+        uint64_t hash = identity.token ^ 0xD6E8FEB86659FD93ull;
+        hash ^= identity.offset + 0x9E3779B97F4A7C15ull + (hash << 6) + (hash >> 2);
+        hash ^= uint64_t(bytes) + 0xC2B2AE3D27D4EB4Full + (hash << 6) + (hash >> 2);
+        hash ^= hash >> 33;
+        hash *= 0xff51afd7ed558ccdull;
+        hash ^= hash >> 33;
+        hash *= 0xc4ceb9fe1a85ec53ull;
+        hash ^= hash >> 33;
+        return hash;
+    }
+
+    usedIdentity = false;
+    return HashGuestTextureSourceBytes(GuestReadPtr(guestBase, address, bytes), bytes);
+}
+
 struct GuestRgba8MipSource
 {
     uint32_t level = 0;
@@ -8062,12 +6755,15 @@ bool BuildGuestRgba8MipSources(uint8_t* guestBase,
                                uint32_t hostMipLevels,
                                std::array<GuestRgba8MipSource, 16>& sources,
                                uint32_t& sourceCount, bool& authoredMips,
-                               uint64_t& sourceHash, size_t& visibleBytes)
+                               uint64_t& sourceHash, size_t& visibleBytes,
+                               size_t& hashedBytes, bool& usedIdentity)
 {
     sourceCount = 0;
     authoredMips = false;
     sourceHash = 0x6A09E667F3BCC909ull;
     visibleBytes = 0;
+    hashedBytes = 0;
+    usedIdentity = false;
     if (!guestBase || !hostMipLevels || hostMipLevels > sources.size())
         return false;
 
@@ -8105,11 +6801,16 @@ bool BuildGuestRgba8MipSources(uint8_t* guestBase,
             if (bytes64 > SIZE_MAX || !GuestRangeOk(mip.address, bytes64))
                 return false;
             const size_t bytes = static_cast<size_t>(bytes64);
-            const uint64_t levelHash = HashGuestTextureSourceBytes(
-                guestBase + mip.address, bytes);
+            bool identityBacked = false;
+            const uint64_t levelHash = GuestTextureSourceFingerprint(
+                guestBase, mip.address, bytes, identityBacked);
             sourceHash ^= levelHash + 0x9E3779B97F4A7C15ull +
                           (sourceHash << 6) + (sourceHash >> 2);
             visibleBytes += bytes;
+            if (identityBacked)
+                usedIdentity = true;
+            else
+                hashedBytes += bytes;
             continue;
         }
         for (uint32_t y = 0; y < mip.height; ++y)
@@ -8119,11 +6820,16 @@ bool BuildGuestRgba8MipSources(uint8_t* guestBase,
             if (rowAddress > UINT32_MAX ||
                 !GuestRangeOk(uint32_t(rowAddress), rowBytes))
                 return false;
-            const uint64_t rowHash = HashGuestTextureSourceBytes(
-                guestBase + uint32_t(rowAddress), rowBytes);
+            bool identityBacked = false;
+            const uint64_t rowHash = GuestTextureSourceFingerprint(
+                guestBase, uint32_t(rowAddress), rowBytes, identityBacked);
             sourceHash ^= rowHash + 0x9E3779B97F4A7C15ull +
                           (sourceHash << 6) + (sourceHash >> 2);
             visibleBytes += rowBytes;
+            if (identityBacked)
+                usedIdentity = true;
+            else
+                hashedBytes += rowBytes;
         }
     }
     return true;
@@ -8164,7 +6870,9 @@ bool StageGuestRgba8MipSources(uint8_t* guestBase,
                 !GuestRangeOk(uint32_t(rowAddress), rowBytes))
                 return false;
             CopySwapped(g_uploadMapped + uploadAt + tightOffset + uint64_t(y) * rowBytes,
-                        guestBase + uint32_t(rowAddress), rowBytes, endian);
+                        GuestReadPtr(
+                            guestBase, uint32_t(rowAddress), rowBytes),
+                        rowBytes, endian);
         }
 
         VkBufferImageCopy copy{};
@@ -8362,7 +7070,9 @@ bool UpdateGuestR8MipTexture(
             const uint64_t rowAddress = address +
                 uint64_t(mip.offsetY + y) * mip.pitchPixels + mip.offsetX;
             std::memcpy(g_uploadMapped + uploadAt + tightOffset + uint64_t(y) * mip.width,
-                        guestBase + static_cast<uint32_t>(rowAddress), mip.width);
+                        GuestReadPtr(
+                            guestBase, static_cast<uint32_t>(rowAddress), mip.width),
+                        mip.width);
         }
         copies[i].bufferOffset = uploadAt + tightOffset;
         copies[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip.level, 0, 1};
@@ -8518,6 +7228,8 @@ GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
     const uint32_t mipBase = authoredMips ? PhysicalToCached(fetch.mipKey) : 0u;
     uint64_t sourceHash = 0xBB67AE8584CAA73Bull;
     size_t visibleSourceBytes = 0;
+    size_t hashedSourceBytes = 0;
+    bool usedSnapshotIdentity = false;
     size_t stagedBytes = 0;
     for (uint32_t i = 0; i < sourceCount; ++i)
     {
@@ -8538,22 +7250,38 @@ GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
             if (rowAddress > UINT32_MAX ||
                 !GuestRangeOk(static_cast<uint32_t>(rowAddress), rowBytes))
                 return nullptr;
-            const uint64_t rowHash = HashGuestTextureSourceBytes(
-                guestBase + static_cast<uint32_t>(rowAddress), rowBytes);
+            bool identityBacked = false;
+            const uint64_t rowHash = GuestTextureSourceFingerprint(
+                guestBase, static_cast<uint32_t>(rowAddress), rowBytes,
+                identityBacked);
             sourceHash ^= rowHash + 0x9E3779B97F4A7C15ull +
                           (sourceHash << 6) + (sourceHash >> 2);
             visibleSourceBytes += rowBytes;
+            if (identityBacked)
+                usedSnapshotIdentity = true;
+            else
+                hashedSourceBytes += rowBytes;
         }
     }
-    g_perfTextureHashBytesR8 += visibleSourceBytes;
-    ++g_perfTextureHashCallsR8;
+    g_perfTextureHashBytesR8 += hashedSourceBytes;
+    if (hashedSourceBytes)
+        ++g_perfTextureHashCallsR8;
+    if (usedSnapshotIdentity)
+    {
+        g_perfTextureIdentityBytes += visibleSourceBytes - hashedSourceBytes;
+        ++g_perfTextureIdentityCalls;
+    }
 
     if (existing)
     {
         if (hostMipLevels == 1u)
         {
             const uint32_t sourcePitch = fetch.pitch ? fetch.pitch : fetch.width;
-            const uint8_t* source = guestBase + baseAddress;
+            const size_t sourceSpan = fetch.height
+                ? size_t(fetch.height - 1u) * sourcePitch + fetch.width
+                : 0u;
+            const uint8_t* source = GuestReadPtr(
+                guestBase, baseAddress, sourceSpan);
             const size_t byteCount = size_t(fetch.width) * fetch.height;
             if (!UpdateGuestR8Texture(*existing, source, sourcePitch, byteCount, sourceHash))
                 return nullptr;
@@ -8591,7 +7319,9 @@ GuestTexture* CreateGuestR8Texture(uint8_t* guestBase,
             const uint64_t rowAddress = address +
                 uint64_t(mip.offsetY + y) * mip.pitchPixels + mip.offsetX;
             std::memcpy(g_uploadMapped + uploadAt + tightOffset + uint64_t(y) * mip.width,
-                        guestBase + static_cast<uint32_t>(rowAddress), mip.width);
+                        GuestReadPtr(
+                            guestBase, static_cast<uint32_t>(rowAddress), mip.width),
+                        mip.width);
         }
         copies[i].bufferOffset = uploadAt + tightOffset;
         copies[i].imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip.level, 0, 1};
@@ -8935,7 +7665,8 @@ GuestTexture* CreateGuestRGBA8Texture(uint8_t* guestBase,
                     const size_t probeBytes = static_cast<size_t>(std::min<uint64_t>(bytes, 4096));
                     size_t nonZero = 0;
                     uint64_t hash = 1469598103934665603ull;
-                    const uint8_t* src = guestBase + guestAddress;
+                    const uint8_t* src = GuestReadPtr(
+                        guestBase, guestAddress, probeBytes);
                     for (size_t i = 0; i < probeBytes; ++i)
                     {
                         nonZero += src[i] != 0;
@@ -8990,21 +7721,32 @@ GuestTexture* CreateGuestRGBA8Texture(uint8_t* guestBase,
     bool authoredMips = false;
     uint64_t sourceHash = 0;
     size_t visibleSourceBytes = 0;
+    size_t hashedSourceBytes = 0;
+    bool usedSnapshotIdentity = false;
     if (!BuildGuestRgba8MipSources(guestBase, fetch, hostMipLevels, mipSources,
                                    mipSourceCount, authoredMips, sourceHash,
-                                   visibleSourceBytes))
+                                   visibleSourceBytes, hashedSourceBytes,
+                                   usedSnapshotIdentity))
         return nullptr;
-    g_perfTextureHashBytesRGBA += visibleSourceBytes;
-    ++g_perfTextureHashCallsRGBA;
+    g_perfTextureHashBytesRGBA += hashedSourceBytes;
+    if (hashedSourceBytes)
+        ++g_perfTextureHashCallsRGBA;
+    if (usedSnapshotIdentity)
+    {
+        g_perfTextureIdentityBytes += visibleSourceBytes - hashedSourceBytes;
+        ++g_perfTextureIdentityCalls;
+    }
     if (authoredMips)
     {
-        g_perfTextureHashBytesRGBAAuthored += visibleSourceBytes;
-        ++g_perfTextureHashCallsRGBAAuthored;
+        g_perfTextureHashBytesRGBAAuthored += hashedSourceBytes;
+        if (hashedSourceBytes)
+            ++g_perfTextureHashCallsRGBAAuthored;
     }
     else
     {
-        g_perfTextureHashBytesRGBAGenerated += visibleSourceBytes;
-        ++g_perfTextureHashCallsRGBAGenerated;
+        g_perfTextureHashBytesRGBAGenerated += hashedSourceBytes;
+        if (hashedSourceBytes)
+            ++g_perfTextureHashCallsRGBAGenerated;
     }
     if (existing)
     {
@@ -9316,16 +8058,27 @@ GuestTexture* CreateGuestBlockCompressedTexture(
     if (!GuestRangeOk(guestAddress, sourceBytes64))
         return nullptr;
     const size_t byteCount = static_cast<size_t>(byteCount64);
-    const uint8_t* source = guestBase + guestAddress;
+    const uint8_t* source = GuestReadPtr(
+        guestBase, guestAddress, static_cast<size_t>(sourceBytes64));
     GuestTexture* existing = FindGuestTexture(fetch);
     const uint64_t currentFrame = g_frames.load(std::memory_order_relaxed) + 1;
     if (existing && existing->sourceCheckFrame == currentFrame)
         return existing;
 
-    g_perfTextureHashBytesBC1 += sourceBytes64;
-    ++g_perfTextureHashCallsBC1;
-    const uint64_t sourceHash =
-        HashGuestTextureSourceBytes(source, static_cast<size_t>(sourceBytes64));
+    bool usedSnapshotIdentity = false;
+    const uint64_t sourceHash = GuestTextureSourceFingerprint(
+        guestBase, guestAddress, static_cast<size_t>(sourceBytes64),
+        usedSnapshotIdentity);
+    if (usedSnapshotIdentity)
+    {
+        g_perfTextureIdentityBytes += sourceBytes64;
+        ++g_perfTextureIdentityCalls;
+    }
+    else
+    {
+        g_perfTextureHashBytesBC1 += sourceBytes64;
+        ++g_perfTextureHashCallsBC1;
+    }
     if (existing)
     {
         if (!UpdateGuestBlockCompressedTexture(
@@ -9463,7 +8216,8 @@ ResolveSnapshot* CreateZeroSnapshotFromGuestIfEmpty(
     // explicit EDRAM resolve. If the complete guest allocation is still zero,
     // tiling/endian layout cannot change the visible result: every texel is zero.
     // Materialize that exact initial state on the GPU instead of dropping the draw.
-    const uint8_t* src = guestBase + guestAddress;
+    const uint8_t* src = GuestReadPtr(
+        guestBase, guestAddress, static_cast<size_t>(byteCount));
     for (uint64_t i = 0; i < byteCount; ++i)
         if (src[i] != 0)
             return nullptr;
@@ -9486,131 +8240,6 @@ ResolveSnapshot* CreateZeroSnapshotFromGuestIfEmpty(
         KLOG("Vulkan zero-initialized tiled snapshot: key=%08X size=%ux%u\n",
              fetch.key, fetch.width, fetch.height);
     return snapshot;
-}
-
-bool BlurNeutralAuxEnabled()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_BLUR_NEUTRAL_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (!toggleFile.empty())
-    {
-        using Clock = std::chrono::steady_clock;
-        static Clock::time_point nextPoll{};
-        static bool enabled = false;
-        const auto now = Clock::now();
-        if (now >= nextPoll)
-        {
-            nextPoll = now + std::chrono::milliseconds(50);
-            std::ifstream input(toggleFile);
-            char value = '0';
-            if (input)
-                input >> value;
-            enabled = value != '0';
-        }
-        return enabled;
-    }
-
-    // Until the Xenos motion-vector RT1 path is reproduced exactly, sampling
-    // those auxiliary buffers creates large character halos/ghost trails. The
-    // neutral 1x1 inputs preserve the scene color and remove the invalid blur.
-    // Keep the original path available with MOJORECOMP_BLUR_NEUTRAL_AUX=0 for A/B.
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_BLUR_NEUTRAL_AUX");
-        return !value || !*value || value[0] != '0';
-    }();
-    return enabled;
-}
-
-bool BlurBypassEnabled()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_BLUR_BYPASS_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return false;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static bool enabled = false;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(50);
-        std::ifstream input(toggleFile);
-        char value = '0';
-        if (input)
-            input >> value;
-        enabled = value != '0';
-    }
-    return enabled;
-}
-
-bool SceneColorFeedbackNeutralEnabled()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SCENE_FEEDBACK_NEUTRAL_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return false;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static bool enabled = false;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(50);
-        std::ifstream input(toggleFile);
-        char value = '0';
-        if (input)
-            input >> value;
-        enabled = value != '0';
-    }
-    return enabled;
-}
-
-int SceneColorFeedbackConsumerNeutralMask()
-{
-    static const std::string maskFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SCENE_FEEDBACK_CONSUMER_MASK_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (maskFile.empty())
-        return 0;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mask = 0;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(maskFile);
-        int next = 0;
-        if (input)
-            input >> next;
-        mask = std::clamp(next, 0, 31);
-    }
-    return mask;
-}
-
-uint32_t SceneColorFeedbackConsumerBit(uint64_t vsHash, uint64_t psHash)
-{
-    if (vsHash == 0x1D72F92BDA785FDCull && psHash == 0xD6806DE1D0BFDE01ull)
-        return 1u;  // water specular
-    if (vsHash == 0x0F3237C46D3AC46Bull && psHash == 0x06996E20CC9E1124ull)
-        return 2u;  // water distort
-    if (vsHash == 0xF64FC44269F1E70Eull && psHash == 0x22EC5BCABF84EFF7ull)
-        return 4u;
-    if (vsHash == 0xD589CC02813C1884ull && psHash == 0x80428150BC1ED3ABull)
-        return 8u;
-    if (vsHash == 0x821F51E34929F4DDull && psHash == 0x89B4E4C8E904ABD5ull)
-        return 16u;
-    return 0u;
 }
 
 bool SceneColorFeedbackTraceEnabled()
@@ -9636,335 +8265,6 @@ bool SceneColorFeedbackTraceEnabled()
         enabled = value != '0';
     }
     return enabled;
-}
-
-int SceneColorFeedbackSamplerMode()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SCENE_FEEDBACK_SAMPLER_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return -1;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int mode = -1;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(50);
-        std::ifstream input(toggleFile);
-        int next = -1;
-        if (input)
-            input >> next;
-        mode = (next >= 0 && next <= 2) ? next : -1;
-    }
-    return mode;
-}
-
-int DiagnosticEffectDummySlot()
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_EFFECT_DUMMY_SLOT_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return -1;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static int slot = -1;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(50);
-        std::ifstream input(toggleFile);
-        int next = -1;
-        if (input)
-            input >> next;
-        slot = (next >= 0 && next < int(kTextureSlots)) ? next : -1;
-    }
-    return slot;
-}
-
-bool DiagnosticSkipShaderPair(uint64_t vsHash, uint64_t psHash)
-{
-    static const std::string toggleFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SKIP_PS_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (toggleFile.empty())
-        return false;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    // Diagnostic selector accepts up to two comma-separated entries so a
-    // screen-space pass (for example the pause blur) can be removed while a
-    // second shader pair is isolated in the exact same frame.  Each entry is
-    // either PS or VS:PS, preserving the original single-entry syntax.
-    static std::array<uint64_t, 32> skippedVs{};
-    static std::array<uint64_t, 32> skippedPs{};
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(50);
-        std::ifstream input(toggleFile);
-        std::string value;
-        if (input)
-            input >> value;
-
-        std::array<uint64_t, 32> nextVs{};
-        std::array<uint64_t, 32> nextPs{};
-        size_t tokenBegin = 0;
-        for (size_t selector = 0; selector < nextPs.size() && tokenBegin < value.size(); ++selector)
-        {
-            const size_t comma = value.find(',', tokenBegin);
-            const std::string token = value.substr(
-                tokenBegin, comma == std::string::npos ? std::string::npos : comma - tokenBegin);
-            tokenBegin = comma == std::string::npos ? value.size() : comma + 1;
-            if (token.empty() || token == "0")
-                continue;
-
-            const size_t colon = token.find(':');
-            if (colon == std::string::npos)
-            {
-                char* end = nullptr;
-                nextPs[selector] = std::strtoull(token.c_str(), &end, 16);
-                if (end == token.c_str())
-                    nextPs[selector] = 0;
-            }
-            else
-            {
-                const std::string vsText = token.substr(0, colon);
-                const std::string psText = token.substr(colon + 1);
-                char* vsEnd = nullptr;
-                char* psEnd = nullptr;
-                nextVs[selector] = std::strtoull(vsText.c_str(), &vsEnd, 16);
-                nextPs[selector] = std::strtoull(psText.c_str(), &psEnd, 16);
-                if (vsEnd == vsText.c_str() || psEnd == psText.c_str())
-                    nextVs[selector] = nextPs[selector] = 0;
-            }
-        }
-        if (nextVs != skippedVs || nextPs != skippedPs)
-        {
-            skippedVs = nextVs;
-            skippedPs = nextPs;
-            KLOG("[shader isolate] skip0 VS=%016llX PS=%016llX skip1 VS=%016llX PS=%016llX\n",
-                 static_cast<unsigned long long>(skippedVs[0]),
-                 static_cast<unsigned long long>(skippedPs[0]),
-                 static_cast<unsigned long long>(skippedVs[1]),
-                 static_cast<unsigned long long>(skippedPs[1]));
-        }
-    }
-    for (size_t selector = 0; selector < skippedPs.size(); ++selector)
-        if (skippedPs[selector] && psHash == skippedPs[selector] &&
-            (!skippedVs[selector] || vsHash == skippedVs[selector]))
-            return true;
-    return false;
-}
-
-bool DiagnosticSkipIndexHash(uint64_t vsHash, uint64_t psHash,
-                             const Pm4Draw& draw, const uint32_t* regs,
-                             const uint8_t* base)
-{
-    constexpr uint64_t kMainVs = 0xD589CC02813C1884ull;
-    constexpr uint64_t kMainPs = 0x80428150BC1ED3ABull;
-    if (vsHash != kMainVs || psHash != kMainPs || !draw.indexed ||
-        !draw.indexVa || !base)
-        return false;
-
-    static const std::string selectorFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SKIP_INDEX_HASH_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (selectorFile.empty())
-        return false;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static std::vector<uint64_t> selectedHashes;
-    static bool skipMatches = true;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(selectorFile);
-        std::string value((std::istreambuf_iterator<char>(input)),
-                          std::istreambuf_iterator<char>());
-        for (char& c : value)
-            if (c == ',' || c == ';' || c == '|')
-                c = ' ';
-
-        std::vector<uint64_t> parsedHashes;
-        bool parsedSkipMatches = true;
-        std::istringstream tokens(value);
-        std::string token;
-        while (tokens >> token)
-        {
-            if (token == "observe" || token == "trace")
-            {
-                parsedSkipMatches = false;
-                continue;
-            }
-            if (token == "off" || token == "-1" || token == "0")
-                continue;
-            char* end = nullptr;
-            const uint64_t parsed = std::strtoull(token.c_str(), &end, 16);
-            if (end != token.c_str() && *end == '\0' && parsed &&
-                std::find(parsedHashes.begin(), parsedHashes.end(), parsed) == parsedHashes.end())
-                parsedHashes.push_back(parsed);
-        }
-        selectedHashes = std::move(parsedHashes);
-        skipMatches = parsedSkipMatches;
-    }
-    if (selectedHashes.empty())
-        return false;
-
-    const uint64_t indexBytes = uint64_t(draw.indexCount) * (draw.index32 ? 4u : 2u);
-    const uint64_t readBytes = !draw.index32 && (draw.indexEndian & 3u) == 2u
-                                   ? ((indexBytes + 3u) & ~3ull)
-                                   : indexBytes;
-    if (!GuestRangeOk(draw.indexVa, readBytes))
-        return false;
-    const uint64_t hash = HashGuestTextureBytes(base + draw.indexVa,
-                                                 static_cast<size_t>(readBytes));
-    if (std::find(selectedHashes.begin(), selectedHashes.end(), hash) == selectedHashes.end())
-        return false;
-
-    static const bool captureOnMatch = [] {
-        const char* value = std::getenv("MOJORECOMP_CAPTURE_ON_INDEX_HASH");
-        return value && value[0] && value[0] != '0';
-    }();
-    static const uint64_t captureAfterFrame = [] {
-        const char* value = std::getenv("MOJORECOMP_INDEX_HASH_EVENT_AFTER_FRAME");
-        if (!value || !*value)
-            return uint64_t{0};
-        char* end = nullptr;
-        const unsigned long long parsed = std::strtoull(value, &end, 10);
-        return end != value ? static_cast<uint64_t>(parsed) : uint64_t{0};
-    }();
-    const uint64_t frame = g_frames.load(std::memory_order_relaxed) + 1;
-    if (captureOnMatch && frame >= captureAfterFrame)
-    {
-        uint64_t expected = 0;
-        if (g_indexHashEventFrame.compare_exchange_strong(
-                expected, frame, std::memory_order_relaxed))
-        {
-            KLOG("[index hash event] armed frame=%llu count=%u hash=%016llX skip=%u\n",
-                 static_cast<unsigned long long>(frame), draw.indexCount,
-                 static_cast<unsigned long long>(hash), skipMatches ? 1u : 0u);
-        }
-    }
-
-    static uint32_t reports = 0;
-    if (reports++ < 12)
-    {
-        uint64_t textureHash = 0;
-        uint32_t textureKey = 0;
-        const uint32_t* raw = regs + xenos::kFetchConstantBase;
-        const auto fetch = mojorecomp::texture_abi::Decode(raw);
-        const uint32_t pitch = fetch.pitch ? fetch.pitch : fetch.width;
-        const uint64_t sourceBytes = uint64_t(pitch) * fetch.height * 4u;
-        const uint32_t guestAddress = PhysicalToCached(fetch.key);
-        if (fetch.type == 2 && fetch.dimension == 1 && fetch.format == 6 &&
-            !fetch.tiled && pitch >= fetch.width &&
-            GuestRangeOk(guestAddress, sourceBytes))
-        {
-            textureKey = fetch.key;
-            textureHash = HashGuestTextureBytes(base + guestAddress,
-                                                static_cast<size_t>(sourceBytes));
-        }
-        KLOG("[draw index hash] matched frame=%llu count=%u hash=%016llX skip=%u "
-             "texKey=%08X texHash=%016llX\n",
-             static_cast<unsigned long long>(frame), draw.indexCount,
-             static_cast<unsigned long long>(hash), skipMatches ? 1u : 0u,
-             textureKey, static_cast<unsigned long long>(textureHash));
-    }
-    return skipMatches;
-}
-
-bool DiagnosticSkipTextureContentHash(const ShaderModuleRec& vs,
-                                      const ShaderModuleRec& ps,
-                                      const uint32_t* regs)
-{
-    static const std::string selectorFile = [] {
-        const char* value = std::getenv("MOJORECOMP_SKIP_TEXTURE_HASH_FILE");
-        return value ? std::string(value) : std::string{};
-    }();
-    if (selectorFile.empty())
-        return false;
-
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point nextPoll{};
-    static std::vector<uint64_t> selectedHashes;
-    static bool skipMatches = true;
-    const auto now = Clock::now();
-    if (now >= nextPoll)
-    {
-        nextPoll = now + std::chrono::milliseconds(20);
-        std::ifstream input(selectorFile);
-        std::string value((std::istreambuf_iterator<char>(input)),
-                          std::istreambuf_iterator<char>());
-        for (char& c : value)
-            if (c == ',' || c == ';' || c == '|')
-                c = ' ';
-
-        std::vector<uint64_t> parsedHashes;
-        bool parsedSkipMatches = true;
-        std::istringstream tokens(value);
-        std::string token;
-        while (tokens >> token)
-        {
-            if (token == "observe" || token == "trace")
-            {
-                parsedSkipMatches = false;
-                continue;
-            }
-            if (token == "off" || token == "-1" || token == "0")
-                continue;
-            char* end = nullptr;
-            const uint64_t parsed = std::strtoull(token.c_str(), &end, 16);
-            if (end != token.c_str() && *end == '\0' && parsed &&
-                std::find(parsedHashes.begin(), parsedHashes.end(), parsed) == parsedHashes.end())
-                parsedHashes.push_back(parsed);
-        }
-        selectedHashes = std::move(parsedHashes);
-        skipMatches = parsedSkipMatches;
-    }
-    if (selectedHashes.empty())
-        return false;
-
-    std::array<bool, kTextureSlots> checked{};
-    for (const ShaderModuleRec* shader : {&vs, &ps})
-    {
-        if (!shader->usesTextures)
-            continue;
-        for (uint32_t slot : shader->textureSlots)
-        {
-            if (slot >= kTextureSlots || checked[slot])
-                continue;
-            checked[slot] = true;
-            const uint32_t* raw = regs + xenos::kFetchConstantBase + slot * 6;
-            const auto fetch = mojorecomp::texture_abi::Decode(raw);
-            GuestTexture* texture = FindGuestTexture(fetch);
-            if (!texture || !texture->sourceHash)
-                continue;
-            if (std::find(selectedHashes.begin(), selectedHashes.end(), texture->sourceHash) ==
-                selectedHashes.end())
-                continue;
-
-            static uint32_t reports = 0;
-            if (reports++ < 32)
-                KLOG("[draw texture hash] matched frame=%llu slot=%u key=%08X hash=%016llX skip=%u\n",
-                     static_cast<unsigned long long>(g_frames.load(std::memory_order_relaxed) + 1),
-                     slot, texture->key,
-                     static_cast<unsigned long long>(texture->sourceHash),
-                     skipMatches ? 1u : 0u);
-            return skipMatches;
-        }
-    }
-    return false;
 }
 
 const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
@@ -10038,15 +8338,6 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                     KLOG("[front pass] slot=%u source=dummy-disabled\n", slot);
                 continue;
             }
-            if (probeEffectPass && DiagnosticEffectDummySlot() == int(slot))
-            {
-                wanted.views[slot] = g_dummyTextures[0].view;
-                wanted.samplers[slot] = GetSnapshotSampler(fetch);
-                if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("effect-dummy-view-or-sampler", slot);
-                if (reportFrontPass)
-                    KLOG("[front pass] slot=%u source=dummy-effect-diagnostic\n", slot);
-                continue;
-            }
             // Guest memory is routinely aliased between D24S8 and D24FS8. Keep
             // both host images alive for the same guest address and select the
             // variant described by the fetch instead of whichever snapshot was
@@ -10080,21 +8371,6 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                 snapshot = FindSnapshot(fetch.key);
             const bool sceneColorFeedback =
                 fetch.key == 0x0A63D000u || fetch.key == 0x09B75000u;
-            const int sceneFeedbackSamplerMode = sceneColorFeedback
-                ? SceneColorFeedbackSamplerMode() : -1;
-            const uint32_t sceneFeedbackConsumerBit = sceneColorFeedback
-                ? SceneColorFeedbackConsumerBit(vs.hash, ps.hash) : 0u;
-            const bool neutralSceneFeedbackConsumer = sceneFeedbackConsumerBit &&
-                ((SceneColorFeedbackConsumerNeutralMask() & int(sceneFeedbackConsumerBit)) != 0);
-            // The final/front composition pass also samples the scene-color
-            // resolve, but it must see the live snapshot. Feeding the stable
-            // history image back into that pass can black out/freeze the final
-            // frame. Stable history is only for intermediate scene-feedback
-            // consumers such as water/refraction.
-            const bool stableSceneFeedback = sceneColorFeedback && !probeFrontPass &&
-                (sceneFeedbackConsumerBit & 3u) != 0u && StableSceneFeedbackEnabled() &&
-                snapshot && snapshot->presentValid && snapshot->presentImage && snapshot->presentView &&
-                snapshot->presentLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             if (SceneColorFeedbackTraceEnabled() &&
                 sceneColorFeedback)
             {
@@ -10107,24 +8383,17 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                      fetch.minFilter, fetch.magFilter, fetch.clampX, fetch.clampY,
                      raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
             }
-            if ((SceneColorFeedbackNeutralEnabled() || neutralSceneFeedbackConsumer) &&
-                sceneColorFeedback)
-            {
-                wanted.views[slot] = g_dummyTextures[0].view;
-                wanted.samplers[slot] = GetSnapshotSampler(fetch, sceneFeedbackSamplerMode);
-                if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("scene-feedback-dummy-view-or-sampler", slot);
-                if (reportFrontPass)
-                    KLOG("[front pass] slot=%u source=dummy-scene-feedback key=%08X consumerBit=%u\n",
-                         slot, fetch.key, sceneFeedbackConsumerBit);
-                continue;
-            }
-            if (probeFrontPass && BlurNeutralAuxEnabled() && (slot == 2 || slot == 3))
+            // The validated COT front-composition path requires neutral auxiliary
+            // blur inputs until the title's Xenos motion-vector RT1 behavior is
+            // reproduced exactly. Keep this as one definitive runtime policy,
+            // not a live A/B toggle.
+            if (probeFrontPass && (slot == 2 || slot == 3))
             {
                 wanted.views[slot] = g_neutralBlurTexture.view;
                 wanted.samplers[slot] = GetSnapshotSampler(fetch);
                 if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("blur-dummy-view-or-sampler", slot);
                 if (reportFrontPass)
-                    KLOG("[front pass] slot=%u source=neutral-1x1 diagnostic\n", slot);
+                    KLOG("[front pass] slot=%u source=neutral-1x1 blur auxiliary\n", slot);
                 continue;
             }
             const bool basicSnapshotFetch = fetch.type == 2 && fetch.dimension == 1 &&
@@ -10144,16 +8413,13 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
                 basicSnapshotFetch && (colorSnapshotFetch || depthSnapshotFetch);
             if (snapshotCompatible)
             {
-                wanted.views[slot] = stableSceneFeedback
-                    ? GetSnapshotPresentView(*snapshot, fetch)
-                    : GetSnapshotView(*snapshot, fetch);
-                wanted.samplers[slot] = GetSnapshotSampler(fetch, sceneFeedbackSamplerMode);
+                wanted.views[slot] = GetSnapshotView(*snapshot, fetch);
+                wanted.samplers[slot] = GetSnapshotSampler(fetch);
                 if (!wanted.views[slot] || !wanted.samplers[slot]) return fail("snapshot-view-or-sampler", slot);
-                if (!stableSceneFeedback)
-                    sampled[slot] = snapshot;
+                sampled[slot] = snapshot;
                 if (reportFrontPass)
-                    KLOG("[front pass] slot=%u source=%s key=%08X copies=%llu depth=%u\n",
-                         slot, stableSceneFeedback ? "snapshot-stable-scene" : "snapshot-compatible",
+                    KLOG("[front pass] slot=%u source=snapshot-compatible key=%08X copies=%llu depth=%u\n",
+                         slot,
                          snapshot->key, static_cast<unsigned long long>(snapshot->copies),
                          snapshot->depth ? 1u : 0u);
                 continue;
@@ -10226,7 +8492,7 @@ const TextureBundle* PrepareTextures(uint8_t* guestBase, const uint32_t* regs,
             }
             sampled[slot] = snapshot;
             wanted.views[slot] = snapshot->view;
-            wanted.samplers[slot] = GetSnapshotSampler(fetch, sceneFeedbackSamplerMode);
+            wanted.samplers[slot] = GetSnapshotSampler(fetch);
             if (!wanted.samplers[slot]) return fail("generic-snapshot-sampler", slot);
             if (reportFrontPass)
                 KLOG("[front pass] slot=%u source=snapshot-generic key=%08X copies=%llu depth=%u\n",
@@ -11676,113 +9942,33 @@ bool DrawDebugOverlay(uint32_t imageIndex, VkImageLayout currentLayout)
     return true;
 }
 
-long JsonIntField(std::string_view obj, const char* key, long fallback)
+bool PopulateShaderModuleMetadata(const MojoTranslatedShader& translated,
+                                  ShaderModuleRec& rec)
 {
-    const std::string needle = std::string("\"") + key + "\"";
-    size_t p = obj.find(needle);
-    if (p == std::string_view::npos)
-        return fallback;
-    p = obj.find(':', p + needle.size());
-    if (p == std::string_view::npos)
-        return fallback;
-    ++p;
-    while (p < obj.size() && (obj[p] == ' ' || obj[p] == '\r' || obj[p] == '\n' || obj[p] == '\t'))
-        ++p;
-    bool neg = false;
-    if (p < obj.size() && obj[p] == '-')
-    {
-        neg = true;
-        ++p;
-    }
-    long v = 0;
-    bool any = false;
-    while (p < obj.size() && obj[p] >= '0' && obj[p] <= '9')
-    {
-        any = true;
-        v = v * 10 + (obj[p++] - '0');
-    }
-    return any ? (neg ? -v : v) : fallback;
-}
-
-bool JsonArrayNonEmpty(const std::string& text, const char* key)
-{
-    const std::string needle = std::string("\"") + key + "\"";
-    const size_t p = text.find(needle);
-    if (p == std::string::npos)
+    mojorecomp::gpu::ShaderMetadata metadata{};
+    if (!mojorecomp::gpu::ParseShaderMetadata(
+            translated.metaJson, translated.type, metadata))
         return false;
-    const size_t a = text.find('[', p);
-    const size_t b = a == std::string::npos ? std::string::npos : text.find(']', a);
-    if (a == std::string::npos || b == std::string::npos)
-        return false;
-    for (size_t i = a + 1; i < b; ++i)
-        if (text[i] != ' ' && text[i] != '\r' && text[i] != '\n' && text[i] != '\t')
-            return true;
-    return false;
-}
+    rec.textureSlots = std::move(metadata.textureSlots);
+    rec.textureDimensions = std::move(metadata.textureDimensions);
+    rec.aluConsts = std::move(metadata.aluConsts);
+    rec.attributes = std::move(metadata.attributes);
+    rec.aluDynamic = metadata.aluDynamic;
+    rec.usesTextures = !rec.textureSlots.empty();
+    rec.usesAlu = !rec.aluConsts.empty() || rec.aluDynamic;
+    if (rec.type != 1)
+        return true;
 
-std::vector<uint32_t> JsonUintArray(const std::string& text, const char* key)
-{
-    std::vector<uint32_t> values;
-    size_t at = text.find(std::string("\"") + key + "\"");
-    if (at == std::string::npos || (at = text.find('[', at)) == std::string::npos)
-        return values;
-    ++at;
-    while (at < text.size())
+    rec.writesDepth = translated.hlsl.find("SV_Depth") != std::string::npos;
+    for (uint32_t target = 0; target < 4; ++target)
     {
-        while (at < text.size() && (text[at] == ' ' || text[at] == '\n' ||
-               text[at] == '\r' || text[at] == '\t')) ++at;
-        if (at < text.size() && text[at] == ']') return values;
-        uint32_t value = 0;
-        const size_t start = at;
-        while (at < text.size() && text[at] >= '0' && text[at] <= '9')
-        {
-            if (value > 1000) return {};
-            value = value * 10 + uint32_t(text[at++] - '0');
-        }
-        if (at == start) return {};
-        values.push_back(value);
-        while (at < text.size() && (text[at] == ' ' || text[at] == '\n' ||
-               text[at] == '\r' || text[at] == '\t')) ++at;
-        if (at < text.size() && text[at] == ']') return values;
-        if (at == text.size() || text[at++] != ',') return {};
+        const std::string semantic = "SV_Target" + std::to_string(target);
+        if (translated.hlsl.find(semantic) != std::string::npos)
+            rec.colorOutputMask |= 1u << target;
     }
-    return {};
-}
-
-void ParseShaderMeta(const std::string& text, ShaderModuleRec& out)
-{
-    out.usesTextures = JsonArrayNonEmpty(text, "tfetchConsts");
-    out.textureSlots = JsonUintArray(text, "tfetchConsts");
-    out.textureDimensions = JsonUintArray(text, "tfetchDims");
-    out.aluConsts = JsonUintArray(text, "aluConsts");
-    out.aluDynamic = text.find("\"aluDynamic\": true") != std::string::npos;
-    out.usesAlu = !out.aluConsts.empty() || out.aluDynamic;
-    const size_t at = text.find("\"attributes\"");
-    if (at == std::string::npos)
-        return;
-    const size_t arrayEnd = text.find(']', at);
-    size_t cursor = text.find('[', at);
-    while (cursor != std::string::npos && cursor < arrayEnd)
-    {
-        const size_t open = text.find('{', cursor);
-        if (open == std::string::npos || open > arrayEnd)
-            break;
-        const size_t close = text.find('}', open);
-        if (close == std::string::npos || close > arrayEnd)
-            break;
-        const std::string_view obj(text.data() + open, close - open + 1);
-        VertexAttribute a;
-        a.location = static_cast<int32_t>(JsonIntField(obj, "location", -1));
-        a.fetchSlot = static_cast<uint32_t>(JsonIntField(obj, "fetchSlot", 0));
-        a.format = static_cast<uint32_t>(JsonIntField(obj, "format", 0));
-        a.isSigned = static_cast<uint32_t>(JsonIntField(obj, "signed", 0));
-        a.isInteger = static_cast<uint32_t>(JsonIntField(obj, "integer", 0));
-        a.strideDwords = static_cast<uint32_t>(JsonIntField(obj, "strideDwords", 0));
-        a.offsetDwords = static_cast<uint32_t>(JsonIntField(obj, "offsetDwords", 0));
-        a.indirect = static_cast<uint32_t>(JsonIntField(obj, "indirect", 0));
-        out.attributes.push_back(a);
-        cursor = close + 1;
-    }
+    if (!rec.colorOutputMask)
+        rec.colorOutputMask = 1u;
+    return true;
 }
 
 ShaderModuleRec* GetModule(uint32_t type, uint64_t hash)
@@ -11802,16 +9988,13 @@ ShaderModuleRec* GetModule(uint32_t type, uint64_t hash)
     rec.hash = hash;
     if (p_vkCreateShaderModule(g_device, &ci, nullptr, &rec.module) != VK_SUCCESS)
         return nullptr;
-    ParseShaderMeta(translated->metaJson, rec);
+    if (!PopulateShaderModuleMetadata(*translated, rec))
+    {
+        p_vkDestroyShaderModule(g_device, rec.module, nullptr);
+        return nullptr;
+    }
     if (type == 1)
     {
-        rec.writesDepth = translated->hlsl.find("SV_Depth") != std::string::npos;
-        for (uint32_t target = 0; target < 4; ++target)
-        {
-            const std::string semantic = "SV_Target" + std::to_string(target);
-            if (translated->hlsl.find(semantic) != std::string::npos)
-                rec.colorOutputMask |= 1u << target;
-        }
         // A successfully translated color pixel shader historically always had
         // Target0. Keep that behavior if a translator spelling ever changes, but
         // report real MRT exports when they are present so the host can bind RT1.
@@ -11823,121 +10006,6 @@ ShaderModuleRec* GetModule(uint32_t type, uint64_t hash)
     }
     g_modules.push_back(std::move(rec));
     return &g_modules.back();
-}
-
-VkShaderModule GetFloat24DepthModule(ShaderModuleRec& ps)
-{
-    if (ps.type != 1)
-        return VK_NULL_HANDLE;
-    if (ps.float24DepthModule)
-        return ps.float24DepthModule;
-    if (ps.float24DepthModuleAttempted)
-        return VK_NULL_HANDLE;
-    ps.float24DepthModuleAttempted = true;
-
-    const MojoTranslatedShader* translated = ShaderCache_Find(1, ps.hash);
-    if (!translated || translated->hlsl.empty())
-        return VK_NULL_HANDLE;
-
-    std::string hlsl = "#define MOJORECOMP_FLOAT24_DEPTH 1\n";
-    hlsl += translated->hlsl;
-    std::vector<uint8_t> spirv;
-    std::string err;
-    if (!ShaderTranslator::CompileHostHlsl(hlsl, false, spirv, err))
-    {
-        KLOG("Vulkan float24 depth PS compile failed PS=%016llX: %s\n",
-             static_cast<unsigned long long>(ps.hash), err.c_str());
-        return VK_NULL_HANDLE;
-    }
-
-    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    ci.codeSize = spirv.size();
-    ci.pCode = reinterpret_cast<const uint32_t*>(spirv.data());
-    if (p_vkCreateShaderModule(g_device, &ci, nullptr,
-                              &ps.float24DepthModule) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
-
-    KLOG("Vulkan float24 depth PS variant ready: PS=%016llX explicitDepth=%u\n",
-         static_cast<unsigned long long>(ps.hash), ps.writesDepth ? 1u : 0u);
-    return ps.float24DepthModule;
-}
-
-VkShaderModule GetFloat24DepthOnlyModule()
-{
-    if (g_float24DepthOnlyPs)
-        return g_float24DepthOnlyPs;
-    if (g_float24DepthOnlyPsAttempted)
-        return VK_NULL_HANDLE;
-    g_float24DepthOnlyPsAttempted = true;
-
-    static constexpr const char* kPs = R"(
-float MojoQuantizeFloat24Depth(float hostDepth)
-{
-    uint f32 = asuint(saturate(hostDepth * 2.0f));
-    uint f24;
-    if (f32 < 0x38800000u)
-    {
-        uint shift = min(113u - (f32 >> 23u), 24u);
-        f24 = ((f32 & 0x7FFFFFu) | 0x800000u) >> shift;
-    }
-    else
-    {
-        f24 = f32 + 0xC8000000u;
-    }
-    f24 += 3u + ((f24 >> 3u) & 1u);
-    f24 = (f24 >> 3u) & 0xFFFFFFu;
-    if (f24 == 0u)
-        return 0.0f;
-
-    uint mantissa = f24 & 0xFFFFFu;
-    int exponent = int(f24 >> 20u);
-    if (exponent == 0)
-    {
-        int highest = firstbithigh(mantissa);
-        uint shift = uint(20 - highest);
-        exponent = 1 - int(shift);
-        mantissa = (mantissa << shift) & 0xFFFFFu;
-    }
-    float guestDepth = asfloat((uint(exponent + 112) << 23u) | (mantissa << 3u));
-    return guestDepth * 0.5f;
-}
-
-float main(sample float4 position : SV_Position) : SV_Depth
-{
-    return MojoQuantizeFloat24Depth(position.z);
-}
-)";
-
-    std::vector<uint8_t> spirv;
-    std::string err;
-    if (!ShaderTranslator::CompileHostHlsl(kPs, false, spirv, err))
-    {
-        KLOG("Vulkan DepthOnly float24 PS compile failed: %s\n", err.c_str());
-        return VK_NULL_HANDLE;
-    }
-
-    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    ci.codeSize = spirv.size();
-    ci.pCode = reinterpret_cast<const uint32_t*>(spirv.data());
-    if (p_vkCreateShaderModule(g_device, &ci, nullptr, &g_float24DepthOnlyPs) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
-
-    KLOG("Vulkan DepthOnly float24 PS ready (guest pixel shader bypassed)\n");
-    return g_float24DepthOnlyPs;
-}
-
-bool UseFloat24DepthShader(uint32_t depthControl, bool depthFloat24,
-                           VkSampleCountFlagBits samples)
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOJORECOMP_FLOAT24_DEPTH_PS");
-        return value && value[0] && value[0] != '0';
-    }();
-    if (!enabled || (depthControl & (1u << 1)) == 0 || !depthFloat24)
-        return false;
-    if (samples == VK_SAMPLE_COUNT_1_BIT)
-        return true;
-    return g_sampleRateShading;
 }
 
 VkFormat VertexFormat(const VertexAttribute& a)
@@ -12131,8 +10199,7 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
                        uint32_t blendControl1,
                        uint32_t depthControl, uint32_t rasterState,
                        uint32_t alphaTest, uint32_t mode, bool primitiveRestart,
-                       VkSampleCountFlagBits samples, VkFormat depthFormat,
-                       bool depthFloat24)
+                       VkSampleCountFlagBits samples, VkFormat depthFormat)
 {
     const bool depthOnly = mode == 5;
     const uint64_t pipelinePsHash = depthOnly ? 0ull : ps.hash;
@@ -12141,16 +10208,25 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
     if (topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM)
         return VK_NULL_HANDLE;
     const uint64_t layoutHash = AttributeLayoutHash(vs);
-    for (const auto& p : g_pipelines)
-        if (p.vs == vs.hash && p.ps == pipelinePsHash && p.prim == prim &&
-            p.colorMask == colorMask && p.blendControl0 == blendControl0 &&
-            p.blendControl1 == blendControl1 &&
-            p.depthControl == depthControl && p.rasterState == rasterState &&
-            p.alphaTest == effectiveAlphaTest && p.mode == mode &&
-            p.primitiveRestart == primitiveRestart && p.samples == samples &&
-            p.depthFormat == depthFormat && p.depthFloat24 == depthFloat24 &&
-            p.layoutHash == layoutHash)
-            return p.pipeline;
+    PipelineRec requested{vs.hash, pipelinePsHash, prim, colorMask, blendControl0,
+                          blendControl1, depthControl, rasterState, effectiveAlphaTest,
+                          mode, primitiveRestart, samples, depthFormat, layoutHash,
+                          VK_NULL_HANDLE};
+    auto findExisting = [&]() -> VkPipeline {
+        const auto existing = std::find_if(g_pipelines.begin(), g_pipelines.end(),
+            [&](const PipelineRec& p) { return SamePipelineKey(p, requested); });
+        return existing != g_pipelines.end() ? existing->pipeline : VK_NULL_HANDLE;
+    };
+    if (g_pipelinePrewarmActive.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(g_pipelineMutex);
+        if (const VkPipeline existing = findExisting())
+            return existing;
+    }
+    else if (const VkPipeline existing = findExisting())
+    {
+        return existing;
+    }
 
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attrs;
@@ -12167,28 +10243,7 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
         ++binding;
     }
 
-    const bool float24DepthShader =
-        UseFloat24DepthShader(depthControl, depthFloat24, samples);
-    VkShaderModule pixelModule = VK_NULL_HANDLE;
-    if (depthOnly)
-    {
-        if (float24DepthShader)
-        {
-            pixelModule = GetFloat24DepthOnlyModule();
-            if (!pixelModule)
-                return VK_NULL_HANDLE;
-        }
-    }
-    else
-    {
-        pixelModule = ps.module;
-        if (float24DepthShader)
-        {
-            pixelModule = GetFloat24DepthModule(ps);
-            if (!pixelModule)
-                return VK_NULL_HANDLE;
-        }
-    }
+    const VkShaderModule pixelModule = depthOnly ? VK_NULL_HANDLE : ps.module;
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -12249,13 +10304,6 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
     raster.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = samples;
-    if (float24DepthShader && samples != VK_SAMPLE_COUNT_1_BIT)
-    {
-        // Xenos depth is per sample. Converting interpolated Z to float24 in a
-        // pixel shader must therefore also run per sample under MSAA.
-        ms.sampleShadingEnable = VK_TRUE;
-        ms.minSampleShading = 1.0f;
-    }
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depth.depthTestEnable = ((depthControl >> 1) & 1u) ? VK_TRUE : VK_FALSE;
     depth.depthWriteEnable = ((depthControl >> 2) & 1u) ? VK_TRUE : VK_FALSE;
@@ -12346,7 +10394,10 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
     ci.layout = g_pipelineLayout;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    const VkResult result = p_vkCreateGraphicsPipelines(g_device, g_pipelineCache, 1, &ci, nullptr, &pipeline);
+    const VkPipelineCache pipelineCache = g_threadPipelineCacheOverride
+        ? g_threadPipelineCacheOverride
+        : g_pipelineCache;
+    const VkResult result = p_vkCreateGraphicsPipelines(g_device, pipelineCache, 1, &ci, nullptr, &pipeline);
     if (result != VK_SUCCESS)
     {
         KLOG("Vulkan pipeline FAILED (%d) VS=%016llX PS=%016llX prim=%u attrs=%zu\n",
@@ -12354,9 +10405,29 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
              static_cast<unsigned long long>(ps.hash), prim, attrs.size());
         return VK_NULL_HANDLE;
     }
-    g_pipelines.push_back({vs.hash, pipelinePsHash, prim, colorMask, blendControl0, blendControl1, depthControl,
-                           rasterState, effectiveAlphaTest, mode, primitiveRestart,
-                           samples, depthFormat, depthFloat24, layoutHash, pipeline});
+    requested.pipeline = pipeline;
+    if (g_pipelinePrewarmActive.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(g_pipelineMutex);
+        if (const VkPipeline existing = findExisting())
+        {
+            if (pipeline && p_vkDestroyPipeline)
+                p_vkDestroyPipeline(g_device, pipeline, nullptr);
+            return existing;
+        }
+        g_pipelines.push_back(requested);
+    }
+    else
+    {
+        if (const VkPipeline existing = findExisting())
+        {
+            if (pipeline && p_vkDestroyPipeline)
+                p_vkDestroyPipeline(g_device, pipeline, nullptr);
+            return existing;
+        }
+        g_pipelines.push_back(requested);
+    }
+    RecordPipelineManifest(requested);
     KLOG_DIAG("Vulkan pipeline created VS=%016llX PS=%016llX prim=%u attrs=%zu mask=%X "
          "blend0=%08X blend1=%08X depth=%08X raster=%03X alphaTest=%u mode=%u restart=%u samples=%u depthFmt=%u\n",
          static_cast<unsigned long long>(vs.hash), static_cast<unsigned long long>(ps.hash),
@@ -12364,6 +10435,148 @@ VkPipeline GetPipeline(const ShaderModuleRec& vs, ShaderModuleRec& ps,
          depthControl, rasterState, effectiveAlphaTest, mode, primitiveRestart ? 1u : 0u,
          uint32_t(samples), uint32_t(depthFormat));
     return pipeline;
+}
+
+ShaderModuleRec* FindOrCreatePrewarmModule(std::deque<ShaderModuleRec>& modules,
+                                           uint32_t type, uint64_t hash)
+{
+    for (auto& module : modules)
+        if (module.type == type && module.hash == hash)
+            return &module;
+
+    if (!ShaderCache_Preload(type, hash))
+        return nullptr;
+    const MojoTranslatedShader* translated = ShaderCache_Find(type, hash);
+    if (!translated || translated->spirv.empty())
+        return nullptr;
+
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    ci.codeSize = translated->spirv.size();
+    ci.pCode = reinterpret_cast<const uint32_t*>(translated->spirv.data());
+    ShaderModuleRec rec{};
+    rec.type = type;
+    rec.hash = hash;
+    if (p_vkCreateShaderModule(g_device, &ci, nullptr, &rec.module) != VK_SUCCESS)
+        return nullptr;
+    if (!PopulateShaderModuleMetadata(*translated, rec))
+    {
+        p_vkDestroyShaderModule(g_device, rec.module, nullptr);
+        return nullptr;
+    }
+    modules.push_back(std::move(rec));
+    return &modules.back();
+}
+
+void StartPipelinePrewarmWorker()
+{
+    if (g_pipelinePrewarmThread.joinable())
+        return;
+
+    std::vector<PipelineRec> manifest;
+    {
+        std::lock_guard<std::mutex> lock(g_pipelineManifestMutex);
+        manifest = g_pipelineManifest;
+    }
+    if (manifest.empty())
+    {
+        KLOG("Vulkan pipeline prewarm: no manifest yet; learning this run\n");
+        return;
+    }
+
+    g_pipelinePrewarmStop.store(false, std::memory_order_release);
+    g_pipelinePrewarmActive.store(true, std::memory_order_release);
+    g_pipelinePrewarmCompiled.store(0, std::memory_order_relaxed);
+    g_pipelinePrewarmSkipped.store(0, std::memory_order_relaxed);
+    g_pipelinePrewarmThread = std::thread([manifest = std::move(manifest)]() mutable {
+#ifdef _WIN32
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+        VkPipelineCacheCreateInfo cacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        if (p_vkCreatePipelineCache)
+        {
+            if (p_vkCreatePipelineCache(g_device, &cacheInfo, nullptr,
+                                        &g_pipelinePrewarmCache) != VK_SUCCESS)
+                g_pipelinePrewarmCache = VK_NULL_HANDLE;
+        }
+        g_threadPipelineCacheOverride = g_pipelinePrewarmCache;
+
+        std::deque<ShaderModuleRec> workerModules;
+        ShaderModuleRec dummyPs{};
+        dummyPs.type = 1;
+        uint64_t completed = 0;
+        const auto start = PerfClock::now();
+        for (const PipelineRec& entry : manifest)
+        {
+            if (g_pipelinePrewarmStop.load(std::memory_order_acquire))
+                break;
+
+            ShaderModuleRec* vs = FindOrCreatePrewarmModule(workerModules, 0, entry.vs);
+            ShaderModuleRec* ps = &dummyPs;
+            if (entry.ps)
+                ps = FindOrCreatePrewarmModule(workerModules, 1, entry.ps);
+            if (!vs || !ps)
+            {
+                g_pipelinePrewarmSkipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            const VkPipeline pipeline = GetPipeline(
+                *vs, *ps, entry.prim, entry.colorMask,
+                entry.blendControl0, entry.blendControl1,
+                entry.depthControl, entry.rasterState, entry.alphaTest, entry.mode,
+                entry.primitiveRestart, entry.samples, entry.depthFormat);
+            if (pipeline)
+            {
+                ++completed;
+                g_pipelinePrewarmCompiled.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_pipelinePrewarmSkipped.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // Keep prewarming opportunistic: it should consume idle headroom,
+            // not compete aggressively with the guest/render threads.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        for (auto& module : workerModules)
+        {
+            if (module.module && p_vkDestroyShaderModule)
+                p_vkDestroyShaderModule(g_device, module.module, nullptr);
+        }
+        g_threadPipelineCacheOverride = VK_NULL_HANDLE;
+        g_pipelinePrewarmActive.store(false, std::memory_order_release);
+
+        const double elapsedMs = std::chrono::duration<double, std::milli>(
+            PerfClock::now() - start).count();
+        KLOG("Vulkan pipeline prewarm: ready=%llu skipped=%llu known=%zu elapsed=%.1f ms\n",
+             static_cast<unsigned long long>(completed),
+             static_cast<unsigned long long>(g_pipelinePrewarmSkipped.load(std::memory_order_relaxed)),
+             manifest.size(), elapsedMs);
+    });
+}
+
+void StopPipelinePrewarmWorker()
+{
+    g_pipelinePrewarmStop.store(true, std::memory_order_release);
+    if (g_pipelinePrewarmThread.joinable())
+        g_pipelinePrewarmThread.join();
+    g_pipelinePrewarmActive.store(false, std::memory_order_release);
+
+    if (g_pipelinePrewarmCache)
+    {
+        if (g_pipelineCache && p_vkMergePipelineCaches)
+        {
+            const VkPipelineCache source = g_pipelinePrewarmCache;
+            const VkResult merged = p_vkMergePipelineCaches(g_device, g_pipelineCache, 1, &source);
+            if (merged != VK_SUCCESS)
+                KLOG("Vulkan pipeline prewarm cache merge failed: %d\n", merged);
+        }
+        if (p_vkDestroyPipelineCache)
+            p_vkDestroyPipelineCache(g_device, g_pipelinePrewarmCache, nullptr);
+        g_pipelinePrewarmCache = VK_NULL_HANDLE;
+    }
 }
 
 uint64_t GpuTimestampDelta(uint64_t start, uint64_t end)
@@ -12447,25 +10660,11 @@ bool BeginFrame()
     g_perfFenceWaitNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         PerfClock::now() - fenceWaitStart).count());
     if (fenceWaitResult != VK_SUCCESS)
-        return false;
-    ReportGpuDrawTimestampFrame(g_frameSlot, frame);
-
-    // Temporary lifetime diagnostic: preserve the two frame slots/upload
-    // segments but serialize against the immediately previous slot. If this
-    // removes the frontend corruption, the slot data itself is valid and an
-    // in-flight resource is being reused too early.
-    const bool serializeFrames = [] {
-        const char* value = std::getenv("MOJORECOMP_SERIALIZE_FRAMES");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    if (serializeFrames && g_framesInFlight > 1)
     {
-        const uint32_t previousSlot = (g_frameSlot + g_framesInFlight - 1u) % g_framesInFlight;
-        const VkFence previousFence = g_frameContexts[previousSlot].fence;
-        if (previousFence != g_fence &&
-            p_vkWaitForFences(g_device, 1, &previousFence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
-            return false;
+        ReportVulkanFailureResult("vkWaitForFences", fenceWaitResult, "begin_frame");
+        return false;
     }
+    ReportGpuDrawTimestampFrame(g_frameSlot, frame);
 
     if (g_readbackPending && g_readbackFrameSlot == g_frameSlot &&
         g_uploadMapped && g_readbackBytes)
@@ -12514,12 +10713,20 @@ bool BeginFrame()
         g_readbackPending = false;
         g_readbackFrameSlot = UINT32_MAX;
     }
-    if (p_vkResetCommandBuffer(g_commandBuffer, 0) != VK_SUCCESS)
+    const VkResult resetCommandResult = p_vkResetCommandBuffer(g_commandBuffer, 0);
+    if (resetCommandResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkResetCommandBuffer", resetCommandResult, "begin_frame");
         return false;
+    }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (p_vkBeginCommandBuffer(g_commandBuffer, &begin) != VK_SUCCESS)
+    const VkResult beginCommandResult = p_vkBeginCommandBuffer(g_commandBuffer, &begin);
+    if (beginCommandResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkBeginCommandBuffer", beginCommandResult, "begin_frame");
         return false;
+    }
     ResetGraphicsCommandStateCache(g_commandBuffer);
     if (g_gpuDrawTimestamps && frame.timestampPool)
     {
@@ -12529,30 +10736,12 @@ bool BeginFrame()
         p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                               frame.timestampPool, 0);
     }
-    // Diagnostic for cross-frame hazards on persistent Xenos resources. The
-    // previous experiment only made writes visible to the next frame, but the
-    // frontend also reuses images that were read (sampled) by the preceding
-    // submission and then overwritten by a resolve. Include reads on the
-    // source side so the next writes cannot overtake those samples.
-    if (g_framesInFlight > 1)
-    {
-        const char* barrierEnv = std::getenv("MOJORECOMP_INTERFRAME_BARRIER");
-        if (barrierEnv && barrierEnv[0] == '1')
-        {
-            VkMemoryBarrier interFrame{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            interFrame.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            interFrame.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            p_vkCmdPipelineBarrier(g_commandBuffer,
-                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                   0, 1, &interFrame, 0, nullptr, 0, nullptr);
-        }
-    }
-
     const VkDeviceSize uploadBase = VkDeviceSize(g_frameSlot) * kFrameUploadBytes;
     g_uploadAt = uploadBase;
     g_uploadLimit = std::min(uploadBase + kFrameUploadBytes,
                              g_readbackOffset ? g_readbackOffset : kUploadBytes);
+    g_frameVertexUploadCache.clear();
+    g_frameIndexUploadCache.clear();
     if (g_uploadLimit <= uploadBase)
         return false;
 
@@ -12560,8 +10749,6 @@ bool BeginFrame()
     if (activeColor0)
     {
         TransitionColorBacking(*activeColor0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        if (g_hostMsaa2x)
-            TransitionColorResolveBacking(*activeColor0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
     else
     {
@@ -12582,24 +10769,10 @@ bool BeginFrame()
                                0, nullptr, 0, nullptr, 1, &barrier);
     }
     if (ColorBacking* activeColor1 = ActiveColor1Backing())
-    {
         TransitionColorBacking(*activeColor1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        if (g_hostMsaa2x)
-            TransitionColorResolveBacking(*activeColor1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    }
-    if (g_hostMsaa2x && !ActiveColorBacking())
-        TransitionResolveTarget(g_colorResolveImage, g_colorResolveLayout,
-                                VK_IMAGE_ASPECT_COLOR_BIT,
-                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
     DepthBacking* activeDepth = ActiveDepthBacking();
     const bool depthWasInitialized = activeDepth ? activeDepth->initialized : g_depthInitialized;
-    const bool activeDepthMsaaResolve =
-        HostMsaa2xDepthResolveEnabled() && activeDepth &&
-        activeDepth->samples != VK_SAMPLE_COUNT_1_BIT &&
-        activeDepth->resolveImage && activeDepth->resolveView;
-    const bool fallbackDepthMsaaResolve =
-        HostMsaa2xDepthResolveEnabled() && !activeDepth && g_depthResolveView;
     if (activeDepth)
     {
         TransitionDepthBacking(*activeDepth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
@@ -12626,15 +10799,6 @@ bool BeginFrame()
                                0, 0, nullptr, 0, nullptr, 1, &depthBarrier);
         g_depthInitialized = true;
     }
-    if (activeDepthMsaaResolve)
-        TransitionResolveTarget(activeDepth->resolveImage, activeDepth->resolveLayout,
-                                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    else if (fallbackDepthMsaaResolve)
-        TransitionResolveTarget(g_depthResolveImage, g_depthResolveLayout,
-                                VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-
     std::array<VkRenderingAttachmentInfo, 2> attachments{};
     attachments[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     attachments[0].imageView = ActiveColorView();
@@ -12668,21 +10832,7 @@ bool BeginFrame()
     // The clear is only for a genuinely uninitialized host image. Persistent
     // Xenos EDRAM contents are always loaded across host frame boundaries.
     depth.clearValue.depthStencil = {1.0f, 0};
-    if (activeDepthMsaaResolve)
-    {
-        depth.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-        depth.resolveImageView = activeDepth->resolveView;
-        depth.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    }
-    else if (fallbackDepthMsaaResolve)
-    {
-        depth.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-        depth.resolveImageView = g_depthResolveView;
-        depth.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    }
     VkRenderingAttachmentInfo stencil = depth;
-    stencil.resolveMode = VK_RESOLVE_MODE_NONE;
-    stencil.resolveImageView = VK_NULL_HANDLE;
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea.extent = g_internalExtent;
     ri.layerCount = 1;
@@ -12778,7 +10928,7 @@ VkViewport DecodeViewport(const uint32_t* regs, bool ignoreWindowOffset = false,
             vp.maxDepth = 1.0f;
         }
     }
-    if (EmulateReverseZLikeD3D12() && vp.minDepth > vp.maxDepth)
+    if (vp.minDepth > vp.maxDepth)
     {
         // ReXGlue/Xenia D3D12 can't rely on a reversed host viewport. Keep the
         // host range monotonic; UploadShared mirrors this by reflecting NDC Z,
@@ -12891,7 +11041,8 @@ VkRect2D DecodeScreenScissor(const uint32_t* regs)
     return {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
 }
 
-VkDeviceSize UploadConstants(const uint32_t* regs, uint32_t baseReg, uint32_t bytes, bool needed)
+VkDeviceSize UploadConstants(const uint32_t* regs, uint32_t baseReg, uint32_t bytes,
+                             bool needed)
 {
     const VkDeviceSize at = UploadAlloc(bytes, 256);
     if (at == VK_WHOLE_SIZE)
@@ -13038,7 +11189,7 @@ VkDeviceSize UploadShared(const uint32_t* regs,
         posDepthTransform[0] = 0.5f;
         posDepthTransform[1] = 0.5f;
     }
-    if (!clippingDisabled && EmulateReverseZLikeD3D12() &&
+    if (!clippingDisabled &&
         std::isfinite(zScale) && std::isfinite(zOffset))
     {
         const float hostOffset = dxClipSpace ? zOffset : (zOffset - zScale);
@@ -13106,17 +11257,6 @@ uint32_t ReadIndexValue(const uint8_t* src, uint32_t index, bool index32, uint32
     return value;
 }
 
-constexpr uint32_t kXenosVertexIndexMask = 0x00FFFFFFu;
-
-uint32_t RemapVertexIndex(uint32_t index, uint32_t indexOffset,
-                          uint32_t minVertex, uint32_t maxVertex)
-{
-    uint32_t remapped = (index + indexOffset) & kXenosVertexIndexMask;
-    if (minVertex <= maxVertex)
-        remapped = std::clamp(remapped, minVertex, maxVertex);
-    return remapped;
-}
-
 struct DrawPositionBounds
 {
     float minX = FLT_MAX;
@@ -13172,28 +11312,31 @@ bool GetDrawPositionBounds(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
     {
         if (!draw.indexVa || !GuestRangeOk(draw.indexVa, indexReadBytes))
             return false;
-        indexSrc = base + draw.indexVa;
+        indexSrc = GuestReadPtr(
+            base, draw.indexVa, static_cast<size_t>(indexReadBytes));
     }
 
-    const uint32_t indexOffset = regs[xenos::kVgtIndxOffset] & kXenosVertexIndexMask;
-    const uint32_t minVertex = regs[xenos::kVgtMinVtxIndx] & kXenosVertexIndexMask;
-    const uint32_t maxVertex = regs[xenos::kVgtMaxVtxIndx] & kXenosVertexIndexMask;
+    const uint32_t indexOffset = regs[xenos::kVgtIndxOffset] & xenos::kVertexIndexMask;
+    const uint32_t minVertex = regs[xenos::kVgtMinVtxIndx] & xenos::kVertexIndexMask;
+    const uint32_t maxVertex = regs[xenos::kVgtMaxVtxIndx] & xenos::kVertexIndexMask;
     for (uint32_t i = 0; i < draw.indexCount; ++i)
     {
         const uint32_t vertex = draw.indexed
-                                    ? RemapVertexIndex(ReadIndexValue(indexSrc, i, draw.index32,
-                                                                     draw.indexEndian),
-                                                       indexOffset, minVertex, maxVertex)
-                                    : RemapVertexIndex(i, indexOffset, minVertex, maxVertex);
+                                    ? xenos::RemapVertexIndex(ReadIndexValue(indexSrc, i, draw.index32,
+                                                                            draw.indexEndian),
+                                                              indexOffset, minVertex, maxVertex)
+                                    : xenos::RemapVertexIndex(i, indexOffset, minVertex, maxVertex);
         if (i == 0)
             out.firstVertex = vertex;
         if ((uint64_t(vertex) + 1u) * position->strideDwords > vf.sizeDwords)
             return false;
 
         uint32_t words[2]{};
+        const uint32_t vertexAddress = static_cast<uint32_t>(
+            uint64_t(va) + uint64_t(vertex) * strideBytes +
+            uint64_t(position->offsetDwords) * 4u);
         CopySwapped(reinterpret_cast<uint8_t*>(words),
-                    base + va + uint64_t(vertex) * strideBytes +
-                        uint64_t(position->offsetDwords) * 4u,
+                    GuestReadPtr(base, vertexAddress, sizeof(words)),
                     sizeof(words), vf.endian);
         const float x = F32(words[0]);
         const float y = F32(words[1]);
@@ -13205,23 +11348,6 @@ bool GetDrawPositionBounds(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
         out.maxY = std::max(out.maxY, y);
     }
     return true;
-}
-
-bool IsSafeAreaOverlayDraw(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
-                           const ShaderModuleRec& vs, uint32_t mode)
-{
-    if (mode != 4 || !draw.predicated || draw.indexed ||
-        (draw.primType != xenos::kTriangleList &&
-         draw.primType != xenos::kTriangleStrip))
-        return false;
-
-    DrawPositionBounds bounds{};
-    if (!GetDrawPositionBounds(base, draw, regs, vs, bounds))
-        return false;
-
-    return mojorecomp::gpu::ShouldTreatAsSafeAreaOverlay(
-        bounds.minX, bounds.minY, bounds.maxX, bounds.maxY,
-        g_extent.width, g_extent.height);
 }
 
 void ReportLowerUiCandidate(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
@@ -13308,9 +11434,12 @@ void ReportLowerUiCandidate(uint8_t* base, const Pm4Draw& draw, const uint32_t* 
     if (payload && (uint64_t(firstVertex) + 1u) * payload->strideDwords <= vf.sizeDwords)
     {
         const uint32_t words = std::min<uint32_t>(4u, payload->strideDwords - payload->offsetDwords);
+        const uint32_t payloadAddress = static_cast<uint32_t>(
+            uint64_t(va) + uint64_t(firstVertex) * strideBytes +
+            uint64_t(payload->offsetDwords) * 4u);
         CopySwapped(reinterpret_cast<uint8_t*>(extra),
-                    base + va + uint64_t(firstVertex) * strideBytes +
-                        uint64_t(payload->offsetDwords) * 4u,
+                    GuestReadPtr(
+                        base, payloadAddress, size_t(words) * 4u),
                     words * 4u, vf.endian);
     }
 
@@ -13345,9 +11474,12 @@ void ReportLowerUiCandidate(uint8_t* base, const Pm4Draw& draw, const uint32_t* 
             const uint32_t wordCount = std::min<uint32_t>(4u, available);
             if (!wordCount)
                 continue;
+            const uint32_t attributeAddress = static_cast<uint32_t>(
+                uint64_t(ava) + uint64_t(firstVertex) * uint64_t(a.strideDwords) * 4u +
+                uint64_t(a.offsetDwords) * 4u);
             CopySwapped(reinterpret_cast<uint8_t*>(words.data()),
-                        base + ava + uint64_t(firstVertex) * uint64_t(a.strideDwords) * 4u +
-                            uint64_t(a.offsetDwords) * 4u,
+                        GuestReadPtr(
+                            base, attributeAddress, size_t(wordCount) * 4u),
                         wordCount * 4u, avf.endian);
             KLOG("[ui attr] frame=%llu loc=%d slot=%u fmt=%u signed=%u int=%u stride=%u off=%u "
                  "words=%08X,%08X,%08X,%08X f=%g,%g,%g,%g\n",
@@ -13371,11 +11503,12 @@ struct PreparedDraw
 bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* regs,
                            const ShaderModuleRec& vs, PreparedDraw& out)
 {
-    std::vector<VkBuffer> buffers;
-    std::vector<VkDeviceSize> offsets;
-    const uint32_t indexOffset = regs[xenos::kVgtIndxOffset] & kXenosVertexIndexMask;
-    const uint32_t minVertex = regs[xenos::kVgtMinVtxIndx] & kXenosVertexIndexMask;
-    const uint32_t maxVertexClamp = regs[xenos::kVgtMaxVtxIndx] & kXenosVertexIndexMask;
+    std::array<VkBuffer, 128> buffers{};
+    std::array<VkDeviceSize, 128> offsets{};
+    uint32_t bindingCount = 0;
+    const uint32_t indexOffset = regs[xenos::kVgtIndxOffset] & xenos::kVertexIndexMask;
+    const uint32_t minVertex = regs[xenos::kVgtMinVtxIndx] & xenos::kVertexIndexMask;
+    const uint32_t maxVertexClamp = regs[xenos::kVgtMaxVtxIndx] & xenos::kVertexIndexMask;
     const bool primitiveRestart = PrimitiveRestartEnabled(draw, regs);
     const uint32_t guestRestartIndex = regs[xenos::kVgtMultiPrimIbResetIndx] &
                                        (draw.index32 ? 0xFFFFFFFFu : 0xFFFFu);
@@ -13398,7 +11531,8 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
     {
         if (!draw.indexVa || !GuestRangeOk(draw.indexVa, indexReadBytes))
             return false;
-        indexSrc = base + draw.indexVa;
+        indexSrc = GuestReadPtr(
+            base, draw.indexVa, static_cast<size_t>(indexReadBytes));
         maxIndex = 0;
         maxEffectiveIndex = 0;
         for (uint32_t i = 0; i < draw.indexCount; ++i)
@@ -13406,15 +11540,15 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
             const uint32_t raw = ReadIndexValue(indexSrc, i, draw.index32, draw.indexEndian);
             if (primitiveRestart && raw == guestRestartIndex)
                 continue;
-            const uint32_t effective = RemapVertexIndex(raw, indexOffset,
-                                                        minVertex, maxVertexClamp);
+            const uint32_t effective = xenos::RemapVertexIndex(raw, indexOffset,
+                                                               minVertex, maxVertexClamp);
             maxIndex = std::max(maxIndex, raw);
             maxEffectiveIndex = std::max(maxEffectiveIndex, effective);
             remapIndices |= effective != raw;
         }
         if (rectangle)
             for (uint32_t i = 0; i < 3; ++i)
-                rectCorner[i] = RemapVertexIndex(
+                rectCorner[i] = xenos::RemapVertexIndex(
                     ReadIndexValue(indexSrc, i, draw.index32, draw.indexEndian),
                     indexOffset, minVertex, maxVertexClamp);
     }
@@ -13429,11 +11563,8 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
             // materialize an index buffer when Xenos offset/wrap/clamp semantics
             // actually alter that sequence.
             out.indexed = true;
-            maxEffectiveIndex = 0;
-            for (uint32_t i = 0; i < draw.indexCount; ++i)
-                maxEffectiveIndex = std::max(
-                    maxEffectiveIndex,
-                    RemapVertexIndex(i, indexOffset, minVertex, maxVertexClamp));
+            maxEffectiveIndex = xenos::MaxRemappedAutoVertexIndex(
+                draw.indexCount, indexOffset, minVertex, maxVertexClamp);
         }
     }
 
@@ -13479,9 +11610,12 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
                     break;
                 }
                 uint32_t words[2]{};
+                const uint32_t cornerAddress = static_cast<uint32_t>(
+                    uint64_t(va) + uint64_t(rectCorner[i]) * strideBytes +
+                    uint64_t(position->offsetDwords) * 4u);
                 CopySwapped(reinterpret_cast<uint8_t*>(words),
-                            base + va + uint64_t(rectCorner[i]) * strideBytes +
-                                uint64_t(position->offsetDwords) * 4u,
+                            GuestReadPtr(
+                                base, cornerAddress, sizeof(words)),
                             sizeof(words), vf.endian);
                 xy[i][0] = F32(words[0]);
                 xy[i][1] = F32(words[1]);
@@ -13545,7 +11679,7 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
         // indexed work is underway so the dump describes the cutscene pass,
         // not an earlier frontend use of the same generic passthrough VS.
         if (vs.hash == 0x760AACF6212E632Cull &&
-            g_indexedDraws.load(std::memory_order_relaxed) > 10000)
+            g_indexedDraws > 10000)
         {
             static uint32_t velocityFillAttributeReports = 0;
             if (velocityFillAttributeReports < vs.attributes.size())
@@ -13566,15 +11700,18 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
                                              ? ReadIndexValue(indexSrc, v, draw.index32,
                                                               draw.indexEndian)
                                              : v;
-                    const uint32_t vertex = RemapVertexIndex(raw, indexOffset,
-                                                             minVertex, maxVertexClamp);
+                    const uint32_t vertex = xenos::RemapVertexIndex(raw, indexOffset,
+                                                                    minVertex, maxVertexClamp);
                     if (!wordsToRead ||
                         (uint64_t(vertex) + 1u) * a.strideDwords > vf.sizeDwords)
                         break;
                     std::array<uint32_t, 4> words{};
+                    const uint32_t vertexAddress = static_cast<uint32_t>(
+                        uint64_t(va) + uint64_t(vertex) * strideBytes +
+                        uint64_t(a.offsetDwords) * 4u);
                     CopySwapped(reinterpret_cast<uint8_t*>(words.data()),
-                                base + va + uint64_t(vertex) * strideBytes +
-                                    uint64_t(a.offsetDwords) * 4u,
+                                GuestReadPtr(
+                                    base, vertexAddress, size_t(wordsToRead) * 4u),
                                 size_t(wordsToRead) * 4u, vf.endian);
                     KLOG("[velocity fill vertex] v%u guest=%u raw=%08X,%08X,%08X,%08X "
                          "f=%g,%g,%g,%g\n",
@@ -13601,14 +11738,18 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
                                              ? ReadIndexValue(indexSrc, v, draw.index32,
                                                               draw.indexEndian)
                                              : v;
-                    const uint32_t vertex = RemapVertexIndex(raw, indexOffset,
-                                                             minVertex, maxVertexClamp);
+                    const uint32_t vertex = xenos::RemapVertexIndex(raw, indexOffset,
+                                                                    minVertex, maxVertexClamp);
                     if ((uint64_t(vertex) + 1u) * a.strideDwords > vf.sizeDwords)
                         break;
                     std::array<uint32_t, 7> words{};
+                    const uint32_t vertexAddress = static_cast<uint32_t>(
+                        uint64_t(va) + uint64_t(vertex) * strideBytes);
+                    const size_t readBytes = size_t(std::min<uint64_t>(strideBytes, sizeof(words)));
                     CopySwapped(reinterpret_cast<uint8_t*>(words.data()),
-                                base + va + uint64_t(vertex) * strideBytes,
-                                size_t(std::min<uint64_t>(strideBytes, sizeof(words))), vf.endian);
+                                GuestReadPtr(
+                                    base, vertexAddress, readBytes),
+                                readBytes, vf.endian);
                     KLOG("[bink vertex] v%u guest=%u words=%08X,%08X,%08X,%08X,%08X,%08X,%08X "
                          "f=%g,%g,%g,%g,%g,%g,%g\n",
                          v, vertex, words[0], words[1], words[2], words[3], words[4], words[5],
@@ -13638,14 +11779,18 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
                                              ? ReadIndexValue(indexSrc, v, draw.index32,
                                                               draw.indexEndian)
                                              : v;
-                    const uint32_t vertex = RemapVertexIndex(raw, indexOffset,
-                                                             minVertex, maxVertexClamp);
+                    const uint32_t vertex = xenos::RemapVertexIndex(raw, indexOffset,
+                                                                    minVertex, maxVertexClamp);
                     if ((uint64_t(vertex) + 1u) * a.strideDwords > vf.sizeDwords)
                         break;
                     std::array<uint32_t, 7> words{};
+                    const uint32_t vertexAddress = static_cast<uint32_t>(
+                        uint64_t(va) + uint64_t(vertex) * strideBytes);
+                    const size_t readBytes = size_t(std::min<uint64_t>(strideBytes, sizeof(words)));
                     CopySwapped(reinterpret_cast<uint8_t*>(words.data()),
-                                base + va + uint64_t(vertex) * strideBytes,
-                                size_t(std::min<uint64_t>(strideBytes, sizeof(words))), vf.endian);
+                                GuestReadPtr(
+                                    base, vertexAddress, readBytes),
+                                readBytes, vf.endian);
                     KLOG("[VTE probe] v%u guest=%u words=%08X,%08X,%08X,%08X,%08X,%08X,%08X "
                          "f=%g,%g,%g,%g,%g,%g,%g\n",
                          v, vertex, words[0], words[1], words[2], words[3], words[4], words[5],
@@ -13658,9 +11803,9 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
         if (rectangle)
         {
             uint32_t corners[3] = {
-                draw.indexed ? rectCorner[0] : RemapVertexIndex(0, indexOffset, minVertex, maxVertexClamp),
-                draw.indexed ? rectCorner[1] : RemapVertexIndex(1, indexOffset, minVertex, maxVertexClamp),
-                draw.indexed ? rectCorner[2] : RemapVertexIndex(2, indexOffset, minVertex, maxVertexClamp),
+                draw.indexed ? rectCorner[0] : xenos::RemapVertexIndex(0, indexOffset, minVertex, maxVertexClamp),
+                draw.indexed ? rectCorner[1] : xenos::RemapVertexIndex(1, indexOffset, minVertex, maxVertexClamp),
+                draw.indexed ? rectCorner[2] : xenos::RemapVertexIndex(2, indexOffset, minVertex, maxVertexClamp),
             };
             for (uint32_t corner : corners)
                 if ((uint64_t(corner) + 1u) * a.strideDwords > vf.sizeDwords)
@@ -13680,9 +11825,14 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
             const auto stripSources = mojorecomp::gpu::RectangleStripSources(
                 rectOther, rectDiagonalA, rectDiagonalB);
             for (uint32_t i = 0; i < 3; ++i)
+            {
+                const uint32_t vertexAddress = static_cast<uint32_t>(
+                    uint64_t(va) + uint64_t(corners[stripSources[i]]) * strideBytes);
                 CopySwapped(dst + uint64_t(i) * strideBytes,
-                            base + va + uint64_t(corners[stripSources[i]]) * strideBytes,
+                            GuestReadPtr(
+                                base, vertexAddress, size_t(strideBytes)),
                             size_t(strideBytes), vf.endian);
+            }
             uint8_t* fourth = dst + 3u * strideBytes;
             for (uint32_t d = 0; d < a.strideDwords; ++d)
             {
@@ -13693,8 +11843,11 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
                 f3 = diagonalA + diagonalB - other;
                 std::memcpy(fourth + d * 4, &f3, 4);
             }
-            buffers.push_back(g_uploadBuffer);
-            offsets.push_back(at + uint64_t(a.offsetDwords) * 4u);
+            if (bindingCount >= buffers.size())
+                return false;
+            buffers[bindingCount] = g_uploadBuffer;
+            offsets[bindingCount] = at + uint64_t(a.offsetDwords) * 4u;
+            ++bindingCount;
             continue;
         }
 
@@ -13721,23 +11874,49 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
         else
         {
             const uint64_t uploadBytes = sourceDwords * 4u;
-            at = UploadAlloc(uploadBytes, 16);
+            const uint32_t sourceAddress = va + startDw * 4u;
+            mojorecomp::gpu::GuestMemoryIdentity identity{};
+            const bool immutable = mojorecomp::gpu::GuestReadIdentity(
+                sourceAddress, uploadBytes, identity);
+            VertexUploadCacheKey frameKey{};
+            if (immutable)
+            {
+                frameKey = {identity.token, identity.offset, uploadBytes, vf.endian};
+                if (const auto found = g_frameVertexUploadCache.find(frameKey);
+                    found != g_frameVertexUploadCache.end())
+                {
+                    at = found->second;
+                    g_perfVertexReuseBytes += uploadBytes;
+                    ++g_perfVertexReuseHits;
+                }
+            }
+
             if (at == VK_WHOLE_SIZE)
-                return false;
-            g_perfVertexUploadBytes += uploadBytes;
-            ++g_perfVertexUploadCopies;
-            const uint8_t* src = base + va + startDw * 4u;
-            uint8_t* dst = g_uploadMapped + at;
-            CopySwapped(dst, src, size_t(uploadBytes), vf.endian);
+            {
+                at = UploadAlloc(uploadBytes, 16);
+                if (at == VK_WHOLE_SIZE)
+                    return false;
+                g_perfVertexUploadBytes += uploadBytes;
+                ++g_perfVertexUploadCopies;
+                const uint8_t* src = GuestReadPtr(
+                    base, sourceAddress, size_t(uploadBytes));
+                uint8_t* dst = g_uploadMapped + at;
+                CopySwapped(dst, src, size_t(uploadBytes), vf.endian);
+                if (immutable)
+                    g_frameVertexUploadCache.emplace(frameKey, at);
+            }
             cached = {true, vf.address, vf.sizeDwords, vf.endian,
                       a.strideDwords, sourceDwords, at};
         }
-        buffers.push_back(g_uploadBuffer);
-        offsets.push_back(at + uint64_t(a.offsetDwords) * 4u);
+        if (bindingCount >= buffers.size())
+            return false;
+        buffers[bindingCount] = g_uploadBuffer;
+        offsets[bindingCount] = at + uint64_t(a.offsetDwords) * 4u;
+        ++bindingCount;
     }
 
-    if (!buffers.empty())
-        p_vkCmdBindVertexBuffers(g_commandBuffer, 0, static_cast<uint32_t>(buffers.size()),
+    if (bindingCount)
+        p_vkCmdBindVertexBuffers(g_commandBuffer, 0, bindingCount,
                                  buffers.data(), offsets.data());
 
     if (out.indexed)
@@ -13746,46 +11925,76 @@ bool PrepareVertexBindings(uint8_t* base, const Pm4Draw& draw, const uint32_t* r
         const bool hostIndex32 = rewritten || draw.index32;
         const uint32_t hostIndexBytes = hostIndex32 ? 4u : 2u;
         const uint64_t indexUploadBytes = uint64_t(out.count) * hostIndexBytes;
-        const VkDeviceSize at = UploadAlloc(indexUploadBytes, 4);
+        VkDeviceSize at = VK_WHOLE_SIZE;
+        mojorecomp::gpu::GuestMemoryIdentity identity{};
+        IndexUploadCacheKey frameKey{};
+        bool immutable = false;
+        if (draw.indexed)
+        {
+            immutable = mojorecomp::gpu::GuestReadIdentity(
+                draw.indexVa, indexReadBytes, identity);
+            if (immutable)
+            {
+                frameKey = {identity.token, identity.offset, indexReadBytes, out.count,
+                            indexOffset, minVertex, maxVertexClamp, guestRestartIndex,
+                            draw.indexEndian, draw.index32, primitiveRestart, rewritten};
+                if (const auto found = g_frameIndexUploadCache.find(frameKey);
+                    found != g_frameIndexUploadCache.end())
+                {
+                    at = found->second.at;
+                    out.indexType = found->second.type;
+                    g_perfIndexReuseBytes += found->second.bytes;
+                    ++g_perfIndexReuseHits;
+                }
+            }
+        }
+
         if (at == VK_WHOLE_SIZE)
-            return false;
-        g_perfIndexUploadBytes += indexUploadBytes;
-        ++g_perfIndexUploadCopies;
-        uint8_t* dst = g_uploadMapped + at;
-        if (rewritten)
         {
-            for (uint32_t i = 0; i < out.count; ++i)
+            at = UploadAlloc(indexUploadBytes, 4);
+            if (at == VK_WHOLE_SIZE)
+                return false;
+            g_perfIndexUploadBytes += indexUploadBytes;
+            ++g_perfIndexUploadCopies;
+            uint8_t* dst = g_uploadMapped + at;
+            if (rewritten)
             {
-                const uint32_t raw = draw.indexed
-                                         ? ReadIndexValue(indexSrc, i, draw.index32,
-                                                          draw.indexEndian)
-                                         : i;
-                const uint32_t value = primitiveRestart && raw == guestRestartIndex
-                                           ? 0xFFFFFFFFu
-                                           : RemapVertexIndex(raw, indexOffset,
-                                                              minVertex, maxVertexClamp);
-                std::memcpy(dst + uint64_t(i) * 4u, &value, sizeof(value));
+                for (uint32_t i = 0; i < out.count; ++i)
+                {
+                    const uint32_t raw = draw.indexed
+                                             ? ReadIndexValue(indexSrc, i, draw.index32,
+                                                              draw.indexEndian)
+                                             : i;
+                    const uint32_t value = primitiveRestart && raw == guestRestartIndex
+                                               ? 0xFFFFFFFFu
+                                               : xenos::RemapVertexIndex(raw, indexOffset,
+                                                                         minVertex, maxVertexClamp);
+                    std::memcpy(dst + uint64_t(i) * 4u, &value, sizeof(value));
+                }
+                out.indexType = VK_INDEX_TYPE_UINT32;
             }
-            out.indexType = VK_INDEX_TYPE_UINT32;
-        }
-        else if (draw.index32)
-        {
-            for (uint32_t i = 0; i < draw.indexCount; ++i)
+            else if (draw.index32)
             {
-                const uint32_t value = ReadIndexValue(indexSrc, i, true, draw.indexEndian);
-                std::memcpy(dst + uint64_t(i) * 4u, &value, sizeof(value));
+                for (uint32_t i = 0; i < draw.indexCount; ++i)
+                {
+                    const uint32_t value = ReadIndexValue(indexSrc, i, true, draw.indexEndian);
+                    std::memcpy(dst + uint64_t(i) * 4u, &value, sizeof(value));
+                }
+                out.indexType = VK_INDEX_TYPE_UINT32;
             }
-            out.indexType = VK_INDEX_TYPE_UINT32;
-        }
-        else
-        {
-            for (uint32_t i = 0; i < draw.indexCount; ++i)
+            else
             {
-                const uint16_t value = uint16_t(ReadIndexValue(indexSrc, i, false,
-                                                               draw.indexEndian));
-                std::memcpy(dst + uint64_t(i) * 2u, &value, sizeof(value));
+                for (uint32_t i = 0; i < draw.indexCount; ++i)
+                {
+                    const uint16_t value = uint16_t(ReadIndexValue(indexSrc, i, false,
+                                                                   draw.indexEndian));
+                    std::memcpy(dst + uint64_t(i) * 2u, &value, sizeof(value));
+                }
+                out.indexType = VK_INDEX_TYPE_UINT16;
             }
-            out.indexType = VK_INDEX_TYPE_UINT16;
+            if (immutable)
+                g_frameIndexUploadCache.emplace(
+                    frameKey, IndexUploadCacheValue{at, out.indexType, indexUploadBytes});
         }
         out.indexAt = at;
         p_vkCmdBindIndexBuffer(g_commandBuffer, g_uploadBuffer, out.indexAt, out.indexType);
@@ -13797,53 +12006,29 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
 {
     if (!BeginFrame())
         return false;
-    static uint32_t msaaPresentReports = 0;
-    const bool reportMsaaPresent = g_hostMsaa2x && msaaPresentReports++ < 12;
-    if (reportMsaaPresent)
-        KLOG("[msaa2x present] frame=%llu begin\n",
-             static_cast<unsigned long long>(g_frames.load(std::memory_order_relaxed) + 1));
     EndColorRendering();
-    if (reportMsaaPresent)
-        KLOG("[msaa2x present] render scope closed\n");
 
     uint32_t imageIndex = 0;
+    const auto acquireStart = PerfClock::now();
     VkResult result = p_vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX,
                                               g_imageAvailable, VK_NULL_HANDLE, &imageIndex);
+    g_perfAcquireNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            PerfClock::now() - acquireStart).count());
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+    {
+        ReportVulkanFailureResult("vkAcquireNextImageKHR", result, "present_acquire");
         return false;
+    }
+
+    const auto presentPrepStart = PerfClock::now();
 
     const uint32_t frontKey = frontBuffer & 0x1FFFFFFFu;
     ResolveSnapshot* frontSnapshot = FindSnapshot(frontKey);
     const uint64_t currentFrame = g_frames.load(std::memory_order_relaxed) + 1;
-    const bool indexHashEventCapture =
-        g_indexHashCaptureFrame.load(std::memory_order_relaxed) == currentFrame;
 
-    const bool completeFrontOnly = [] {
-        const char* value = std::getenv("MOJORECOMP_COMPLETE_FRONT_ONLY");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-
-    // A front buffer can receive only part of a tiled resolve before XE_SWAP.
-    // Preserve the most recent fully covered generation so an incomplete sweep
-    // never becomes visible. This adds only a GPU image copy; it does not wait
-    // for the previous frame on the CPU and therefore keeps frames-in-flight.
-    if (completeFrontOnly && frontSnapshot && frontSnapshot->coverageComplete &&
-        frontSnapshot->frameSeen == currentFrame)
-        CommitSnapshotForPresent(*frontSnapshot);
-
-    // A retail frame may be assembled through several complete EDRAM sweeps.
-    // Coverage alone therefore isn't enough: promoting immediately after tile 3
-    // can expose an intermediate UI layer. Require one host present with no new
-    // resolves to this snapshot before publishing it. This is a GPU-side copy,
-    // not a wait, so it preserves the current CPU/GPU overlap.
-    if (StableFrontEnabled() && frontSnapshot && frontSnapshot->coverageComplete &&
-        frontSnapshot->frameSeen < currentFrame)
-        CommitSnapshotForPresent(*frontSnapshot);
-
-    const bool haveStableFront = (StableFrontEnabled() || completeFrontOnly) && frontSnapshot && frontSnapshot->presentValid &&
-                                 frontSnapshot->presentImage != VK_NULL_HANDLE;
-    const bool haveCurrentFront = frontSnapshot && frontSnapshot->frameSeen == currentFrame &&
-                                  (!completeFrontOnly || frontSnapshot->coverageComplete);
+    const bool haveCurrentFront =
+        frontSnapshot && frontSnapshot->frameSeen == currentFrame;
 
     // Low-volume presentation diagnostics: only report when the source-selection
     // state changes. This is intentionally independent of the verbose front probe
@@ -13851,31 +12036,26 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
     // perturbing frame pacing.
     {
         const uint64_t generation = frontSnapshot ? frontSnapshot->coverageGeneration : 0;
-        const uint64_t presented = frontSnapshot ? frontSnapshot->presentedGeneration : 0;
         const uint64_t seen = frontSnapshot ? frontSnapshot->frameSeen : 0;
         const uint64_t signature =
             (uint64_t(frontKey) << 32) ^
             (uint64_t(g_activeColorInfo) << 1) ^
-            (haveStableFront ? 0x8000000000000000ull : 0ull) ^
             (haveCurrentFront ? 0x4000000000000000ull : 0ull) ^
             (frontSnapshot && frontSnapshot->coverageComplete ? 0x2000000000000000ull : 0ull) ^
-            (generation * 0x9E3779B185EBCA87ull) ^
-            (presented * 0xC2B2AE3D27D4EB4Full) ^ seen;
+            (generation * 0x9E3779B185EBCA87ull) ^ seen;
         static uint64_t lastSignature = ~0ull;
         static uint32_t reports = 0;
         if (signature != lastSignature && reports < 160)
         {
             lastSignature = signature;
             ++reports;
-            KLOG("[present select] frame=%llu front=%08X key=%08X snap=%u stable=%u current=%u "
-                 "complete=%u seen=%llu gen=%llu presented=%llu copies=%llu active=%08X\n",
+            KLOG("[present select] frame=%llu front=%08X key=%08X snap=%u current=%u "
+                 "complete=%u seen=%llu gen=%llu copies=%llu active=%08X\n",
                  static_cast<unsigned long long>(currentFrame), frontBuffer, frontKey,
-                 frontSnapshot ? 1u : 0u, haveStableFront ? 1u : 0u,
-                 haveCurrentFront ? 1u : 0u,
+                 frontSnapshot ? 1u : 0u, haveCurrentFront ? 1u : 0u,
                  frontSnapshot && frontSnapshot->coverageComplete ? 1u : 0u,
                  static_cast<unsigned long long>(seen),
                  static_cast<unsigned long long>(generation),
-                 static_cast<unsigned long long>(presented),
                  static_cast<unsigned long long>(frontSnapshot ? frontSnapshot->copies : 0),
                  g_activeColorInfo);
         }
@@ -13927,19 +12107,8 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
         }
         return key;
     }();
-    if (indexHashEventCapture)
-    {
-        const uint32_t eventKey = g_indexHashCaptureSnapshotKey.load(std::memory_order_relaxed);
-        if (eventKey != UINT32_MAX)
-            debugPresentSnapshotKey = eventKey;
-    }
     ResolveSnapshot* debugPresentSnapshot =
         debugPresentSnapshotKey != UINT32_MAX ? FindSnapshot(debugPresentSnapshotKey) : nullptr;
-    // The freshly resolved front buffer is authoritative for this SWAP. A
-    // preserved stable image is only a fallback for a SWAP where the title did
-    // not resolve that buffer again. Preferring the stable image here made an
-    // old transition frame override newer complete UI frames, producing the
-    // whole-screen/text flicker seen in the frontend.
     if (debugPresentSnapshot && debugPresentSnapshot->copies && !debugPresentSnapshot->depth)
     {
         TransitionSnapshot(*debugPresentSnapshot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -13953,14 +12122,6 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
                  sourceWidth, sourceHeight,
                  static_cast<unsigned long long>(debugPresentSnapshot->copies),
                  static_cast<unsigned long long>(debugPresentSnapshot->frameSeen));
-    }
-    else if (completeFrontOnly && haveStableFront)
-    {
-        TransitionSnapshotPresent(*frontSnapshot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        sourceImage = frontSnapshot->presentImage;
-        sourceWidth = frontSnapshot->width;
-        sourceHeight = frontSnapshot->height;
-        g_snapshotPresents.fetch_add(1, std::memory_order_relaxed);
     }
     else if (haveCurrentFront)
     {
@@ -13976,59 +12137,27 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
                  static_cast<unsigned long long>(frontSnapshot->copies),
                  static_cast<unsigned long long>(currentFrame));
     }
-    else if (haveStableFront)
-    {
-        TransitionSnapshotPresent(*frontSnapshot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        sourceImage = frontSnapshot->presentImage;
-        sourceWidth = frontSnapshot->width;
-        sourceHeight = frontSnapshot->height;
-        const uint64_t n = g_snapshotPresents.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (n <= 4)
-            KLOG("Vulkan present uses stable resolved front: front=%08X key=%08X "
-                 "%ux%u generation=%llu frame=%llu\n",
-                 frontBuffer, frontKey, sourceWidth, sourceHeight,
-                 static_cast<unsigned long long>(frontSnapshot->presentedGeneration),
-                 static_cast<unsigned long long>(currentFrame));
-    }
     else
     {
         if (ColorBacking* activeBacking = ActiveColorBacking())
         {
-            if (g_hostMsaa2x)
-            {
-                TransitionColorResolveBacking(*activeBacking, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                sourceImage = activeBacking->resolveImage;
-            }
-            else
-            {
-                TransitionColorBacking(*activeBacking, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                sourceImage = activeBacking->image;
-            }
+            TransitionColorBacking(*activeBacking, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            sourceImage = activeBacking->image;
         }
         else
         {
-            if (g_hostMsaa2x)
-            {
-                TransitionResolveTarget(g_colorResolveImage, g_colorResolveLayout,
-                                        VK_IMAGE_ASPECT_COLOR_BIT,
-                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                sourceImage = g_colorResolveImage;
-            }
-            else
-            {
-                VkImageMemoryBarrier live{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                live.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                live.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-                live.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                live.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                live.srcQueueFamilyIndex = live.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                live.image = g_colorImage;
-                live.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                                       0, nullptr, 0, nullptr, 1, &live);
-                sourceImage = g_colorImage;
-            }
+            VkImageMemoryBarrier live{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            live.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            live.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            live.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            live.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            live.srcQueueFamilyIndex = live.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            live.image = g_colorImage;
+            live.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            p_vkCmdPipelineBarrier(g_commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                   0, nullptr, 0, nullptr, 1, &live);
+            sourceImage = g_colorImage;
         }
         const uint64_t n = g_fallbackPresents.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n <= 4)
@@ -14039,8 +12168,7 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
     }
 
     const bool preserveNative16x9 = mojorecomp::gpu::ShouldPreserveNativePresentation(
-        g_physicalTileContentFrame == currentFrame,
-        g_sceneTilingLastIndexedFrame == currentFrame);
+        g_physicalTileContentFrame == currentFrame, false);
     const bool fxaaDrawn = DrawFxaa(imageIndex, sourceImage, sourceWidth, sourceHeight,
                                     preserveNative16x9);
     VkImageLayout swapLayout = fxaaDrawn
@@ -14097,17 +12225,14 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
 
     const bool triggeredFrontCapture = FrontCaptureTrigger(currentFrame);
     const bool explicitFrontCapture = FrontDiagnosticFrame(currentFrame) ||
-                                      triggeredFrontCapture || indexHashEventCapture;
-    if (indexHashEventCapture)
-        KLOG("[index hash event] capture present frame=%llu\n",
-             static_cast<unsigned long long>(currentFrame));
+                                      triggeredFrontCapture;
     if (explicitFrontCapture)
-        KLOG("[front probe] present frame=%llu front=%08X key=%08X stable=%u current=%u "
+        KLOG("[front probe] present frame=%llu front=%08X key=%08X current=%u "
              "seen=%llu copies=%llu generation=%llu source=%ux%u swap=%ux%u active=%08X\n",
-             currentFrame, frontBuffer, frontKey, haveStableFront, haveCurrentFront,
+             currentFrame, frontBuffer, frontKey, haveCurrentFront,
              frontSnapshot ? frontSnapshot->frameSeen : 0,
              frontSnapshot ? frontSnapshot->copies : 0,
-             frontSnapshot ? frontSnapshot->presentedGeneration : 0,
+             frontSnapshot ? frontSnapshot->coverageGeneration : 0,
              sourceWidth, sourceHeight, g_outputExtent.width, g_outputExtent.height,
              g_activeColorInfo);
     if (triggeredFrontCapture)
@@ -14120,14 +12245,14 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
                  snapshot.key, snapshot.depth ? 1u : 0u,
                  static_cast<unsigned long long>(snapshot.frameSeen),
                  static_cast<unsigned long long>(snapshot.copies),
-                 static_cast<unsigned long long>(snapshot.presentedGeneration),
+                 static_cast<unsigned long long>(snapshot.coverageGeneration),
                  snapshot.width, snapshot.height);
         }
     }
     const bool captureRaster =
                                ((g_framesInFlight == 1 && !g_readbackReported) || explicitFrontCapture) &&
                                !g_readbackPending &&
-                               g_readbackBytes && g_draws.load(std::memory_order_relaxed) != 0 &&
+                               g_readbackBytes && g_draws != 0 &&
                                sourceWidth == g_extent.width && sourceHeight == g_extent.height;
     if (captureRaster)
     {
@@ -14172,18 +12297,25 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
                            0, nullptr, 0, nullptr, 1, &toPresent);
 
-    if (reportMsaaPresent)
-        KLOG("[msaa2x present] ending command buffer\n");
     auto& frameContext = g_frameContexts[g_frameSlot];
     if (g_gpuDrawTimestamps && frameContext.timestampPool)
         p_vkCmdWriteTimestamp(g_commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                               frameContext.timestampPool, 1);
-    if (p_vkEndCommandBuffer(g_commandBuffer) != VK_SUCCESS)
+    const VkResult endCommandResult = p_vkEndCommandBuffer(g_commandBuffer);
+    if (endCommandResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkEndCommandBuffer", endCommandResult, "present_prepare");
         return false;
-    if (reportMsaaPresent)
-        KLOG("[msaa2x present] command buffer ended\n");
-    if (p_vkResetFences(g_device, 1, &g_fence) != VK_SUCCESS)
+    }
+    g_perfPresentPrepNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            PerfClock::now() - presentPrepStart).count());
+    const VkResult resetFenceResult = p_vkResetFences(g_device, 1, &g_fence);
+    if (resetFenceResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkResetFences", resetFenceResult, "present_submit");
         return false;
+    }
     const VkPipelineStageFlags waitStage = fxaaDrawn
         ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
         : VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -14198,14 +12330,18 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
     const VkSemaphore presentReady = g_presentReady[imageIndex];
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &presentReady;
-    if (reportMsaaPresent)
-        KLOG("[msaa2x present] queue submit begin\n");
-    if (p_vkQueueSubmit(g_queue, 1, &submit, g_fence) != VK_SUCCESS)
+    const auto queueSubmitStart = PerfClock::now();
+    const VkResult queueSubmitResult = p_vkQueueSubmit(g_queue, 1, &submit, g_fence);
+    g_perfQueueSubmitNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            PerfClock::now() - queueSubmitStart).count());
+    if (queueSubmitResult != VK_SUCCESS)
+    {
+        ReportVulkanFailureResult("vkQueueSubmit", queueSubmitResult, "present_submit");
         return false;
+    }
     if (g_gpuDrawTimestamps && frameContext.timestampPool)
         frameContext.timestampPending = true;
-    if (reportMsaaPresent)
-        KLOG("[msaa2x present] queue submit returned\n");
     if (captureRaster)
     {
         g_readbackPending = true;
@@ -14218,14 +12354,22 @@ bool EndFrameAndPresent(uint32_t frontBuffer, uint32_t width, uint32_t height)
     present.swapchainCount = 1;
     present.pSwapchains = &g_swapchain;
     present.pImageIndices = &imageIndex;
+    const auto queuePresentStart = PerfClock::now();
     result = p_vkQueuePresentKHR(g_queue, &present);
+    g_perfQueuePresentNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            PerfClock::now() - queuePresentStart).count());
     if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+    {
+        ReportVulkanFailureResult("vkQueuePresentKHR", result, "present");
         return false;
+    }
 
     if (imageIndex < g_imageInitialized.size())
         g_imageInitialized[imageIndex] = true;
     g_colorInitialized = true;
     g_frameOpen = false;
+    g_publishedDraws.store(g_draws, std::memory_order_relaxed);
     g_frames.fetch_add(1, std::memory_order_relaxed);
     g_frameSlot = (g_frameSlot + 1u) % g_framesInFlight;
     return true;
@@ -14239,6 +12383,8 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
         return true;
     if (!nativeWindow)
         return false;
+    ResetStutterTracking();
+    KLOG("Runtime stutter profiler: hitch threshold=%u ms\n", StutterThresholdMs());
 
     // width/height are the title's guest-visible logical framebuffer size.
     // The swapchain gets its own independently resizable output extent.
@@ -14285,7 +12431,6 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     loaded &= LoadInstance(p_vkEnumeratePhysicalDevices, "vkEnumeratePhysicalDevices");
     loaded &= LoadInstance(p_vkEnumerateDeviceExtensionProperties, "vkEnumerateDeviceExtensionProperties");
     loaded &= LoadInstance(p_vkGetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
-    loaded &= LoadInstance(p_vkGetPhysicalDeviceProperties2, "vkGetPhysicalDeviceProperties2");
     loaded &= LoadInstance(p_vkGetPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2");
     loaded &= LoadInstance(p_vkGetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties");
     loaded &= LoadInstance(p_vkGetPhysicalDeviceQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties");
@@ -14313,8 +12458,16 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
         return false;
     std::vector<VkPhysicalDevice> physicalDevices(physicalCount);
     p_vkEnumeratePhysicalDevices(g_instance, &physicalCount, physicalDevices.data());
+
+    uint32_t bestPreference = 0;
+    bool haveCompatibleAdapter = false;
     for (VkPhysicalDevice candidate : physicalDevices)
     {
+        VkPhysicalDeviceProperties candidateProperties{};
+        p_vkGetPhysicalDeviceProperties(candidate, &candidateProperties);
+
+        uint32_t candidateQueue = UINT32_MAX;
+        uint32_t candidateTimestampValidBits = 0;
         uint32_t queueCount = 0;
         p_vkGetPhysicalDeviceQueueFamilyProperties(candidate, &queueCount, nullptr);
         std::vector<VkQueueFamilyProperties> queues(queueCount);
@@ -14325,18 +12478,97 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
             p_vkGetPhysicalDeviceSurfaceSupportKHR(candidate, q, g_surface, &present);
             if ((queues[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present)
             {
-                g_physicalDevice = candidate;
-                g_queueFamily = q;
-                g_gpuTimestampValidBits = queues[q].timestampValidBits;
+                candidateQueue = q;
+                candidateTimestampValidBits = queues[q].timestampValidBits;
                 break;
             }
         }
-        if (g_physicalDevice)
-            break;
+
+        bool hasSwapchain = false;
+        uint32_t extensionCount = 0;
+        if (p_vkEnumerateDeviceExtensionProperties(
+                candidate, nullptr, &extensionCount, nullptr) == VK_SUCCESS &&
+            extensionCount)
+        {
+            std::vector<VkExtensionProperties> extensions(extensionCount);
+            if (p_vkEnumerateDeviceExtensionProperties(
+                    candidate, nullptr, &extensionCount, extensions.data()) == VK_SUCCESS)
+            {
+                for (const auto& extension : extensions)
+                {
+                    if (std::strcmp(extension.extensionName,
+                                    VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
+                    {
+                        hasSwapchain = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        VkPhysicalDeviceVulkan12Features candidate12{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan13Features candidate13{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        candidate13.pNext = &candidate12;
+        VkPhysicalDeviceFeatures2 candidateFeatures{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        candidateFeatures.pNext = &candidate13;
+        p_vkGetPhysicalDeviceFeatures2(candidate, &candidateFeatures);
+
+        const auto& limits = candidateProperties.limits;
+        const mojorecomp::gpu::VulkanAdapterCapabilities caps =
+            mojorecomp::gpu::VulkanAdapterCapabilitiesFor(
+            candidateQueue != UINT32_MAX,
+            hasSwapchain,
+            candidateProperties.apiVersion >= VK_API_VERSION_1_3,
+            candidateFeatures.features.shaderInt64 == VK_TRUE,
+            candidate12.bufferDeviceAddress == VK_TRUE,
+            candidate12.runtimeDescriptorArray == VK_TRUE,
+            candidate13.dynamicRendering == VK_TRUE,
+            candidateFeatures.features.shaderSampledImageArrayDynamicIndexing == VK_TRUE,
+            limits,
+            g_internalExtent.width <= limits.maxImageDimension2D &&
+                g_internalExtent.height <= limits.maxImageDimension2D,
+            kTextureSlots);
+
+        const mojorecomp::gpu::VulkanAdapterClass deviceClass =
+            mojorecomp::gpu::VulkanAdapterClassFor(uint32_t(candidateProperties.deviceType));
+
+        const bool compatible =
+            mojorecomp::gpu::VulkanAdapterIsRendererCompatible(caps);
+        const uint32_t preference =
+            mojorecomp::gpu::VulkanAdapterPreference(deviceClass);
+        KLOG("Vulkan adapter candidate: %s type=%u compatible=%u preference=%u "
+             "graphicsPresent=%u swapchain=%u api13=%u shaderInt64=%u BDA=%u "
+             "runtimeArray=%u dynamicRendering=%u dynamicSampledIndex=%u "
+             "descriptorLimits=%u extent=%u\n",
+             candidateProperties.deviceName,
+             uint32_t(candidateProperties.deviceType),
+             compatible ? 1u : 0u, preference,
+             caps.graphicsPresent ? 1u : 0u,
+             caps.swapchain ? 1u : 0u,
+             caps.api13 ? 1u : 0u,
+             caps.shaderInt64 ? 1u : 0u,
+             caps.bufferDeviceAddress ? 1u : 0u,
+             caps.runtimeDescriptorArray ? 1u : 0u,
+             caps.dynamicRendering ? 1u : 0u,
+             caps.sampledImageArrayDynamicIndexing ? 1u : 0u,
+             caps.descriptorLimits ? 1u : 0u,
+             caps.extentSupported ? 1u : 0u);
+
+        if (!compatible || (haveCompatibleAdapter && preference <= bestPreference))
+            continue;
+
+        g_physicalDevice = candidate;
+        g_queueFamily = candidateQueue;
+        g_gpuTimestampValidBits = candidateTimestampValidBits;
+        bestPreference = preference;
+        haveCompatibleAdapter = true;
     }
     if (!g_physicalDevice)
     {
-        KLOG("Vulkan: no graphics+present queue found\n");
+        KLOG("Vulkan: no renderer-compatible graphics adapter found\n");
         return false;
     }
 
@@ -14354,9 +12586,6 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
          g_extent.width, g_extent.height,
          g_internalExtent.width, g_internalExtent.height, g_resolutionScale,
          g_outputExtent.width, g_outputExtent.height);
-    g_hostColorSampleCounts = properties.limits.framebufferColorSampleCounts;
-    g_hostDepthSampleCounts = properties.limits.framebufferDepthSampleCounts;
-    g_hostStencilSampleCounts = properties.limits.framebufferStencilSampleCounts;
     g_gpuTimestampPeriodNs = properties.limits.timestampPeriod;
     g_gpuTimestampSupported = properties.limits.timestampComputeAndGraphics == VK_TRUE &&
                               g_gpuTimestampValidBits != 0 &&
@@ -14368,19 +12597,9 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     KLOG("Vulkan GPU: %s (api %u.%u.%u, driver=%08X)\n", properties.deviceName,
          VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion),
          VK_VERSION_PATCH(properties.apiVersion), properties.driverVersion);
-    KLOG("Vulkan framebuffer samples: color=%02X depth=%02X stencil=%02X common=%02X\n",
-         uint32_t(g_hostColorSampleCounts), uint32_t(g_hostDepthSampleCounts),
-         uint32_t(g_hostStencilSampleCounts),
-         uint32_t(g_hostColorSampleCounts & g_hostDepthSampleCounts & g_hostStencilSampleCounts));
     if (gpuTimestampEnv && std::strcmp(gpuTimestampEnv, "1") == 0)
         KLOG("Vulkan GPU timestamp support: requested=1 supported=%u period=%.3f ns validBits=%u\n",
              g_gpuTimestampSupported ? 1u : 0u, g_gpuTimestampPeriodNs, g_gpuTimestampValidBits);
-
-    VkPhysicalDeviceDepthStencilResolveProperties depthResolveProperties{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
-    VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-    properties2.pNext = &depthResolveProperties;
-    p_vkGetPhysicalDeviceProperties2(g_physicalDevice, &properties2);
 
     bool hasFragmentShaderInterlockExtension = false;
     bool hasShaderStencilExportExtension = false;
@@ -14430,22 +12649,6 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
          haveInterlock.fragmentShaderPixelInterlock ? 1u : 0u,
          haveInterlock.fragmentShaderShadingRateInterlock ? 1u : 0u);
 
-    const bool hostMsaa2xSupported =
-        (properties.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_2_BIT) &&
-        (properties.limits.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_2_BIT) &&
-        (properties.limits.framebufferStencilSampleCounts & VK_SAMPLE_COUNT_2_BIT);
-    g_hostMsaa2x = HostMsaa2xRequested() && hostMsaa2xSupported;
-    g_hostMsaaDepthSampleZero =
-        (depthResolveProperties.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) != 0 &&
-        depthResolveProperties.independentResolveNone == VK_TRUE;
-    KLOG("Vulkan Xenos host MSAA: requested2x=%u supported2x=%u active2x=%u\n",
-         HostMsaa2xRequested() ? 1u : 0u,
-         hostMsaa2xSupported ? 1u : 0u,
-         g_hostMsaa2x ? 1u : 0u);
-    KLOG("Vulkan Xenos depth resolve: sampleZero=%u independentNone=%u enabled=%u\n",
-         (depthResolveProperties.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) ? 1u : 0u,
-         depthResolveProperties.independentResolveNone ? 1u : 0u,
-         HostMsaa2xDepthResolveEnabled() ? 1u : 0u);
     if (!have.features.shaderInt64 || !have12.bufferDeviceAddress || !have13.dynamicRendering)
     {
         KLOG("Vulkan raster requirements missing: shaderInt64=%u BDA=%u dynamicRendering=%u\n",
@@ -14474,15 +12677,13 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     VkPhysicalDeviceFeatures2 enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     enable.features.shaderInt64 = VK_TRUE;
     enable.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
-    enable.features.sampleRateShading = have.features.sampleRateShading;
     enable.features.textureCompressionBC = have.features.textureCompressionBC;
     enable.features.samplerAnisotropy =
         g_effectiveSamplerAnisotropy > 1.0f ? VK_TRUE : VK_FALSE;
     enable.pNext = &enable13;
     g_textureCompressionBC = have.features.textureCompressionBC == VK_TRUE;
-    g_sampleRateShading = have.features.sampleRateShading == VK_TRUE;
-    KLOG("Vulkan optional texture compression: BC=%u sampleRateShading=%u\n",
-         g_textureCompressionBC ? 1u : 0u, g_sampleRateShading ? 1u : 0u);
+    KLOG("Vulkan optional texture compression: BC=%u\n",
+         g_textureCompressionBC ? 1u : 0u);
     KLOG("Vulkan texture filtering: requested=%s anisotropySupported=%u max=%.1f effective=%.1f\n",
          mojorecomp::config::TextureFilteringToString(requestedFiltering),
          g_samplerAnisotropySupported ? 1u : 0u,
@@ -14530,7 +12731,6 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     LOAD_DEVICE(vkCmdPipelineBarrier);
     LOAD_DEVICE(vkCmdBlitImage);
     LOAD_DEVICE(vkCmdCopyImage);
-    LOAD_DEVICE(vkCmdResolveImage);
     LOAD_DEVICE(vkCmdCopyImageToBuffer);
     LOAD_DEVICE(vkCmdCopyBufferToImage);
     LOAD_DEVICE(vkCmdClearColorImage);
@@ -14573,6 +12773,7 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     LOAD_DEVICE(vkCreatePipelineCache);
     LOAD_DEVICE(vkDestroyPipelineCache);
     LOAD_DEVICE(vkGetPipelineCacheData);
+    LOAD_DEVICE(vkMergePipelineCaches);
     LOAD_DEVICE(vkCreateGraphicsPipelines);
     LOAD_DEVICE(vkDestroyPipeline);
     LOAD_DEVICE(vkCmdBindPipeline);
@@ -14605,12 +12806,23 @@ bool VkPresenter_Init(void* nativeWindow, uint32_t width, uint32_t height)
     // persist it across runs. Failure is non-fatal; rendering still works with
     // VK_NULL_HANDLE just as before.
     CreatePersistentPipelineCache(properties);
+    InitializePipelineManifest(properties);
 
     p_vkGetDeviceQueue(g_device, g_queueFamily, 0, &g_queue);
     if (!g_queue || !CreateSwapchain(width, height) || !CreateCommandState() ||
         !CreateUploadArena() || !CreateColorTarget() || !CreateDepthTarget() ||
         !CreateTextureDescriptors() || !CreatePipelineLayout())
         return false;
+
+    // Physical Xenos EDRAM aliasing is part of the normal COT rendering path.
+    // Build its fixed descriptor/pipeline-layout infrastructure during renderer
+    // startup instead of paying that one-time DXC/Vulkan setup cost on the first
+    // ownership transfer in gameplay. Variant PS/pipelines remain lazy and are
+    // backed by the persistent host-shader + Vulkan pipeline caches.
+    if (!EnsureEdramTransferInfrastructure())
+        return false;
+    StartEdramShaderPrewarmWorker();
+    StartPipelinePrewarmWorker();
 
     // Keep GDI font rasterization and DXC compilation out of the final-present
     // path. Vulkan objects and the tiny atlas upload remain lazy until Debug
@@ -14781,7 +12993,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                          static_cast<unsigned long long>(draw.binMask),
                          static_cast<unsigned long long>(draw.binSelect),
                          static_cast<unsigned long long>(g_renderWriteGeneration),
-                         static_cast<unsigned long long>(g_draws.load(std::memory_order_relaxed)),
+                          static_cast<unsigned long long>(g_draws),
                          static_cast<unsigned long long>(lastRaster.vs),
                          static_cast<unsigned long long>(lastRaster.ps),
                          lastRaster.prim, lastRaster.count,
@@ -14793,10 +13005,9 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                 }
             }
         }
-        const auto start = PerfClock::now();
+        const auto start = DetailedCpuTimerStart();
         const bool ok = ResolveColorSurface(guestBase, regs);
-        g_perfResolveNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            PerfClock::now() - start).count());
+        DetailedCpuTimerAccumulate(start, g_perfResolveNs);
         ++g_perfResolveCalls;
         return ok;
     }
@@ -14811,24 +13022,8 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         return true;
     }
 
-    struct DrawCpuScope
-    {
-        PerfClock::time_point start = PerfClock::now();
-        ~DrawCpuScope()
-        {
-            g_perfDrawTotalNs += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    PerfClock::now() - start).count());
-        }
-    } drawCpuScope;
+    DetailedCpuScope drawCpuScope(g_perfDrawTotalNs);
 
-    // Crash replays an entire 1280x720 scene three times through the same EDRAM
-    // raster window. A real gameplay frame shows 504 matching draw signatures in
-    // each pass; the only differences are the 0/416/832 logical window and the
-    // matching 0/-416/-832 window offset. The host target is already full-size,
-    // so render the first pass in logical coordinates and discard the two exact
-    // replays. This is broader than looking only at BIN_MASK=0x3f: the title also
-    // splits some geometry across the individual bits inside each two-bin group.
     const uint64_t currentFrame = g_frames.load(std::memory_order_relaxed) + 1;
     const uint32_t windowTl = regs[xenos::kPaScWindowScissorTl];
     const uint32_t windowBr = regs[xenos::kPaScWindowScissorBr];
@@ -14838,16 +13033,13 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     const uint32_t tileY1 = (windowBr >> 16) & 0x7FFFu;
     int32_t tileWindowX = 0, tileWindowY = 0;
     DecodeVertexWindowOffset(regs, tileWindowX, tileWindowY, false);
-    const bool firstSceneTile = tileX0 == 0 && tileX1 == 448 &&
-                                tileY0 == 0 && tileY1 == g_extent.height &&
-                                tileWindowX == 0 && tileWindowY == 0;
-    const bool middleSceneTile = tileX0 == 416 && tileX1 == 864 &&
-                                 tileY0 == 0 && tileY1 == g_extent.height &&
-                                 tileWindowX == -416 && tileWindowY == 0;
-    const bool lastSceneTile = tileX0 == 832 && tileX1 == g_extent.width &&
-                               tileY0 == 0 && tileY1 == g_extent.height &&
-                               tileWindowX == -832 && tileWindowY == 0;
-    const bool sceneTileWindow = firstSceneTile || middleSceneTile || lastSceneTile;
+    const bool sceneTileWindow =
+        (tileX0 == 0 && tileX1 == 448 && tileY0 == 0 &&
+         tileY1 == g_extent.height && tileWindowX == 0 && tileWindowY == 0) ||
+        (tileX0 == 416 && tileX1 == 864 && tileY0 == 0 &&
+         tileY1 == g_extent.height && tileWindowX == -416 && tileWindowY == 0) ||
+        (tileX0 == 832 && tileX1 == g_extent.width && tileY0 == 0 &&
+         tileY1 == g_extent.height && tileWindowX == -832 && tileWindowY == 0);
     // Headless validation can drive the frontend with the diagnostic autopilot,
     // but all synthetic input must stop the instant the real tiled 3D scene is
     // reached.  Doing this here is race-free compared with an external log
@@ -14874,82 +13066,11 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
             }
         }
     }
-    if (CollapseTiledDrawsEnabled() && draw.indexed && draw.predicated && sceneTileWindow)
-    {
-        g_sceneTilingLastIndexedFrame = currentFrame;
-        if ((regs[xenos::kRbDepthControl] & 0x7u) != 0)
-            g_sceneTilingLastDepthFrame = currentFrame;
-    }
-    if (StitchTiledDrawsEnabled() && draw.indexed && draw.predicated && sceneTileWindow)
-        g_sceneStitchLastIndexedFrame = currentFrame;
-    const bool sceneTilingActive = CollapseTiledDrawsEnabled() && draw.predicated &&
-                                   sceneTileWindow && g_sceneTilingLastIndexedFrame != 0 &&
-                                   currentFrame <= g_sceneTilingLastIndexedFrame + 1;
-    const bool sceneStitchActive = StitchTiledDrawsEnabled() &&
-                                   g_sceneStitchLastIndexedFrame != 0 &&
-                                   currentFrame <= g_sceneStitchLastIndexedFrame + 1;
-    const bool offsetSceneTileDraw = sceneStitchActive && draw.predicated && !sceneTileWindow &&
-                                     tileWindowY == 0 &&
-                                     (tileWindowX == -416 || tileWindowX == -832);
-    if (TraceStitchMissesEnabled() && offsetSceneTileDraw)
-    {
-        static uint32_t reports = 0;
-        if (reports < 240)
-        {
-            ++reports;
-            KLOG("[stitch miss] #%u frame=%llu VS=%016llX PS=%016llX indexed=%u prim=%u "
-                 "bin=%016llX/%016llX win=%u,%u-%u,%u off=%d,%d broaden=%u\n",
-                 reports, static_cast<unsigned long long>(currentFrame),
-                 static_cast<unsigned long long>(vsHash), static_cast<unsigned long long>(psHash),
-                 draw.indexed ? 1u : 0u, draw.primType,
-                 static_cast<unsigned long long>(draw.binMask),
-                 static_cast<unsigned long long>(draw.binSelect),
-                 tileX0, tileY0, tileX1, tileY1, tileWindowX, tileWindowY,
-                 StitchOffsetPredicatedDrawsEnabled() ? 1u : 0u);
-        }
-    }
-    const bool stitchedUnpredicatedTile = sceneStitchActive && sceneTileWindow &&
-                                          !draw.predicated &&
-                                          StitchUnpredicatedTileDrawsEnabled();
-    const bool stitchedSceneTile = (sceneStitchActive && sceneTileWindow &&
-                                    (draw.predicated || stitchedUnpredicatedTile)) ||
-                                   (offsetSceneTileDraw && StitchOffsetPredicatedDrawsEnabled());
-    if (TraceUnpredicatedTileDrawsEnabled() && sceneStitchActive && sceneTileWindow &&
-        !draw.predicated)
-    {
-        static uint32_t reports = 0;
-        if (reports < 160)
-        {
-            ++reports;
-            KLOG("[stitch unpred] #%u frame=%llu VS=%016llX PS=%016llX indexed=%u prim=%u "
-                 "bin=%016llX/%016llX tile=%u..%u winOff=%d,%d broaden=%u\n",
-                 reports, static_cast<unsigned long long>(currentFrame),
-                 static_cast<unsigned long long>(vsHash), static_cast<unsigned long long>(psHash),
-                 draw.indexed ? 1u : 0u, draw.primType,
-                 static_cast<unsigned long long>(draw.binMask),
-                 static_cast<unsigned long long>(draw.binSelect),
-                 tileX0, tileX1, tileWindowX, tileWindowY,
-                 stitchedUnpredicatedTile ? 1u : 0u);
-        }
-    }
-    if (sceneTilingActive && !firstSceneTile)
-    {
-        g_collapsedTileDraws.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-
-    // Each EDRAM tile replay is followed by a tiny six-draw transition group
-    // using the fullscreen screen-scissor rather than the 448x720 tile window.
-    // On the console this advances/clears the physical tile before the next
-    // logical window is rasterized. With the full-size host render target that
-    // work must happen only for the first tile; replaying the 0x0c and 0x30
-    // groups modifies the already complete scene and creates a visible seam at
-    // the 416/448 overlap.
-    const uint64_t lowTileSelect = draw.binSelect & 0x3Full;
     static const bool traceTileTransitions = [] {
         const char* value = std::getenv("MOJORECOMP_TILE_TRANSITION_TRACE");
         return value && value[0] && value[0] != '0';
     }();
+    const uint64_t lowTileSelect = draw.binSelect & 0x3Full;
     if (traceTileTransitions && draw.predicated &&
         draw.primType == xenos::kRectangleList &&
         (lowTileSelect == 0x0Cull || lowTileSelect == 0x30ull))
@@ -14958,72 +13079,17 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         if (reports++ < 160)
         {
             KLOG("[tile transition trace] frame=%llu indexed=%u bin=%016llX/%016llX "
-                 "win=%u,%u-%u,%u off=%d,%d sceneTile=%u first=%u middle=%u last=%u\n",
+                 "win=%u,%u-%u,%u off=%d,%d sceneTile=%u\n",
                  static_cast<unsigned long long>(currentFrame),
                  draw.indexed ? 1u : 0u,
                  static_cast<unsigned long long>(draw.binMask),
                  static_cast<unsigned long long>(draw.binSelect),
                  tileX0, tileY0, tileX1, tileY1, tileWindowX, tileWindowY,
-                 sceneTileWindow ? 1u : 0u, firstSceneTile ? 1u : 0u,
-                 middleSceneTile ? 1u : 0u, lastSceneTile ? 1u : 0u);
+                 sceneTileWindow ? 1u : 0u);
         }
     }
-    const bool redundantTileTransition = CollapseTiledDrawsEnabled() && draw.predicated &&
-                                         draw.primType == xenos::kRectangleList &&
-                                         (lowTileSelect == 0x0Cull || lowTileSelect == 0x30ull) &&
-                                         g_sceneTilingLastIndexedFrame == currentFrame;
-    const bool stitchedTransitionReplay = sceneStitchActive && !sceneTileWindow && draw.predicated &&
-                                          draw.primType == xenos::kRectangleList &&
-                                          (lowTileSelect == 0x0Cull || lowTileSelect == 0x30ull) &&
-                                          g_sceneStitchLastIndexedFrame == currentFrame &&
-                                          StitchSkipTransitionReplayEnabled();
-    if (redundantTileTransition || stitchedTransitionReplay)
-    {
-        if (stitchedTransitionReplay)
-        {
-            static uint32_t stitchReports = 0;
-            if (stitchReports++ < 24)
-                KLOG("[stitch transition] skipped frame=%llu VS=%016llX PS=%016llX "
-                     "prim=%u indexed=%u bin=%016llX/%016llX win=%08X..%08X off=%08X\n",
-                     static_cast<unsigned long long>(currentFrame),
-                     static_cast<unsigned long long>(vsHash),
-                     static_cast<unsigned long long>(psHash), draw.primType,
-                     draw.indexed ? 1u : 0u,
-                     static_cast<unsigned long long>(draw.binMask),
-                     static_cast<unsigned long long>(draw.binSelect),
-                     windowTl, windowBr, regs[xenos::kPaScWindowOffset]);
-        }
-        g_collapsedTileDraws.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    // Parser-side collapse removes raster setup/draw packets from tiles 1/2,
-    // including packets that are not individually predicated. Once a real
-    // indexed first-tile draw has armed the collapsed scene for this frame, the
-    // corresponding unpredicated raster work in tile 0 must also be broadened
-    // to logical 1280x720 coverage. Otherwise that pass affects only 0..448
-    // while its tile 1/2 replays are skipped, producing a vertical brightness
-    // discontinuity at the physical Xenos tile boundary.
-    const bool collapsedFirstTile = mojorecomp::gpu::ShouldUseLogicalFirstTile(
-        CollapseTiledDrawsEnabled(), firstSceneTile, currentFrame,
-        g_sceneTilingLastIndexedFrame);
-    if (CollapseTiledDrawsEnabled() && sceneTileWindow && draw.indexed)
-    {
-        static uint32_t collapseDecisionReports = 0;
-        if (collapseDecisionReports++ < 96)
-            KLOG_DIAG("[collapse decision] frame=%llu idx=%u pred=%u first=%u middle=%u last=%u "
-                 "lastIndexed=%llu active=%u collapsedFirst=%u win=%u..%u off=%d,%d\n",
-                 static_cast<unsigned long long>(currentFrame), draw.indexed ? 1u : 0u,
-                 draw.predicated ? 1u : 0u, firstSceneTile ? 1u : 0u,
-                 middleSceneTile ? 1u : 0u, lastSceneTile ? 1u : 0u,
-                 static_cast<unsigned long long>(g_sceneTilingLastIndexedFrame),
-                 sceneTilingActive ? 1u : 0u, collapsedFirstTile ? 1u : 0u,
-                 tileX0, tileX1, tileWindowX, tileWindowY);
-    }
-    const bool physicalStitchedSceneTile =
-        stitchedSceneTile && StitchPhysicalTileRasterEnabled();
-    const bool logicalTileCoordinates =
-        collapsedFirstTile || (stitchedSceneTile && !physicalStitchedSceneTile);
-    const bool physicalTileReplay = sceneTileWindow && !logicalTileCoordinates;
+    constexpr bool logicalTileCoordinates = false;
+    const bool physicalTileReplay = sceneTileWindow;
 
     ShaderModuleRec* vs = GetModule(0, vsHash);
     ShaderModuleRec* ps = GetModule(1, psHash);
@@ -15032,15 +13098,6 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         g_skippedShader.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    if (DiagnosticSkipShaderPair(vsHash, psHash))
-        return true;
-
-    const bool logical3DSceneSeen = g_sceneTilingLastIndexedFrame == currentFrame;
-    const bool depthBacked3DSceneSeen = g_sceneTilingLastDepthFrame == currentFrame;
-    const bool safeAreaOverlayDraw = logical3DSceneSeen && depthBacked3DSceneSeen &&
-                                     !logicalTileCoordinates &&
-                                     IsSafeAreaOverlayDraw(guestBase, draw, regs, *vs, mode);
-
     for (const auto& a : vs->attributes)
         if (a.indirect)
         {
@@ -15048,7 +13105,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
             return true;
         }
 
-    const uint64_t diagnosticFrame = g_frames.load(std::memory_order_relaxed) + 1;
+    const uint64_t diagnosticFrame = currentFrame;
     const bool traceDrawFrame = TraceDrawFrame(diagnosticFrame);
     if (traceDrawFrame)
     {
@@ -15155,7 +13212,8 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
             {
                 valid = draw.indexVa && GuestRangeOk(draw.indexVa, indexReadBytes);
                 if (valid)
-                    indexSrc = guestBase + draw.indexVa;
+                    indexSrc = GuestReadPtr(
+                        guestBase, draw.indexVa, static_cast<size_t>(indexReadBytes));
             }
             const int32_t indexOffset = int32_t(regs[xenos::kVgtIndxOffset] & 0xFFFFFFu);
             float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
@@ -15184,9 +13242,12 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                     break;
                 }
                 uint32_t words[2]{};
+                const uint32_t xyAddress = static_cast<uint32_t>(
+                    uint64_t(va) + uint64_t(vertex) * strideBytes +
+                    uint64_t(tracePosition->offsetDwords) * 4u);
                 CopySwapped(reinterpret_cast<uint8_t*>(words),
-                            guestBase + va + uint64_t(vertex) * strideBytes +
-                                uint64_t(tracePosition->offsetDwords) * 4u,
+                            GuestReadPtr(
+                                guestBase, xyAddress, sizeof(words)),
                             sizeof(words), vf.endian);
                 const float x = F32(words[0]);
                 const float y = F32(words[1]);
@@ -15200,9 +13261,12 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                 maxX = std::max(maxX, x);
                 maxY = std::max(maxY, y);
                 uint32_t zWord = 0;
+                const uint32_t zAddress = static_cast<uint32_t>(
+                    uint64_t(va) + uint64_t(vertex) * strideBytes +
+                    uint64_t(tracePosition->offsetDwords + 2u) * 4u);
                 CopySwapped(reinterpret_cast<uint8_t*>(&zWord),
-                            guestBase + va + uint64_t(vertex) * strideBytes +
-                                uint64_t(tracePosition->offsetDwords + 2u) * 4u,
+                            GuestReadPtr(
+                                guestBase, zAddress, sizeof(zWord)),
                             sizeof(zWord), vf.endian);
                 const float z = F32(zWord);
                 if (!std::isfinite(z))
@@ -15305,9 +13369,12 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                             if ((uint64_t(vertex) + 1u) * colour->strideDwords > vf.sizeDwords)
                                 break;
                             uint32_t packed = 0;
+                            const uint32_t colourAddress = static_cast<uint32_t>(
+                                uint64_t(va) + uint64_t(vertex) * strideBytes +
+                                uint64_t(colour->offsetDwords) * 4u);
                             CopySwapped(reinterpret_cast<uint8_t*>(&packed),
-                                        guestBase + va + uint64_t(vertex) * strideBytes +
-                                            uint64_t(colour->offsetDwords) * 4u,
+                                        GuestReadPtr(
+                                            guestBase, colourAddress, sizeof(packed)),
                                         sizeof(packed), vf.endian);
                             KLOG("[draw rgba8] frame=%llu draw=%u vertex=%u raw=%08X rgba=%u,%u,%u,%u\n",
                                  static_cast<unsigned long long>(diagnosticFrame), traceIndex, vertex,
@@ -15367,7 +13434,8 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                         if (image)
                         {
                             image << "P5\n" << fetch.width << " " << fetch.height << "\n255\n";
-                            const uint8_t* source = guestBase + address;
+                            const uint8_t* source = GuestReadPtr(
+                                guestBase, address, static_cast<size_t>(sourceBytes));
                             for (uint32_t y = 0; y < fetch.height; ++y)
                                 image.write(reinterpret_cast<const char*>(source + uint64_t(y) * pitch),
                                             fetch.width);
@@ -15404,7 +13472,8 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                         std::ofstream out(path, std::ios::binary);
                         if (out)
                         {
-                            const uint8_t* source = guestBase + address;
+                            const uint8_t* source = GuestReadPtr(
+                                guestBase, address, static_cast<size_t>(sourceBytes));
                             for (uint32_t x = 0; x < 256; ++x)
                             {
                                 uint8_t pixel[4]{};
@@ -15451,7 +13520,8 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                         if (image)
                         {
                             image << "P6\n" << fetch.width << " " << fetch.height << "\n255\n";
-                            const uint8_t* source = guestBase + address;
+                            const uint8_t* source = GuestReadPtr(
+                                guestBase, address, static_cast<size_t>(sourceBytes));
                             for (uint32_t y = 0; y < fetch.height; ++y)
                             {
                                 const uint8_t* row = source + uint64_t(y) * pitch * 4u;
@@ -15497,7 +13567,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                  static_cast<unsigned long long>(psHash), ps->colorOutputMask, fullColorMask);
     }
 
-    const auto attachmentStart = PerfClock::now();
+    const auto attachmentStart = DetailedCpuTimerStart();
     if (!BeginFrame())
         return false;
     // Xenos changes color/depth views of the same physical EDRAM together.
@@ -15521,21 +13591,19 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     // first and color afterwards, matching the effective precedence used by
     // the host-render-target path when both are active. In DepthOnly mode the
     // color target remains bound but never takes ownership.
-    const bool ownershipEnabled = EdramOwnershipEnabled(
-        g_frames.load(std::memory_order_relaxed) + 1);
-    if (ownershipEnabled && usesDepth && g_activeDepthEnabled &&
+    if (usesDepth && g_activeDepthEnabled &&
         g_activeDepthSurfaceKey != UINT64_MAX)
     {
         if (!ClaimEdramOwnership({EdramOwnerKind::Depth, g_activeDepthSurfaceKey}))
             return false;
     }
-    if (ownershipEnabled && mode == 4 && (colorMask & 0xFu) != 0 &&
+    if (mode == 4 && (colorMask & 0xFu) != 0 &&
         g_activeColorSurfaceKey != UINT64_MAX)
     {
         if (!ClaimEdramOwnership({EdramOwnerKind::Color, g_activeColorSurfaceKey}))
             return false;
     }
-    if (ownershipEnabled && mode == 4 && writesRt1 &&
+    if (mode == 4 && writesRt1 &&
         ((colorMask >> 4) & 0xFu) != 0 &&
         g_activeColor1Enabled && g_activeColor1SurfaceKey != UINT64_MAX)
     {
@@ -15544,147 +13612,9 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     }
     RestoreActiveEdramAttachmentLayouts();
     ResumeColorRendering(false);
-    g_perfAttachmentNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        PerfClock::now() - attachmentStart).count());
+    DetailedCpuTimerAccumulate(attachmentStart, g_perfAttachmentNs);
 
-    // Diagnostic for a known renderer simplification: all guest depth surfaces
-    // currently share one Vulkan depth image even when RB_DEPTH_INFO / the
-    // surface pitch or MSAA mode changes.  The real Xenos addresses distinct
-    // EDRAM regions in those cases.  Clearing only when the guest switches to a
-    // different depth surface tells us whether stale values from an unrelated
-    // guest depth target are contaminating the next pass, without making this a
-    // permanent emulation strategy.
-    if (DiagnosticClearOnDepthSurfaceSwitchEnabled() &&
-        (regs[xenos::kRbDepthControl] & 0x7u))
-    {
-        const uint64_t depthSurfaceKey =
-            (uint64_t(regs[xenos::kRbSurfaceInfo]) << 32) | regs[xenos::kRbDepthInfo];
-        if (depthSurfaceKey != g_activeDepthSurfaceKey)
-        {
-            if (g_activeDepthSurfaceKey != UINT64_MAX)
-            {
-                const uint32_t d = regs[xenos::kRbDepthClear];
-                VkClearAttachment attachment{};
-                attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-                attachment.clearValue.depthStencil.depth =
-                    DecodeDepthClearValue(regs[xenos::kRbDepthInfo], d);
-                attachment.clearValue.depthStencil.stencil = d & 0xFFu;
-                VkClearRect rect{};
-                rect.rect = {{0, 0}, g_internalExtent};
-                rect.baseArrayLayer = 0;
-                rect.layerCount = 1;
-                p_vkCmdClearAttachments(g_commandBuffer, 1, &attachment, 1, &rect);
-                static uint32_t reports = 0;
-                if (reports++ < 32)
-                    KLOG("[depth surface switch clear] old=%016llX new=%016llX clear=%08X\n",
-                         static_cast<unsigned long long>(g_activeDepthSurfaceKey),
-                         static_cast<unsigned long long>(depthSurfaceKey), d);
-            }
-            g_activeDepthSurfaceKey = depthSurfaceKey;
-        }
-    }
-
-    // The guest clears/reuses the physical Xenos depth tile between the three
-    // horizontal scene replays.  Once those replays are collapsed into one
-    // full-width host raster pass, skipping the later physical-tile work also
-    // skips the depth initialization for their logical coverage.  The result is
-    // deterministic: only the first ~448 pixels pass depth and the rest of the
-    // scene is black.  Recreate the equivalent logical operation once, before
-    // the first collapsed indexed draw of the frame, using the guest's own
-    // RB_DEPTH_CLEAR value (important for reverse-Z).
-    const bool automaticCollapsedDepthClear =
-        CollapseTiledDrawsEnabled() && sceneTilingActive && collapsedFirstTile &&
-        draw.indexed && usesDepth && regs[xenos::kRbColorInfo] == 0;
-    if (automaticCollapsedDepthClear)
-    {
-        static uint64_t clearFrame = 0;
-        if (clearFrame != currentFrame)
-        {
-            clearFrame = currentFrame;
-            const uint32_t d = regs[xenos::kRbDepthClear];
-            VkClearAttachment attachment{};
-            attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-            attachment.clearValue.depthStencil.depth =
-                DecodeDepthClearValue(regs[xenos::kRbDepthInfo], d);
-            attachment.clearValue.depthStencil.stencil = d & 0xFFu;
-            VkClearRect rect{};
-            rect.rect = {{0, 0}, g_internalExtent};
-            rect.baseArrayLayer = 0;
-            rect.layerCount = 1;
-            p_vkCmdClearAttachments(g_commandBuffer, 1, &attachment, 1, &rect);
-            ++g_perfDepthClears;
-            g_perfClearRectPixels += uint64_t(g_extent.width) * g_extent.height;
-            ++g_renderWriteGeneration;
-            static uint32_t reports = 0;
-            if (reports++ < 24)
-                KLOG_DIAG("[collapse depth clear] frame=%llu clear=%08X depth=%f rect=1280x720\n",
-                     static_cast<unsigned long long>(currentFrame), d,
-                     attachment.clearValue.depthStencil.depth);
-        }
-    }
-
-    // Diagnostic A/B for additional stale EDRAM contents between Crash's three
-    // horizontal tile replays.  Depth is already handled above for the collapsed
-    // first tile; this switch remains useful for color/depth experiments on the
-    // non-collapsed tile windows.  Mode: 1=color, 2=depth, 3=both.
-    const int diagnosticTileClearMode = DiagnosticTileBoundaryClearMode();
-    if (diagnosticTileClearMode && draw.indexed && draw.predicated &&
-        sceneTileWindow && regs[xenos::kRbColorInfo] == 0)
-    {
-        const uint32_t tileBit = firstSceneTile ? 1u : middleSceneTile ? 2u : 4u;
-        static uint64_t clearFrame = 0;
-        static uint32_t clearedTiles = 0;
-        if (clearFrame != currentFrame)
-        {
-            clearFrame = currentFrame;
-            clearedTiles = 0;
-        }
-        if ((clearedTiles & tileBit) == 0)
-        {
-            clearedTiles |= tileBit;
-            std::array<VkClearAttachment, 2> attachments{};
-            uint32_t attachmentCount = 0;
-            if (diagnosticTileClearMode & 1)
-            {
-                auto& attachment = attachments[attachmentCount++];
-                attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                attachment.colorAttachment = 0;
-                attachment.clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
-            }
-            if ((diagnosticTileClearMode & 2) && !automaticCollapsedDepthClear)
-            {
-                auto& attachment = attachments[attachmentCount++];
-                attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-                const uint32_t d = regs[xenos::kRbDepthClear];
-                attachment.clearValue.depthStencil.depth =
-                    DecodeDepthClearValue(regs[xenos::kRbDepthInfo], d);
-                attachment.clearValue.depthStencil.stencil = d & 0xFFu;
-            }
-            const VkRect2D clearRect =
-                (CollapseTiledDrawsEnabled() && firstSceneTile)
-                    ? VkRect2D{{0, 0}, g_extent}
-                    : DecodeScissor(
-                          regs, StitchTiledDrawsEnabled() && sceneStitchActive &&
-                                    !StitchPhysicalTileRasterEnabled());
-            if (attachmentCount && clearRect.extent.width && clearRect.extent.height)
-            {
-                VkClearRect rect{};
-                rect.rect = ScaleRectToInternal(clearRect);
-                rect.baseArrayLayer = 0;
-                rect.layerCount = 1;
-                p_vkCmdClearAttachments(g_commandBuffer, attachmentCount,
-                                        attachments.data(), 1, &rect);
-                ++g_renderWriteGeneration;
-                static uint32_t reports = 0;
-                if (reports++ < 24)
-                    KLOG("[tile boundary clear] frame=%llu tile=%u mode=%d rect=%d,%d %ux%u\n",
-                         static_cast<unsigned long long>(currentFrame), tileBit,
-                         diagnosticTileClearMode, clearRect.offset.x, clearRect.offset.y,
-                         clearRect.extent.width, clearRect.extent.height);
-            }
-        }
-    }
-    const auto textureStart = PerfClock::now();
+    const auto textureStart = DetailedCpuTimerStart();
     std::array<float, kTextureSlots> textureSampleScales{};
     const bool executeGuestPixelShader = mode != 5;
     textureSampleScales.fill(1.0f);
@@ -15693,8 +13623,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         ? PrepareTextures(guestBase, regs, *vs, *ps, textureSampleScales,
                           executeGuestPixelShader)
         : nullptr;
-    g_perfTextureNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        PerfClock::now() - textureStart).count());
+    DetailedCpuTimerAccumulate(textureStart, g_perfTextureNs);
     if (needsTextureDescriptors && !textures)
     {
         const uint64_t skipped = g_skippedTexture.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -15757,31 +13686,12 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     }
     const uint32_t blendControl0 = regs[xenos::kRbBlendControl0];
     const uint32_t blendControl1 = regs[xenos::kRbBlendControl1];
-    const VkSampleCountFlagBits rasterSamples = GuestSurfaceSamples(
-        regs[xenos::kRbSurfaceInfo], usesDepth ? regs[xenos::kRbDepthInfo] : UINT32_MAX);
+    constexpr VkSampleCountFlagBits rasterSamples = VK_SAMPLE_COUNT_1_BIT;
     const VkFormat pipelineDepthFormat = usesDepth
         ? HostDepthFormat(regs[xenos::kRbDepthInfo]) : kDepthUnormFormat;
-    const bool guestDepthFloat24 =
-        usesDepth && ((regs[xenos::kRbDepthInfo] >> 16) & 1u) != 0;
-    const bool float24DepthShader =
-        UseFloat24DepthShader(depthControl, guestDepthFloat24, rasterSamples);
-    if (guestDepthFloat24 &&
-        (depthControl & (1u << 1)) && rasterSamples != VK_SAMPLE_COUNT_1_BIT &&
-        !g_sampleRateShading)
-    {
-        static uint32_t reports = 0;
-        if (reports++ < 4)
-            KLOG("Vulkan D24FS8 float24 PS conversion unavailable for %ux MSAA: "
-                 "sampleRateShading unsupported; retaining host-precision path\n",
-                 uint32_t(rasterSamples));
-    }
-    const bool shaderWritesDepth = executeGuestPixelShader
-        ? (ps->writesDepth || float24DepthShader)
-        : float24DepthShader;
+    const bool shaderWritesDepth = executeGuestPixelShader && ps->writesDepth;
     VkViewport logicalViewport =
         DecodeViewport(regs, logicalTileCoordinates, shaderWritesDepth, depthControl);
-    if (safeAreaOverlayDraw)
-        logicalViewport = ApplySafeAreaViewport(logicalViewport);
     const VkViewport viewport = ScaleViewportToInternal(logicalViewport);
     const uint32_t rasterState = regs[xenos::kPaSuScModeCntl] & 7u;
     const uint32_t colorControl = regs[xenos::kRbColorControl];
@@ -15795,16 +13705,15 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
             alphaTest = func + 1u;
     }
     if (alphaTest)
-        g_alphaTestDraws.fetch_add(1, std::memory_order_relaxed);
+        ++g_alphaTestDraws;
     const bool primitiveRestart = PrimitiveRestartEnabled(draw, regs);
-    const auto pipelineStart = PerfClock::now();
+    const auto pipelineStart = DetailedCpuTimerStart();
     const VkPipeline pipeline = GetPipeline(*vs, *ps, draw.primType, colorMask,
                                              blendControl0, blendControl1,
                                              depthControl, rasterState, alphaTest, mode,
                                              primitiveRestart, rasterSamples,
-                                             pipelineDepthFormat, guestDepthFloat24);
-    g_perfPipelineNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        PerfClock::now() - pipelineStart).count());
+                                             pipelineDepthFormat);
+    DetailedCpuTimerAccumulate(pipelineStart, g_perfPipelineNs);
     if (!pipeline)
     {
         const uint64_t n = g_skippedPipeline.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -15855,10 +13764,10 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     const bool physicalTileContentRecent = mojorecomp::gpu::HasRecentPhysicalTileContent(
         currentFrame, g_physicalTileContentFrame);
     const bool applyConfiguredAspect = mojorecomp::gpu::ShouldApplyConfiguredAspect(
-        physicalTileReplay, physicalTileContentRecent, logical3DSceneSeen,
+        physicalTileReplay, physicalTileContentRecent, false,
         logicalTileCoordinates);
 
-    const auto constantsStart = PerfClock::now();
+    const auto constantsStart = DetailedCpuTimerStart();
     const VkDeviceSize vsAt = UploadConstants(regs, xenos::kAluConstantBase,
                                                kVsConstBytes, vs->usesAlu);
     const bool projectionAspectApplied = ApplyWideProjectionToUploadedConstants(
@@ -15873,8 +13782,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     const VkDeviceSize sharedAt = UploadShared(regs, textureSampleScales,
                                                logicalTileCoordinates, usesDepth,
                                                applyConfiguredAspect && !projectionAspectApplied);
-    g_perfConstantsNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        PerfClock::now() - constantsStart).count());
+    DetailedCpuTimerAccumulate(constantsStart, g_perfConstantsNs);
     if (vsAt == VK_WHOLE_SIZE || psAt == VK_WHOLE_SIZE || sharedAt == VK_WHOLE_SIZE)
     {
         static bool reported = false;
@@ -15894,7 +13802,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     }
 
     PreparedDraw prepared{};
-    const auto vertexStart = PerfClock::now();
+    const auto vertexStart = DetailedCpuTimerStart();
     if (!PrepareVertexBindings(guestBase, draw, regs, *vs, prepared))
     {
         if (draw.indexed)
@@ -15903,8 +13811,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
             g_skippedVertex.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    g_perfVertexNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        PerfClock::now() - vertexStart).count());
+    DetailedCpuTimerAccumulate(vertexStart, g_perfVertexNs);
     ++g_perfDrawCalls;
 
     CmdBindGraphicsPipelineCached(g_commandBuffer, pipeline);
@@ -15912,9 +13819,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
         CmdBindDescriptorSetsCached(g_commandBuffer, g_pipelineLayout,
                                     0, 4, textures->sets);
     CmdSetViewportCached(g_commandBuffer, viewport);
-    VkRect2D scissor = collapsedFirstTile
-        ? VkRect2D{{0, 0}, g_extent}
-        : DecodeScissor(regs, stitchedSceneTile && !physicalStitchedSceneTile);
+    VkRect2D scissor = DecodeScissor(regs, false);
     if (!scissor.extent.width || !scissor.extent.height)
         return true;
     AccumulatePerfShaderPair(vsHash, psHash, draw.indexed, prepared.count,
@@ -15985,7 +13890,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
             const int32_t windowX = static_cast<int16_t>(windowOffset & 0xFFFFu);
             const int32_t windowY = static_cast<int16_t>(windowOffset >> 16);
             KLOG("[frame113 coords] draw=%llu prim=%u mode=%08X vte=%08X winOff=%d,%d winTL=%08X winBR=%08X viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u\n",
-                 static_cast<unsigned long long>(g_draws.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_draws),
                  draw.primType, regs[xenos::kPaSuScModeCntl], regs[xenos::kPaClVteCntl],
                  windowX, windowY, regs[xenos::kPaScWindowScissorTl],
                  regs[xenos::kPaScWindowScissorBr], viewport.x, viewport.y,
@@ -16059,9 +13964,6 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     p_vkCmdPushConstants(g_commandBuffer, g_pipelineLayout,
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                          0, sizeof(push), &push);
-    if (DiagnosticSkipIndexHash(vsHash, psHash, draw, regs, guestBase) ||
-        DiagnosticSkipTextureContentHash(*vs, *ps, regs))
-        return true;
     uint32_t gpuTimingIndex = UINT32_MAX;
     if (g_gpuDrawTimestamps)
     {
@@ -16094,7 +13996,7 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     if (prepared.indexed)
     {
         p_vkCmdDrawIndexed(g_commandBuffer, prepared.count, 1, 0, prepared.baseVertex, 0);
-        g_indexedDraws.fetch_add(1, std::memory_order_relaxed);
+        ++g_indexedDraws;
     }
     else
         p_vkCmdDraw(g_commandBuffer, prepared.count, 1, 0, 0);
@@ -16106,45 +14008,6 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
                               frame.timestampPool, query);
     }
 
-    // Diagnostic ownership A/B. In DepthOnly mode a Z-writing draw owns the
-    // physical EDRAM range addressed by RB_DEPTH_INFO. The fast Vulkan path has
-    // separate color/depth images, so an aliased color backing would otherwise
-    // retain data that the Xenos depth write has physically overwritten. Clear
-    // the aliased color backing after every actual depth write (not merely when
-    // the depth binding changes) to test that stale-ownership failure mode.
-    // This is intentionally opt-in; a real implementation must transfer / reinterpret
-    // the D24S8 bits rather than replace them with zero.
-    if (!g_hostMsaa2x && mode == 5 && (depthControl & 0x6u) == 0x6u &&
-        DiagnosticInvalidateColorAfterDepthWriteEnabled())
-    {
-        const uint32_t depthBase = regs[xenos::kRbDepthInfo] & 0x7FFu;
-        bool clearedAny = false;
-        EndColorRendering();
-        for (auto& color : g_colorBackings)
-        {
-            if (!color.initialized || (color.info & 0x7FFu) != depthBase)
-                continue;
-            VkClearColorValue clear{};
-            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            TransitionColorBacking(color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            p_vkCmdClearColorImage(g_commandBuffer, color.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                   &clear, 1, &range);
-            if (color.info == g_activeColorInfo ||
-                (g_activeColor1Enabled && color.info == g_activeColor1Info))
-                TransitionColorBacking(color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-            clearedAny = true;
-            static uint32_t reports = 0;
-            if (reports++ < 48)
-                KLOG("[edram ownership A/B] frame=%llu DepthOnly write base=%03X invalidated color=%08X depthCtl=%08X\n",
-                     static_cast<unsigned long long>(currentFrame), depthBase,
-                     color.info, depthControl);
-        }
-        if (clearedAny)
-            ResumeColorRendering(false);
-        else
-            ResumeColorRendering(false);
-    }
     if (mode == 4 && colorMask != 0)
     {
         auto recordWrite = [&](ColorBacking* backing, uint32_t targetMask)
@@ -16152,15 +14015,15 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
             if (!backing || !targetMask)
                 return;
             backing->lastWriteFrame = g_frames.load(std::memory_order_relaxed) + 1;
-            backing->lastWriteDraw = g_draws.load(std::memory_order_relaxed) + 1;
+            backing->lastWriteDraw = g_draws + 1;
             backing->lastWriteGeneration = g_renderWriteGeneration;
         };
         recordWrite(ActiveColorBacking(), colorMask & 0xFu);
         recordWrite(ActiveColor1Backing(), (colorMask >> 4) & 0xFu);
     }
     if (vs->usesTextures || ps->usesTextures)
-        g_texturedDraws.fetch_add(1, std::memory_order_relaxed);
-    const uint64_t n = g_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+        ++g_texturedDraws;
+    const uint64_t n = ++g_draws;
     if (n <= 8)
         KLOG("Vulkan raster draw #%llu prim=%u count=%u indexed=%u VS=%016llX PS=%016llX "
              "viewport=%.1f,%.1f %.1fx%.1f\n",
@@ -16171,6 +14034,137 @@ bool VkPresenter_Draw(uint8_t* guestBase, const Pm4Draw& draw,
     return true;
 }
 
+void ObserveStutterFrame(uint64_t frame, PerfClock::time_point completion,
+                         uint64_t presentNs)
+{
+    StutterCounterSnapshot current{};
+    current.pm4ExecuteNs = Pm4_ExecuteCpuNs();
+    current.pm4DrawSinkNs = Pm4_ExecuteDrawSinkCpuNs();
+    current.pm4ExecuteCalls = Pm4_ExecuteCallCount();
+    current.fenceWaitNs = g_perfFenceWaitNs;
+    current.acquireNs = g_perfAcquireNs;
+    current.presentPrepNs = g_perfPresentPrepNs;
+    current.queueSubmitNs = g_perfQueueSubmitNs;
+    current.queuePresentNs = g_perfQueuePresentNs;
+    current.drawNs = g_perfDrawTotalNs;
+    current.attachmentNs = g_perfAttachmentNs;
+    current.textureNs = g_perfTextureNs;
+    current.pipelineNs = g_perfPipelineNs;
+    current.constantsNs = g_perfConstantsNs;
+    current.vertexNs = g_perfVertexNs;
+    current.resolveNs = g_perfResolveNs;
+    current.edramPipelineNs = g_perfEdramPipelineNs;
+    current.edramTransferNs = g_perfEdramTransferNs;
+    current.pipelineCreates = static_cast<uint64_t>(PipelineCount());
+    current.textureUploadBytes =
+        g_perfTextureUploadBytesR8 + g_perfTextureUploadBytesRGBA +
+        g_perfTextureUploadBytesBC1;
+    current.textureRefreshBytes =
+        g_perfTextureRefreshBytesR8 + g_perfTextureRefreshBytesRGBA +
+        g_perfTextureRefreshBytesBC1;
+    current.vertexUploadBytes = g_perfVertexUploadBytes + g_perfIndexUploadBytes;
+    current.drawCalls = g_perfDrawCalls;
+    current.resolveCalls = g_perfResolveCalls;
+
+    mojorecomp::host::FrameWorkSample work{};
+    work.frameIndex = frame;
+    work.presentNs = presentNs;
+    if (g_stutterPreviousValid)
+    {
+        work.pm4ExecuteNs = CounterDelta(current.pm4ExecuteNs, g_stutterPrevious.pm4ExecuteNs);
+        work.pm4DrawSinkNs = CounterDelta(current.pm4DrawSinkNs, g_stutterPrevious.pm4DrawSinkNs);
+        work.pm4ParserNs = work.pm4ExecuteNs > work.pm4DrawSinkNs
+            ? work.pm4ExecuteNs - work.pm4DrawSinkNs
+            : 0;
+        work.pm4ExecuteCalls = CounterDelta(
+            current.pm4ExecuteCalls, g_stutterPrevious.pm4ExecuteCalls);
+        work.fenceWaitNs = CounterDelta(current.fenceWaitNs, g_stutterPrevious.fenceWaitNs);
+        work.acquireNs = CounterDelta(current.acquireNs, g_stutterPrevious.acquireNs);
+        work.presentPrepNs = CounterDelta(current.presentPrepNs, g_stutterPrevious.presentPrepNs);
+        work.queueSubmitNs = CounterDelta(current.queueSubmitNs, g_stutterPrevious.queueSubmitNs);
+        work.queuePresentNs = CounterDelta(current.queuePresentNs, g_stutterPrevious.queuePresentNs);
+        work.drawNs = CounterDelta(current.drawNs, g_stutterPrevious.drawNs);
+        work.attachmentNs = CounterDelta(current.attachmentNs, g_stutterPrevious.attachmentNs);
+        work.textureNs = CounterDelta(current.textureNs, g_stutterPrevious.textureNs);
+        work.pipelineNs = CounterDelta(current.pipelineNs, g_stutterPrevious.pipelineNs);
+        work.constantsNs = CounterDelta(current.constantsNs, g_stutterPrevious.constantsNs);
+        work.vertexNs = CounterDelta(current.vertexNs, g_stutterPrevious.vertexNs);
+        work.resolveNs = CounterDelta(current.resolveNs, g_stutterPrevious.resolveNs);
+        work.edramPipelineNs = CounterDelta(
+            current.edramPipelineNs, g_stutterPrevious.edramPipelineNs);
+        work.edramTransferNs = CounterDelta(
+            current.edramTransferNs, g_stutterPrevious.edramTransferNs);
+        work.pipelineCreates =
+            CounterDelta(current.pipelineCreates, g_stutterPrevious.pipelineCreates);
+        work.textureUploadBytes =
+            CounterDelta(current.textureUploadBytes, g_stutterPrevious.textureUploadBytes);
+        work.textureRefreshBytes =
+            CounterDelta(current.textureRefreshBytes, g_stutterPrevious.textureRefreshBytes);
+        work.vertexUploadBytes =
+            CounterDelta(current.vertexUploadBytes, g_stutterPrevious.vertexUploadBytes);
+        work.drawCalls = CounterDelta(current.drawCalls, g_stutterPrevious.drawCalls);
+        work.resolveCalls = CounterDelta(current.resolveCalls, g_stutterPrevious.resolveCalls);
+    }
+
+    const auto report = g_stutterProfiler.Observe(completion, work);
+    g_stutterPrevious = current;
+    g_stutterPreviousValid = true;
+    if (!report)
+        return;
+
+    const auto ms = [](uint64_t ns) { return double(ns) / 1.0e6; };
+    const auto mib = [](uint64_t bytes) {
+        return double(bytes) / (1024.0 * 1024.0);
+    };
+    char line[1024]{};
+    std::snprintf(
+        line, sizeof(line),
+        "[stutter] frame=%llu total=%.2f ms cause=%s outside-present=%.2f "
+        "present=%.2f fence=%.2f acquire=%.2f prep=%.2f submit=%.2f queuePresent=%.2f "
+        "pm4=%.2f pm4Parser=%.2f pm4Sink=%.2f "
+        "draw=%.2f pipe=%.2f tex=%.2f resolve=%.2f "
+        "attach=%.2f edramPipe=%.2f edramXfer=%.2f const=%.2f vertex=%.2f newPipelines=%llu "
+        "texUpload=%.2f MiB texRefresh=%.2f MiB vertexUpload=%.2f MiB "
+        "draws=%llu resolves=%llu pm4Calls=%llu",
+        static_cast<unsigned long long>(report->work.frameIndex),
+        ms(report->frameNs),
+        mojorecomp::host::StutterCauseName(report->cause),
+        ms(report->outsidePresenterNs),
+        ms(report->work.presentNs),
+        ms(report->work.fenceWaitNs),
+        ms(report->work.acquireNs),
+        ms(report->work.presentPrepNs),
+        ms(report->work.queueSubmitNs),
+        ms(report->work.queuePresentNs),
+        ms(report->work.pm4ExecuteNs),
+        ms(report->work.pm4ParserNs),
+        ms(report->work.pm4DrawSinkNs),
+        ms(report->work.drawNs),
+        ms(report->work.pipelineNs),
+        ms(report->work.textureNs),
+        ms(report->work.resolveNs),
+        ms(report->work.attachmentNs),
+        ms(report->work.edramPipelineNs),
+        ms(report->work.edramTransferNs),
+        ms(report->work.constantsNs),
+        ms(report->work.vertexNs),
+        static_cast<unsigned long long>(report->work.pipelineCreates),
+        mib(report->work.textureUploadBytes),
+        mib(report->work.textureRefreshBytes),
+        mib(report->work.vertexUploadBytes),
+        static_cast<unsigned long long>(report->work.drawCalls),
+        static_cast<unsigned long long>(report->work.resolveCalls),
+        static_cast<unsigned long long>(report->work.pm4ExecuteCalls));
+    KLOG("%s\n", line);
+
+    if (!g_stutterLogPath.empty())
+    {
+        std::ofstream output(g_stutterLogPath, std::ios::app);
+        if (output)
+            output << line << '\n';
+    }
+}
+
 bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
 {
     if (!g_active)
@@ -16179,15 +14173,40 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         return true;
     const auto presentStart = PerfClock::now();
     const bool ok = EndFrameAndPresent(frontBuffer, width, height);
-    g_perfPresentNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        PerfClock::now() - presentStart).count());
+    const auto presentEnd = PerfClock::now();
+    const uint64_t presentNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            presentEnd - presentStart).count());
+    g_perfPresentNs += presentNs;
     const uint64_t frame = g_frames.load(std::memory_order_relaxed);
+    if (ok)
+    {
+        ObserveStutterFrame(frame, presentEnd, presentNs);
+        const auto policy = mojorecomp::host::ActiveFrameRatePolicy();
+        const auto targetPeriod = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            mojorecomp::host::PeriodForHzRoundedUs(policy.presentationHz));
+        if (const auto cadence = g_framePacingProfiler.Observe(presentEnd, targetPeriod))
+        {
+            KLOG("Vulkan frame pacing: target=%.3f ms mean=%.3f ms meanAbsError=%.3f ms "
+                 "max=%.3f ms late(>1.5x)=%llu/%llu\n",
+                 double(cadence->targetNs) / 1.0e6,
+                 double(cadence->meanNs) / 1.0e6,
+                 double(cadence->meanAbsoluteErrorNs) / 1.0e6,
+                 double(cadence->maxNs) / 1.0e6,
+                 static_cast<unsigned long long>(cadence->lateFrames),
+                 static_cast<unsigned long long>(cadence->samples));
+        }
+    }
     if (ok && g_perfWindowStartFrame == 0)
     {
         g_perfWindowStart = PerfClock::now();
         g_perfWindowStartFrame = frame;
         g_perfFenceWaitNs = 0;
         g_perfPresentNs = 0;
+        g_perfAcquireNs = 0;
+        g_perfPresentPrepNs = 0;
+        g_perfQueueSubmitNs = 0;
+        g_perfQueuePresentNs = 0;
         g_perfTextureNs = 0;
         g_perfPipelineNs = 0;
         g_perfConstantsNs = 0;
@@ -16209,6 +14228,8 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         g_perfEdramOwnershipTiles = 0;
         g_perfEdramOwnershipRects = 0;
         g_perfEdramOwnershipPixels = 0;
+        g_perfEdramPipelineNs = 0;
+        g_perfEdramTransferNs = 0;
         ResetEdramTransferPairProfile();
         g_perfTextureUploadBytesR8 = 0;
         g_perfTextureUploadBytesRGBA = 0;
@@ -16228,12 +14249,26 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         g_perfTextureHashCallsRGBAGenerated = 0;
         g_perfTextureHashBytesBC1 = 0;
         g_perfTextureHashCallsBC1 = 0;
+        g_perfTextureIdentityBytes = 0;
+        g_perfTextureIdentityCalls = 0;
         g_perfVertexUploadBytes = 0;
         g_perfVertexUploadCopies = 0;
         g_perfVertexReuseBytes = 0;
         g_perfVertexReuseHits = 0;
         g_perfIndexUploadBytes = 0;
         g_perfIndexUploadCopies = 0;
+        g_perfIndexReuseBytes = 0;
+        g_perfIndexReuseHits = 0;
+        g_perfDescriptorBundleRequests = 0;
+        g_perfDescriptorAdjacentHits = 0;
+        g_perfDescriptorHashHits = 0;
+        g_perfDescriptorMisses = 0;
+        g_perfDescriptorSetAllocations = 0;
+        g_perfDescriptorUpdateCalls = 0;
+        g_perfDescriptorWrittenDescriptors = 0;
+        g_perfDescriptorLookupNs = 0;
+        g_perfDescriptorBindCalls = 0;
+        g_perfDescriptorBindSuppressed = 0;
         ResetPerfShaderPairs();
         ResetPerfDepthStates();
     }
@@ -16247,18 +14282,27 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         const double fps = wallMs > 0.0 ? double(windowFrames) * 1000.0 / wallMs : 0.0;
         const double fenceMs = double(g_perfFenceWaitNs) / 1.0e6 / double(windowFrames);
         const double presentMs = double(g_perfPresentNs) / 1.0e6 / double(windowFrames);
+        const double acquireMs = double(g_perfAcquireNs) / 1.0e6 / double(windowFrames);
+        const double presentPrepMs = double(g_perfPresentPrepNs) / 1.0e6 / double(windowFrames);
+        const double queueSubmitMs = double(g_perfQueueSubmitNs) / 1.0e6 / double(windowFrames);
+        const double queuePresentMs = double(g_perfQueuePresentNs) / 1.0e6 / double(windowFrames);
         const double guestMs = std::max(0.0, frameMs - presentMs);
-        KLOG("Vulkan perf: %.2f fps %.2f ms/frame (guest+PM4 %.2f ms, present %.2f ms, fence %.2f ms)\n",
-             fps, frameMs, guestMs, presentMs, fenceMs);
+        KLOG("Vulkan perf: %.2f fps %.2f ms/frame (guest+PM4 %.2f ms, present %.2f ms, "
+             "fence %.2f acquire %.2f prep %.2f submit %.2f queuePresent %.2f)\n",
+             fps, frameMs, guestMs, presentMs, fenceMs,
+             acquireMs, presentPrepMs, queueSubmitMs, queuePresentMs);
         const double drawTotalMs = double(g_perfDrawTotalNs) / 1.0e6 / double(windowFrames);
         const double drawKnownMs = double(g_perfAttachmentNs + g_perfTextureNs + g_perfPipelineNs +
                                           g_perfConstantsNs + g_perfVertexNs) /
                                    1.0e6 / double(windowFrames);
         const double drawOtherMs = std::max(0.0, drawTotalMs - drawKnownMs);
-        KLOG("Vulkan CPU profile: drawTotal %.2f drawOther %.2f attach %.2f ms/frame tex %.2f pipe %.2f const %.2f vertex %.2f resolve %.2f "
+        KLOG("Vulkan CPU profile: drawTotal %.2f drawOther %.2f attach %.2f ms/frame "
+             "edramPipe %.2f edramXfer %.2f tex %.2f pipe %.2f const %.2f vertex %.2f resolve %.2f "
              "draws %.1f/frame resolves %.1f/frame\n",
              drawTotalMs, drawOtherMs,
              double(g_perfAttachmentNs) / 1.0e6 / double(windowFrames),
+             double(g_perfEdramPipelineNs) / 1.0e6 / double(windowFrames),
+             double(g_perfEdramTransferNs) / 1.0e6 / double(windowFrames),
              double(g_perfTextureNs) / 1.0e6 / double(windowFrames),
              double(g_perfPipelineNs) / 1.0e6 / double(windowFrames),
              double(g_perfConstantsNs) / 1.0e6 / double(windowFrames),
@@ -16309,7 +14353,8 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         }
         KLOG("Vulkan texture traffic: upload=%.3f MiB/frame (R8 %.3f RGBA %.3f BC1 %.3f, %.2f ops/frame) "
              "refresh=%.3f MiB/frame (R8 %.3f RGBA %.3f BC1 %.3f, %.2f ops/frame) "
-             "hash=%.3f MiB/frame (R8 %.3f/%.1f calls RGBA %.3f/%.1f calls BC1 %.3f/%.1f calls)\n",
+             "hash=%.3f MiB/frame (R8 %.3f/%.1f calls RGBA %.3f/%.1f calls BC1 %.3f/%.1f calls) "
+             "identity=%.3f MiB/frame %.1f checks/frame\n",
              double(g_perfTextureUploadBytesR8 + g_perfTextureUploadBytesRGBA +
                     g_perfTextureUploadBytesBC1) / (1024.0 * 1024.0) / double(windowFrames),
              double(g_perfTextureUploadBytesR8) / (1024.0 * 1024.0) / double(windowFrames),
@@ -16331,21 +14376,41 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
              double(g_perfTextureHashBytesRGBA) / (1024.0 * 1024.0) / double(windowFrames),
              double(g_perfTextureHashCallsRGBA) / double(windowFrames),
              double(g_perfTextureHashBytesBC1) / (1024.0 * 1024.0) / double(windowFrames),
-             double(g_perfTextureHashCallsBC1) / double(windowFrames));
+             double(g_perfTextureHashCallsBC1) / double(windowFrames),
+             double(g_perfTextureIdentityBytes) / (1024.0 * 1024.0) / double(windowFrames),
+             double(g_perfTextureIdentityCalls) / double(windowFrames));
         KLOG("Vulkan texture hash split: RGBA-authored %.3f MiB/frame %.1f calls/frame "
              "RGBA-generated %.3f MiB/frame %.1f calls/frame\n",
              double(g_perfTextureHashBytesRGBAAuthored) / (1024.0 * 1024.0) / double(windowFrames),
              double(g_perfTextureHashCallsRGBAAuthored) / double(windowFrames),
              double(g_perfTextureHashBytesRGBAGenerated) / (1024.0 * 1024.0) / double(windowFrames),
              double(g_perfTextureHashCallsRGBAGenerated) / double(windowFrames));
-        KLOG("Vulkan vertex traffic: upload %.3f MiB/frame %.1f copies/frame localReuse %.3f MiB/frame "
-             "%.1f hits/frame index %.3f MiB/frame %.1f copies/frame\n",
+        KLOG("Vulkan vertex traffic: upload %.3f MiB/frame %.1f copies/frame reuse %.3f MiB/frame "
+             "%.1f hits/frame indexUpload %.3f MiB/frame %.1f copies/frame "
+             "indexReuse %.3f MiB/frame %.1f hits/frame\n",
              double(g_perfVertexUploadBytes) / (1024.0 * 1024.0) / double(windowFrames),
              double(g_perfVertexUploadCopies) / double(windowFrames),
              double(g_perfVertexReuseBytes) / (1024.0 * 1024.0) / double(windowFrames),
              double(g_perfVertexReuseHits) / double(windowFrames),
              double(g_perfIndexUploadBytes) / (1024.0 * 1024.0) / double(windowFrames),
-             double(g_perfIndexUploadCopies) / double(windowFrames));
+             double(g_perfIndexUploadCopies) / double(windowFrames),
+             double(g_perfIndexReuseBytes) / (1024.0 * 1024.0) / double(windowFrames),
+             double(g_perfIndexReuseHits) / double(windowFrames));
+        KLOG("Vulkan descriptor traffic: requests %.1f/frame adjacent %.1f hashHit %.1f miss %.2f "
+             "allocSets %.2f/frame updates %.2f/frame written %.1f/frame binds %.1f/frame "
+             "suppressed %.1f/frame lookup %.3f ms/frame bundles=%zu adjacentCache=%u\n",
+             double(g_perfDescriptorBundleRequests) / double(windowFrames),
+             double(g_perfDescriptorAdjacentHits) / double(windowFrames),
+             double(g_perfDescriptorHashHits) / double(windowFrames),
+             double(g_perfDescriptorMisses) / double(windowFrames),
+             double(g_perfDescriptorSetAllocations) / double(windowFrames),
+             double(g_perfDescriptorUpdateCalls) / double(windowFrames),
+             double(g_perfDescriptorWrittenDescriptors) / double(windowFrames),
+             double(g_perfDescriptorBindCalls) / double(windowFrames),
+             double(g_perfDescriptorBindSuppressed) / double(windowFrames),
+             double(g_perfDescriptorLookupNs) / 1.0e6 / double(windowFrames),
+             g_textureBundles.size(),
+             DescriptorAdjacentCacheEnabled() ? 1u : 0u);
         std::array<uint32_t, 64> pairOrder{};
         for (uint32_t i = 0; i < g_perfShaderPairCount; ++i)
             pairOrder[i] = i;
@@ -16392,6 +14457,10 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         g_perfWindowStartFrame = frame;
         g_perfFenceWaitNs = 0;
         g_perfPresentNs = 0;
+        g_perfAcquireNs = 0;
+        g_perfPresentPrepNs = 0;
+        g_perfQueueSubmitNs = 0;
+        g_perfQueuePresentNs = 0;
         g_perfTextureNs = 0;
         g_perfPipelineNs = 0;
         g_perfConstantsNs = 0;
@@ -16414,6 +14483,8 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         g_perfEdramOwnershipTiles = 0;
         g_perfEdramOwnershipRects = 0;
         g_perfEdramOwnershipPixels = 0;
+        g_perfEdramPipelineNs = 0;
+        g_perfEdramTransferNs = 0;
         ResetEdramTransferPairProfile();
         g_perfTextureUploadBytesR8 = 0;
         g_perfTextureUploadBytesRGBA = 0;
@@ -16433,25 +14504,38 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
         g_perfTextureHashCallsRGBAGenerated = 0;
         g_perfTextureHashBytesBC1 = 0;
         g_perfTextureHashCallsBC1 = 0;
+        g_perfTextureIdentityBytes = 0;
+        g_perfTextureIdentityCalls = 0;
         g_perfVertexUploadBytes = 0;
         g_perfVertexUploadCopies = 0;
         g_perfVertexReuseBytes = 0;
         g_perfVertexReuseHits = 0;
         g_perfIndexUploadBytes = 0;
         g_perfIndexUploadCopies = 0;
+        g_perfIndexReuseBytes = 0;
+        g_perfIndexReuseHits = 0;
+        g_perfDescriptorBundleRequests = 0;
+        g_perfDescriptorAdjacentHits = 0;
+        g_perfDescriptorHashHits = 0;
+        g_perfDescriptorMisses = 0;
+        g_perfDescriptorSetAllocations = 0;
+        g_perfDescriptorUpdateCalls = 0;
+        g_perfDescriptorWrittenDescriptors = 0;
+        g_perfDescriptorLookupNs = 0;
+        g_perfDescriptorBindCalls = 0;
+        g_perfDescriptorBindSuppressed = 0;
         ResetPerfShaderPairs();
         ResetPerfDepthStates();
     }
     if (ok && (frame == 1 || (frame % 60u) == 0))
-        KLOG("Vulkan raster health: frames=%llu draws=%llu indexed=%llu collapsedTile=%llu skipMode=%llu skipIndexed=%llu "
+        KLOG("Vulkan raster health: frames=%llu draws=%llu indexed=%llu skipMode=%llu skipIndexed=%llu "
              "skipShader=%llu skipTexture=%llu skipVertex=%llu skipTopo=%llu skipPipe=%llu "
              "alphaTest=%llu alphaUnsupported=%llu resolves=%llu copies=%llu dedupResolve=%llu "
              "resolveUnsupported=%llu(src=%llu rt1=%llu depth=%llu rect=%llu snap=%llu) snapPresent=%llu fallbackPresent=%llu snapshots=%zu "
              "pipelines=%zu modules=%zu textured=%llu descriptorBundles=%zu ownerFast=%llu\n",
              static_cast<unsigned long long>(frame),
-             static_cast<unsigned long long>(g_draws.load()),
-             static_cast<unsigned long long>(g_indexedDraws.load()),
-             static_cast<unsigned long long>(g_collapsedTileDraws.load()),
+             static_cast<unsigned long long>(g_draws),
+             static_cast<unsigned long long>(g_indexedDraws),
              static_cast<unsigned long long>(g_skippedMode.load()),
              static_cast<unsigned long long>(g_skippedIndexed.load()),
              static_cast<unsigned long long>(g_skippedShader.load()),
@@ -16459,7 +14543,7 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
              static_cast<unsigned long long>(g_skippedVertex.load()),
              static_cast<unsigned long long>(g_skippedTopology.load()),
              static_cast<unsigned long long>(g_skippedPipeline.load()),
-             static_cast<unsigned long long>(g_alphaTestDraws.load()),
+             static_cast<unsigned long long>(g_alphaTestDraws),
              static_cast<unsigned long long>(g_alphaTestUnsupported.load()),
              static_cast<unsigned long long>(g_resolves.load()),
              static_cast<unsigned long long>(g_resolveCopies.load()),
@@ -16473,24 +14557,28 @@ bool VkPresenter_Present(uint32_t frontBuffer, uint32_t width, uint32_t height)
              static_cast<unsigned long long>(g_snapshotPresents.load()),
              static_cast<unsigned long long>(g_fallbackPresents.load()),
              g_snapshots.size(),
-             g_pipelines.size(), g_modules.size(),
-             static_cast<unsigned long long>(g_texturedDraws.load()), g_textureBundles.size(),
+             PipelineCount(), g_modules.size(),
+             static_cast<unsigned long long>(g_texturedDraws), g_textureBundles.size(),
              static_cast<unsigned long long>(g_edramOwnerFastPathHits));
     return ok;
 }
 
 void VkPresenter_Shutdown()
 {
+    StopEdramShaderPrewarmWorker();
+    StopPipelinePrewarmWorker();
     if (g_device && p_vkDeviceWaitIdle)
-        p_vkDeviceWaitIdle(g_device);
+    {
+        const VkResult waitIdleResult = p_vkDeviceWaitIdle(g_device);
+        if (waitIdleResult != VK_SUCCESS)
+            ReportVulkanFailureResult("vkDeviceWaitIdle", waitIdleResult, "shutdown");
+    }
     SavePersistentPipelineCache();
     for (auto& p : g_pipelines)
         if (p.pipeline && p_vkDestroyPipeline)
             p_vkDestroyPipeline(g_device, p.pipeline, nullptr);
     for (auto& m : g_modules)
     {
-        if (m.float24DepthModule && p_vkDestroyShaderModule)
-            p_vkDestroyShaderModule(g_device, m.float24DepthModule, nullptr);
         if (m.module && p_vkDestroyShaderModule)
             p_vkDestroyShaderModule(g_device, m.module, nullptr);
     }
@@ -16518,34 +14606,6 @@ void VkPresenter_Shutdown()
         p_vkDestroyDescriptorPool(g_device, g_edramTransferPool, nullptr);
     if (g_edramTransferSetLayout && p_vkDestroyDescriptorSetLayout)
         p_vkDestroyDescriptorSetLayout(g_device, g_edramTransferSetLayout, nullptr);
-    if (g_msaaResolvePipeline && p_vkDestroyPipeline)
-        p_vkDestroyPipeline(g_device, g_msaaResolvePipeline, nullptr);
-    if (g_msaaResolveVs && p_vkDestroyShaderModule)
-        p_vkDestroyShaderModule(g_device, g_msaaResolveVs, nullptr);
-    if (g_msaaResolvePs && p_vkDestroyShaderModule)
-        p_vkDestroyShaderModule(g_device, g_msaaResolvePs, nullptr);
-    if (g_msaaResolvePipelineLayout && p_vkDestroyPipelineLayout)
-        p_vkDestroyPipelineLayout(g_device, g_msaaResolvePipelineLayout, nullptr);
-    if (g_msaaResolvePool && p_vkDestroyDescriptorPool)
-        p_vkDestroyDescriptorPool(g_device, g_msaaResolvePool, nullptr);
-    if (g_msaaResolveSetLayout && p_vkDestroyDescriptorSetLayout)
-        p_vkDestroyDescriptorSetLayout(g_device, g_msaaResolveSetLayout, nullptr);
-    if (g_float24DepthOnlyPs && p_vkDestroyShaderModule)
-        p_vkDestroyShaderModule(g_device, g_float24DepthOnlyPs, nullptr);
-    if (g_depthMsaaResolveUnormPipeline && p_vkDestroyPipeline)
-        p_vkDestroyPipeline(g_device, g_depthMsaaResolveUnormPipeline, nullptr);
-    if (g_depthMsaaResolveFloatPipeline && p_vkDestroyPipeline)
-        p_vkDestroyPipeline(g_device, g_depthMsaaResolveFloatPipeline, nullptr);
-    if (g_depthMsaaResolveVs && p_vkDestroyShaderModule)
-        p_vkDestroyShaderModule(g_device, g_depthMsaaResolveVs, nullptr);
-    if (g_depthMsaaResolvePs && p_vkDestroyShaderModule)
-        p_vkDestroyShaderModule(g_device, g_depthMsaaResolvePs, nullptr);
-    if (g_depthMsaaResolvePipelineLayout && p_vkDestroyPipelineLayout)
-        p_vkDestroyPipelineLayout(g_device, g_depthMsaaResolvePipelineLayout, nullptr);
-    if (g_depthMsaaResolvePool && p_vkDestroyDescriptorPool)
-        p_vkDestroyDescriptorPool(g_device, g_depthMsaaResolvePool, nullptr);
-    if (g_depthMsaaResolveSetLayout && p_vkDestroyDescriptorSetLayout)
-        p_vkDestroyDescriptorSetLayout(g_device, g_depthMsaaResolveSetLayout, nullptr);
     if (g_overlayPipeline && p_vkDestroyPipeline)
         p_vkDestroyPipeline(g_device, g_overlayPipeline, nullptr);
     if (g_overlayVs && p_vkDestroyShaderModule)
@@ -16598,14 +14658,6 @@ void VkPresenter_Shutdown()
             p_vkDestroyImage(g_device, snapshot.sampledDepthImage, nullptr);
         if (snapshot.sampledDepthMemory && p_vkFreeMemory)
             p_vkFreeMemory(g_device, snapshot.sampledDepthMemory, nullptr);
-        if (snapshot.presentBgraView && p_vkDestroyImageView)
-            p_vkDestroyImageView(g_device, snapshot.presentBgraView, nullptr);
-        if (snapshot.presentView && p_vkDestroyImageView)
-            p_vkDestroyImageView(g_device, snapshot.presentView, nullptr);
-        if (snapshot.presentImage && p_vkDestroyImage)
-            p_vkDestroyImage(g_device, snapshot.presentImage, nullptr);
-        if (snapshot.presentMemory && p_vkFreeMemory)
-            p_vkFreeMemory(g_device, snapshot.presentMemory, nullptr);
         if (snapshot.bgraView && p_vkDestroyImageView)
             p_vkDestroyImageView(g_device, snapshot.bgraView, nullptr);
         if (snapshot.view && p_vkDestroyImageView)
@@ -16617,12 +14669,6 @@ void VkPresenter_Shutdown()
     }
     for (auto& backing : g_colorBackings)
     {
-        if (backing.resolveView && p_vkDestroyImageView)
-            p_vkDestroyImageView(g_device, backing.resolveView, nullptr);
-        if (backing.resolveImage && p_vkDestroyImage)
-            p_vkDestroyImage(g_device, backing.resolveImage, nullptr);
-        if (backing.resolveMemory && p_vkFreeMemory)
-            p_vkFreeMemory(g_device, backing.resolveMemory, nullptr);
         if (backing.view && p_vkDestroyImageView)
             p_vkDestroyImageView(g_device, backing.view, nullptr);
         if (backing.image && p_vkDestroyImage)
@@ -16632,12 +14678,6 @@ void VkPresenter_Shutdown()
     }
     for (auto& backing : g_depthBackings)
     {
-        if (backing.resolveView && p_vkDestroyImageView)
-            p_vkDestroyImageView(g_device, backing.resolveView, nullptr);
-        if (backing.resolveImage && p_vkDestroyImage)
-            p_vkDestroyImage(g_device, backing.resolveImage, nullptr);
-        if (backing.resolveMemory && p_vkFreeMemory)
-            p_vkFreeMemory(g_device, backing.resolveMemory, nullptr);
         if (backing.depthSampleView && p_vkDestroyImageView)
             p_vkDestroyImageView(g_device, backing.depthSampleView, nullptr);
         if (backing.stencilSampleView && p_vkDestroyImageView)
@@ -16695,9 +14735,9 @@ void VkPresenter_Shutdown()
     g_pipelineLayout = VK_NULL_HANDLE;
     g_textureBundles.clear();
     g_textureBundleLookup.clear();
+    g_lastTextureBundleIndex = kInvalidTextureBundleIndex;
     g_guestTextureLookup.clear();
     g_textureCompressionBC = false;
-    g_sampleRateShading = false;
     g_edramOwners.fill({});
     g_edramOwnerTileCounts.clear();
     g_edramOwnerFastPathHits = 0;
@@ -16708,30 +14748,12 @@ void VkPresenter_Shutdown()
     g_edramTransferPool = VK_NULL_HANDLE;
     g_edramTransferPipelineLayout = VK_NULL_HANDLE;
     g_edramTransferVs = VK_NULL_HANDLE;
-    g_msaaResolveSetLayout = VK_NULL_HANDLE;
-    g_msaaResolvePool = VK_NULL_HANDLE;
-    g_msaaResolvePipelineLayout = VK_NULL_HANDLE;
-    g_msaaResolvePipeline = VK_NULL_HANDLE;
-    g_msaaResolveVs = VK_NULL_HANDLE;
-    g_msaaResolvePs = VK_NULL_HANDLE;
-    if (g_device && g_colorResolveView && p_vkDestroyImageView)
-        p_vkDestroyImageView(g_device, g_colorResolveView, nullptr);
-    if (g_device && g_colorResolveImage && p_vkDestroyImage)
-        p_vkDestroyImage(g_device, g_colorResolveImage, nullptr);
-    if (g_device && g_colorResolveMemory && p_vkFreeMemory)
-        p_vkFreeMemory(g_device, g_colorResolveMemory, nullptr);
     if (g_device && g_colorView && p_vkDestroyImageView)
         p_vkDestroyImageView(g_device, g_colorView, nullptr);
     if (g_device && g_colorImage && p_vkDestroyImage)
         p_vkDestroyImage(g_device, g_colorImage, nullptr);
     if (g_device && g_colorMemory && p_vkFreeMemory)
         p_vkFreeMemory(g_device, g_colorMemory, nullptr);
-    if (g_device && g_depthResolveView && p_vkDestroyImageView)
-        p_vkDestroyImageView(g_device, g_depthResolveView, nullptr);
-    if (g_device && g_depthResolveImage && p_vkDestroyImage)
-        p_vkDestroyImage(g_device, g_depthResolveImage, nullptr);
-    if (g_device && g_depthResolveMemory && p_vkFreeMemory)
-        p_vkFreeMemory(g_device, g_depthResolveMemory, nullptr);
     if (g_device && g_depthView && p_vkDestroyImageView)
         p_vkDestroyImageView(g_device, g_depthView, nullptr);
     if (g_device && g_depthImage && p_vkDestroyImage)
@@ -16801,14 +14823,6 @@ void VkPresenter_Shutdown()
     g_fence = VK_NULL_HANDLE;
     g_framesInFlight = 1;
     g_frameSlot = 0;
-    g_hostMsaa2x = false;
-    g_depthMsaaResolveSetLayout = VK_NULL_HANDLE;
-    g_depthMsaaResolvePool = VK_NULL_HANDLE;
-    g_depthMsaaResolvePipelineLayout = VK_NULL_HANDLE;
-    g_depthMsaaResolveVs = VK_NULL_HANDLE;
-    g_depthMsaaResolvePs = VK_NULL_HANDLE;
-    g_depthMsaaResolveUnormPipeline = VK_NULL_HANDLE;
-    g_depthMsaaResolveFloatPipeline = VK_NULL_HANDLE;
     g_overlayAtlasImage = VK_NULL_HANDLE;
     g_overlayAtlasMemory = VK_NULL_HANDLE;
     g_overlayAtlasView = VK_NULL_HANDLE;
@@ -16842,19 +14856,9 @@ void VkPresenter_Shutdown()
     g_colorImage = VK_NULL_HANDLE;
     g_colorView = VK_NULL_HANDLE;
     g_colorMemory = VK_NULL_HANDLE;
-    g_colorResolveImage = VK_NULL_HANDLE;
-    g_colorResolveView = VK_NULL_HANDLE;
-    g_colorResolveMemory = VK_NULL_HANDLE;
-    g_colorResolveLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     g_depthImage = VK_NULL_HANDLE;
     g_depthView = VK_NULL_HANDLE;
     g_depthMemory = VK_NULL_HANDLE;
-    g_depthResolveImage = VK_NULL_HANDLE;
-    g_depthResolveView = VK_NULL_HANDLE;
-    g_depthResolveMemory = VK_NULL_HANDLE;
-    g_depthResolveLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    g_float24DepthOnlyPs = VK_NULL_HANDLE;
-    g_float24DepthOnlyPsAttempted = false;
     g_depthInitialized = false;
     g_uploadBuffer = VK_NULL_HANDLE;
     g_uploadMemory = VK_NULL_HANDLE;
@@ -16889,5 +14893,5 @@ uint64_t VkPresenter_FrameCount()
 
 uint64_t VkPresenter_DrawCount()
 {
-    return g_draws.load(std::memory_order_relaxed);
+    return g_publishedDraws.load(std::memory_order_relaxed);
 }

@@ -97,6 +97,37 @@ pub fn inspect(path: &Path) -> Result<RcfIndex, String> {
     inspect_file(&mut file)
 }
 
+pub fn read_entry(path: &Path, archive_path: &str, max_size: u64) -> Result<Vec<u8>, String> {
+    let expected = normalize_archive_path(archive_path)?;
+    let mut file = File::open(path)
+        .map_err(|error| format!("Could not open RCF {}: {error}", path.display()))?;
+    let index = inspect_file(&mut file)?;
+    let entry = index
+        .entries
+        .iter()
+        .find(|entry| {
+            normalize_archive_path(&entry.name)
+                .map(|name| name == expected)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("RCF entry is missing: {archive_path}"))?;
+    if entry.size > max_size {
+        return Err(format!(
+            "RCF entry is too large to patch safely: {} bytes",
+            entry.size
+        ));
+    }
+    let size: usize = entry
+        .size
+        .try_into()
+        .map_err(|_| "RCF entry is too large for this host".to_string())?;
+    let mut bytes = vec![0u8; size];
+    file.seek(SeekFrom::Start(entry.offset))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .map_err(|error| format!("Could not read RCF entry {archive_path}: {error}"))?;
+    Ok(bytes)
+}
+
 fn inspect_file(file: &mut File) -> Result<RcfIndex, String> {
     let source_size = file
         .metadata()
@@ -326,21 +357,6 @@ fn replacement_map(
         if !replacement.source_path.is_file() {
             return Err(format!(
                 "RCF replacement source does not exist: {}",
-                replacement.source_path.display()
-            ));
-        }
-        let mut signature = [0u8; 4];
-        File::open(&replacement.source_path)
-            .and_then(|mut source| source.read_exact(&mut signature))
-            .map_err(|error| {
-                format!(
-                    "Could not validate replacement {}: {error}",
-                    replacement.source_path.display()
-                )
-            })?;
-        if signature != *b"P3D\xFF" {
-            return Err(format!(
-                "RCF replacement is not a Pure3D file: {}",
                 replacement.source_path.display()
             ));
         }
@@ -769,14 +785,13 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_rejects_invalid_or_duplicate_replacements_without_touching_source() {
+    fn rebuild_rejects_missing_or_duplicate_replacements_without_touching_source() {
         let root = test_root("invalid");
         fs::create_dir_all(&root).expect("root");
         let archive = root.join("default.rcf");
         let files = create_synthetic_archive(&archive);
         let original = fs::read(&archive).expect("source bytes");
-        let invalid = root.join("invalid.p3d");
-        fs::write(&invalid, b"not-p3d").expect("invalid replacement");
+        let invalid = root.join("missing-replacement.bin");
 
         let result = rebuild_to_path(
             &archive,

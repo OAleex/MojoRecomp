@@ -62,6 +62,59 @@ int RunEventProbe()
                     "invalid handle must not signal or overwrite output");
         }
 
+        // Xbox critical sections are recursive and may be contended by native
+        // host threads backing guest threads. Exercise recursion and blocking
+        // through the actual guest import ABI so the host lock implementation
+        // can be optimized without weakening those semantics.
+        constexpr uint32_t criticalSectionAddress = 0x10800;
+        auto criticalCall = [&](PPCContext& callCtx, PPCFunc fn) {
+            callCtx.r3.u64 = criticalSectionAddress;
+            fn(callCtx, base);
+        };
+        ctx.r13.u64 = 0x22000;
+        criticalCall(ctx, __imp__RtlInitializeCriticalSection);
+        criticalCall(ctx, __imp__RtlEnterCriticalSection);
+        criticalCall(ctx, __imp__RtlEnterCriticalSection);
+        auto* critical = reinterpret_cast<XRTL_CRITICAL_SECTION*>(
+            base + criticalSectionAddress);
+        require(uint32_t(critical->RecursionCount) == 2,
+                "critical section recursive enter count");
+
+        std::atomic<bool> criticalAttempting{false};
+        std::atomic<bool> criticalAcquired{false};
+        std::thread criticalWorker([&] {
+            PPCContext workerCtx{};
+            workerCtx.r1.u64 = 0x36000;
+            workerCtx.r13.u64 = 0x23000;
+            criticalAttempting.store(true, std::memory_order_release);
+            criticalCall(workerCtx, __imp__RtlEnterCriticalSection);
+            criticalAcquired.store(true, std::memory_order_release);
+            criticalCall(workerCtx, __imp__RtlLeaveCriticalSection);
+        });
+        while (!criticalAttempting.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        require(!criticalAcquired.load(std::memory_order_acquire),
+                "contended critical section must block another thread");
+
+        criticalCall(ctx, __imp__RtlLeaveCriticalSection);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        require(!criticalAcquired.load(std::memory_order_acquire) &&
+                    uint32_t(critical->RecursionCount) == 1,
+                "recursive critical section must stay owned after partial leave");
+
+        criticalCall(ctx, __imp__RtlLeaveCriticalSection);
+        for (uint32_t spin = 0;
+             spin < 500 && !criticalAcquired.load(std::memory_order_acquire);
+             ++spin)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(criticalAcquired.load(std::memory_order_acquire),
+                "critical section waiter must acquire after final leave");
+        criticalWorker.join();
+        require(uint32_t(critical->RecursionCount) == 0 &&
+                    uint32_t(critical->OwningThread) == 0,
+                "critical section final ownership state");
+
         // Header-level Ke* dispatcher objects are stored in guest memory in the
         // real title, but several native host threads access them concurrently.
         // Exercise the exact signal/wait helpers with a strict two-semaphore

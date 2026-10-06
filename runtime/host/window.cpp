@@ -274,6 +274,14 @@ bool HostWindow_Alive()
            g_window.load(std::memory_order_acquire) != nullptr;
 }
 
+bool HostWindow_AcceptsInput()
+{
+    const HWND window = g_window.load(std::memory_order_acquire);
+    if (!window || g_minimized.load(std::memory_order_acquire))
+        return false;
+    return GetForegroundWindow() == window;
+}
+
 void HostWindow_SetTitle(const wchar_t* title)
 {
     const HWND window = g_window.load(std::memory_order_acquire);

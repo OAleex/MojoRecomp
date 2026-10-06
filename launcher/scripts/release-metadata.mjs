@@ -114,6 +114,21 @@ function blockStringArray(block, key) {
   return residue ? null : values;
 }
 
+function compatibilityRequirements(block) {
+  const sections = block
+    .split(/(?=^\[\[release\.compatibility\.require\]\]\s*$)/m)
+    .slice(1);
+  const requirements = [];
+  for (const section of sections) {
+    const id = blockString(section, "id");
+    const minVersion = blockString(section, "min_version");
+    const maxVersion = blockString(section, "max_version");
+    if (!id || (!minVersion && !maxVersion)) return null;
+    requirements.push({ id, minVersion, maxVersion });
+  }
+  return requirements;
+}
+
 export function runtimeHistoryFromCatalog(catalogText, currentVersion) {
   const normalized = catalogText.replace(/\r\n/g, "\n");
   if (!/^schema_version\s*=\s*1\s*$/m.test(normalized)) return [];
@@ -140,8 +155,10 @@ export function runtimeHistoryFromCatalog(catalogText, currentVersion) {
     const size = blockInteger(block, "size");
     const unpackedSize = blockInteger(block, "unpacked_size");
     const requiredFiles = blockStringArray(block, "required_files");
+    const localizationCatalogUrl = blockString(block, "localization_catalog_url");
     const minLauncher = blockString(block, "min_launcher");
     const maxLauncher = blockString(block, "max_launcher");
+    const requirements = compatibilityRequirements(block);
 
     if (
       id !== "runtime.cot"
@@ -158,6 +175,9 @@ export function runtimeHistoryFromCatalog(catalogText, currentVersion) {
       || !size
       || !unpackedSize
       || !requiredFiles?.includes("cot-runtime.exe")
+      || !requiredFiles.includes("mojorecomp-package.toml")
+      || !requiredFiles.includes("mojorecomp-package.sig")
+      || requirements === null
       || !/^[0-9a-f]{64}$/i.test(sha256 ?? "")
     ) {
       continue;
@@ -166,6 +186,9 @@ export function runtimeHistoryFromCatalog(catalogText, currentVersion) {
     try {
       validatePublicHttpsUrl(url ?? "", "historical runtime URL");
       validatePublicHttpsUrl(notesUrl ?? "", "historical runtime notes URL");
+      if (localizationCatalogUrl) {
+        validatePublicHttpsUrl(localizationCatalogUrl, "historical runtime localization catalog URL");
+      }
       validateReleaseDate(published ?? "");
     } catch {
       continue;
@@ -183,66 +206,8 @@ export function runtimeHistoryFromCatalog(catalogText, currentVersion) {
       requiredFiles,
       minLauncher,
       maxLauncher,
-    });
-  }
-  return releases;
-}
-
-export function launcherHistoryFromCatalog(catalogText, currentVersion) {
-  const normalized = catalogText.replace(/\r\n/g, "\n");
-  if (!/^schema_version\s*=\s*1\s*$/m.test(normalized)) return [];
-  const blocks = normalized
-    .split(/(?=^\[\[release\]\]\s*$)/m)
-    .map((block) => block.trim())
-    .filter((block) => block.startsWith("[[release]]"));
-  const seen = new Set();
-  const releases = [];
-
-  for (const block of blocks) {
-    const id = blockString(block, "id");
-    const kind = blockString(block, "kind");
-    const version = blockString(block, "version");
-    const platform = blockString(block, "platform");
-    const arch = blockString(block, "arch");
-    const url = blockString(block, "url");
-    const sha256 = blockString(block, "sha256");
-    const published = blockString(block, "published");
-    const notesUrl = blockString(block, "notes_url");
-    const packageFormat = blockString(block, "package");
-    const size = blockInteger(block, "size");
-
-    if (
-      id !== "launcher"
-      || kind !== "launcher"
-      || !version
-      || version === currentVersion
-      || seen.has(version)
-      || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)
-      || platform !== "windows"
-      || arch !== "x86_64"
-      || packageFormat !== "portable-zip"
-      || !size
-      || !/^[0-9a-f]{64}$/i.test(sha256 ?? "")
-    ) {
-      continue;
-    }
-
-    try {
-      validatePublicHttpsUrl(url ?? "", "historical launcher URL");
-      validatePublicHttpsUrl(notesUrl ?? "", "historical launcher notes URL");
-      validateReleaseDate(published ?? "");
-    } catch {
-      continue;
-    }
-
-    seen.add(version);
-    releases.push({
-      version,
-      url,
-      size,
-      sha256: sha256.toLowerCase(),
-      published,
-      notesUrl,
+      requirements,
+      localizationCatalogUrl,
     });
   }
   return releases;

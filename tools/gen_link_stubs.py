@@ -81,9 +81,15 @@ def main() -> None:
             "",
         ]
 
-    OUT.write_text("\n".join(body), encoding="utf-8", newline="\n")
+    output = "\n".join(body)
+    current = OUT.read_text(encoding="utf-8", errors="replace") if OUT.is_file() else None
+    if current != output:
+        OUT.write_text(output, encoding="utf-8", newline="\n")
+        status = "generated"
+    else:
+        status = "unchanged"
     print(
-        f"generated {len(names)} import stubs, skipped {len(implemented)} "
+        f"{status} {len(names)} import stubs, skipped {len(implemented)} "
         f"runtime implementations -> {OUT}"
     )
 

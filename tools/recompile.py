@@ -36,6 +36,8 @@ for marker in (
     "PPC_INST_LVXL128",
     "PPC_INST_STVLXL128",
     "PPC_INST_VANDC",
+    "Context-safe register localization",
+    "PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE",
 ):
     if marker not in recompiler_text:
         raise RuntimeError(

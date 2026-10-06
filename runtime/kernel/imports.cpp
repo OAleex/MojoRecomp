@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cctype>
 #include <cstdint>
@@ -30,10 +31,12 @@
 #include "../config/runtime_config.h"
 #include "../cpu/timebase.h"
 #include "../cpu/guest_thread.h"
+#include "../host/timing.h"
 #include "../cpu/guest_fiber.h"
 #include "../gpu/pm4.h"
 #include "../host/input.h"
 #include "../subtitles/subtitle_runtime.h"
+#include "../title_resources.h"
 #include "guestcall.h"
 #include "heap.h"
 #include "memory.h"
@@ -259,68 +262,10 @@ void HostSleepPrecise(uint32_t milliseconds)
         return;
     }
 
-    // Guest delays are expressed at 100 ns precision. Windows' ordinary
-    // sleep_for may overshoot a 16 ms request by a scheduler quantum, which is
-    // enough to make a 30 Hz title visibly run at roughly half speed. Prefer a
-    // process-local high-resolution waitable timer and keep a safe fallback.
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    thread_local HANDLE timer = []() -> HANDLE {
-        HANDLE value = CreateWaitableTimerExW(nullptr, nullptr,
-                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                              TIMER_MODIFY_STATE | SYNCHRONIZE);
-        if (!value)
-            value = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-        return value;
-    }();
-
-    if (timer)
-    {
-        LARGE_INTEGER due{};
-        due.QuadPart = -static_cast<LONGLONG>(milliseconds) * 10000ll;
-        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-        {
-            WaitForSingleObject(timer, INFINITE);
-            return;
-        }
-    }
-
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(milliseconds);
-    if (milliseconds > 1)
-        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds - 1));
-    while (std::chrono::steady_clock::now() < deadline)
-        std::this_thread::yield();
-}
-
-extern "C" void MojoRecompHostPollWaitUs(uint32_t microseconds)
-{
-    if (!microseconds)
-        return;
-
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    thread_local HANDLE timer = []() -> HANDLE {
-        HANDLE value = CreateWaitableTimerExW(nullptr, nullptr,
-                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                              TIMER_MODIFY_STATE | SYNCHRONIZE);
-        if (!value)
-            value = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-        return value;
-    }();
-    if (timer)
-    {
-        LARGE_INTEGER due{};
-        due.QuadPart = -static_cast<LONGLONG>(microseconds) * 10ll;
-        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-        {
-            WaitForSingleObject(timer, INFINITE);
-            return;
-        }
-    }
-    std::this_thread::yield();
+    // Guest delays are expressed at 100 ns precision. Keep their host wait on
+    // the shared high-resolution timing primitive so kernel, display and audio
+    // do not each carry subtly different scheduler behavior.
+    mojorecomp::host::WaitFor(std::chrono::milliseconds(milliseconds));
 }
 
 uint32_t GuestTimeoutToMs(const be<int64_t>* timeout)
@@ -935,13 +880,70 @@ uint32_t MmDeleteKernelStack_x(uint32_t stackBase, uint32_t stackEnd)
 // ---------------------------------------------------------------------------
 
 std::mutex g_csMapMutex;
-std::unordered_map<uint32_t, std::shared_ptr<std::recursive_mutex>> g_csMap;
+
+bool NativeCriticalSectionEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOJORECOMP_CS_NATIVE");
+        return !value || !*value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+struct HostRecursiveLock
+{
+    CRITICAL_SECTION native{};
+    std::unique_ptr<std::recursive_mutex> fallback;
+    bool useNative = false;
+
+    HostRecursiveLock() : useNative(NativeCriticalSectionEnabled())
+    {
+        if (useNative)
+        {
+            InitializeCriticalSectionEx(&native, 4000, 0);
+        }
+        else
+        {
+            fallback = std::make_unique<std::recursive_mutex>();
+        }
+    }
+
+    ~HostRecursiveLock()
+    {
+        if (useNative)
+            DeleteCriticalSection(&native);
+    }
+
+    HostRecursiveLock(const HostRecursiveLock&) = delete;
+    HostRecursiveLock& operator=(const HostRecursiveLock&) = delete;
+
+    void lock()
+    {
+        if (useNative)
+            EnterCriticalSection(&native);
+        else
+            fallback->lock();
+    }
+
+    void unlock()
+    {
+        if (useNative)
+            LeaveCriticalSection(&native);
+        else
+            fallback->unlock();
+    }
+};
+
+std::unordered_map<uint32_t, std::shared_ptr<HostRecursiveLock>> g_csMap;
 
 bool CriticalSectionCacheEnabled()
 {
     static const bool enabled = [] {
         const char* value = std::getenv("MOJORECOMP_CS_CACHE");
-        return value && *value && std::strcmp(value, "0") != 0;
+        // The map never erases critical-section locks, so the per-thread raw
+        // pointer cache is lifetime-safe and preserves the exact synchronized
+        // lookup semantics on misses.  Keep an explicit opt-out for diagnostics.
+        return !value || !*value || std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }
@@ -1025,17 +1027,17 @@ void ProfileCriticalSection(XRTL_CRITICAL_SECTION* cs)
     }
 }
 
-std::shared_ptr<std::recursive_mutex> CriticalSectionLock(XRTL_CRITICAL_SECTION* cs)
+std::shared_ptr<HostRecursiveLock> CriticalSectionLock(XRTL_CRITICAL_SECTION* cs)
 {
     const uint32_t key = g_guestMemory.MapVirtual(cs);
     std::lock_guard guard(g_csMapMutex);
     auto& slot = g_csMap[key];
     if (!slot)
-        slot = std::make_shared<std::recursive_mutex>();
+        slot = std::make_shared<HostRecursiveLock>();
     return slot;
 }
 
-std::recursive_mutex* CriticalSectionLockCached(XRTL_CRITICAL_SECTION* cs)
+HostRecursiveLock* CriticalSectionLockCached(XRTL_CRITICAL_SECTION* cs)
 {
     if (!CriticalSectionCacheEnabled())
         return CriticalSectionLock(cs).get();
@@ -1043,7 +1045,7 @@ std::recursive_mutex* CriticalSectionLockCached(XRTL_CRITICAL_SECTION* cs)
     struct CacheEntry
     {
         uint32_t key = 0;
-        std::recursive_mutex* lock = nullptr;
+        HostRecursiveLock* lock = nullptr;
     };
     thread_local std::array<CacheEntry, 32> cache{};
 
@@ -1855,6 +1857,13 @@ uint32_t NtCreateFile_x(be<uint32_t>* handleOut, uint32_t desiredAccess,
             return kStatusUnsuccessful;
         }
         file->size = truncate ? 0 : static_cast<uint64_t>(fs::file_size(hostPath, ec));
+
+        // Crash's Bink conversion shader is an ordinary 0x102A11xx shader
+        // container. Register its real microcode payload with PM4 from the
+        // resource name itself, so movie cadence never depends on a hardcoded
+        // shader hash tied to one retail build.
+        CotTitleResources_OnFileOpened(
+            file->guestPath, file->fp, file->size, truncate);
     }
 
     const uint32_t handle = AddHandle(file);
@@ -3023,7 +3032,10 @@ uint32_t XGetLanguage_x() { return mojorecomp::config::Get().xboxLanguage; }
 uint32_t XGetAVPack_x() { return 0; }
 uint32_t XGetGameRegion_x() { return 0x03FF; }
 uint32_t XamGetSystemVersion_x() { return 0; }
-uint32_t XamUserGetSigninState_x(uint32_t userIndex) { return userIndex == 0 ? 1u : 0u; }
+uint32_t XamUserGetSigninState_x(uint32_t userIndex)
+{
+    return userIndex < kHostInputPlayerCount ? 1u : 0u;
+}
 
 // XInput ABI structures. Keep these local until the host input backend is split out;
 // their layout is guest-visible and therefore explicitly endian-aware.
@@ -3084,7 +3096,7 @@ uint32_t XamInputGetCapabilities_x(uint32_t userIndex, uint32_t flags,
         return kErrorDeviceNotConnected;
 
     userIndex = NormalizeInputUser(userIndex, flags);
-    if (userIndex != 0)
+    if (userIndex >= kHostInputPlayerCount)
         return kErrorDeviceNotConnected;
 
     // Report one ordinary Xbox 360 gamepad. The boot probe has no host window yet,
@@ -3108,7 +3120,7 @@ uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags, XInputState* sta
     if ((flags & 0xFFu) && !(flags & kXInputFlagGamepad))
         return kErrorDeviceNotConnected;
     userIndex = NormalizeInputUser(userIndex, flags);
-    if (userIndex != 0)
+    if (userIndex >= kHostInputPlayerCount)
     {
         if (state)
             std::memset(state, 0, sizeof(*state));
@@ -3117,9 +3129,9 @@ uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags, XInputState* sta
     if (!state)
         return kStatusInvalidParameter;
 
-    static std::atomic<uint32_t> packet{1};
+    static std::array<std::atomic<uint32_t>, kHostInputPlayerCount> packets{};
     HostInputState host{};
-    HostInput_Poll(host);
+    HostInput_Poll(userIndex, host);
 
     // F2 Unlock All is consumed here because this import is executed on the
     // active guest PPC thread immediately after the host hotkey poll. That lets
@@ -3458,7 +3470,7 @@ uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags, XInputState* sta
     }
 
     std::memset(state, 0, sizeof(*state));
-    state->packetNumber = packet.fetch_add(1, std::memory_order_relaxed);
+    state->packetNumber = packets[userIndex].fetch_add(1, std::memory_order_relaxed) + 1;
     state->gamepad.buttons = host.buttons;
     state->gamepad.leftTrigger = host.leftTrigger;
     state->gamepad.rightTrigger = host.rightTrigger;
@@ -3471,9 +3483,13 @@ uint32_t XamInputGetState_x(uint32_t userIndex, uint32_t flags, XInputState* sta
 
 uint32_t XamInputSetState_x(uint32_t userIndex, uint32_t flags, XInputVibration* vibration)
 {
-    (void)vibration;
     userIndex = NormalizeInputUser(userIndex, flags);
-    return userIndex == 0 ? 0u : kErrorDeviceNotConnected;
+    if (userIndex >= kHostInputPlayerCount)
+        return kErrorDeviceNotConnected;
+    if (!vibration)
+        return kStatusInvalidParameter;
+    HostInput_SetVibration(userIndex, vibration->leftMotorSpeed, vibration->rightMotorSpeed);
+    return 0;
 }
 
 struct XWsaData
@@ -3669,7 +3685,7 @@ uint32_t XamUserReadProfileSettings_x(uint32_t titleId, uint32_t userIndex,
         return CompleteProfileCall(kXErrorInvalidParameter, overlapped);
     if (xuidCount > 1 || (xuidCount != 0 && !xuids))
         return CompleteProfileCall(kXErrorInvalidParameter, overlapped);
-    if (xuidCount == 0 && userIndex != 0)
+    if (xuidCount == 0 && userIndex >= kHostInputPlayerCount)
         return CompleteProfileCall(kXErrorNoSuchUser, overlapped);
 
     uint32_t dataBytes = 0;

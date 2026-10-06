@@ -17,7 +17,7 @@ export type GameInfo = {
   };
 };
 
-export type LocalizationProfile = "en" | "de" | "fr" | "es" | "it" | "nl" | "pt-BR";
+export type LocalizationProfile = string;
 
 export type Settings = {
   schema_version: number;
@@ -36,6 +36,7 @@ export type Settings = {
   graphics: {
     anti_aliasing: "off" | "fxaa" | "fxaa_extreme";
     texture_filtering: "default" | "1x" | "2x" | "4x" | "8x" | "16x";
+    frame_rate: "30" | "60";
   };
   advanced: {
     logging_enabled: boolean;
@@ -65,6 +66,8 @@ export type ComponentUpdateStatus = {
   kind: "launcher" | "runtime" | "language";
   game_id: string | null;
   locale: string | null;
+  display_name: string | null;
+  xbox_language: number | null;
   installed_version: string | null;
   latest_version: string | null;
   state:
@@ -80,7 +83,14 @@ export type ComponentUpdateStatus = {
   published: string | null;
   notes_url: string | null;
   last_action: string | null;
+  can_rollback: boolean;
   releases: ComponentReleaseStatus[];
+  installed_versions: InstalledComponentVersionStatus[];
+};
+
+export type InstalledComponentVersionStatus = {
+  version: string;
+  healthy: boolean;
 };
 
 export type ComponentReleaseStatus = {
@@ -102,7 +112,7 @@ export type ComponentUpdateProgress = {
     | "downloading"
     | "validating"
     | "installing"
-    | "ready_manual"
+    | "ready_restart"
     | "complete"
     | "failed";
   progress: number;
@@ -113,8 +123,30 @@ export type ComponentUpdateProgress = {
 
 export type ComponentUpdateResult = {
   component_id: string;
-  state: "installed" | "ready_manual";
+  state: "installed" | "downloaded" | "ready_restart";
   restart_required: boolean;
+};
+
+export type RuntimeAdditionalLanguageStatus = {
+  id: string;
+  locale: string;
+  display_name: string;
+  version: string;
+  installed_version: string | null;
+};
+
+export type RuntimeAdditionalContentStatus = {
+  game_id: string;
+  runtime_version: string;
+  pack_version: string;
+  pack_size: number;
+  languages: RuntimeAdditionalLanguageStatus[];
+};
+
+export type LocalizationPackInstallResult = {
+  game_id: string;
+  version: string;
+  installed_languages: string[];
 };
 
 export type GameSetupProgress = {
@@ -140,6 +172,8 @@ export type LauncherStorageStatus = {
   default_library_path: string;
   existing_library_detected: boolean;
   available_bytes: number;
+  discord_activity_enabled: boolean;
+  language_setup_completed_games: string[];
   notice?: string | null;
 };
 
@@ -161,7 +195,7 @@ export type LibraryMigrationProgress = {
 };
 
 export type LocalizationStatus = {
-  profile: "pt-BR";
+  profile: string;
   source_installed: boolean;
   overlay_ready: boolean;
   detail: string;
@@ -169,7 +203,7 @@ export type LocalizationStatus = {
 
 export type LocalizationProgress = {
   game_id: string;
-  profile: "pt-BR";
+  profile: string;
   stage: "importing" | "imported" | "preparing" | "building" | "complete" | "failed" | "cancelled";
   progress: number;
   detail: string;

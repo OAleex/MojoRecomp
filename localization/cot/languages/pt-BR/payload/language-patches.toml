@@ -1,0 +1,59 @@
+schema_version = 1
+game_id = "cot"
+locale = "pt-BR"
+
+[[patch]]
+archive_path = "levels\\L3_E3\\statics.lua"
+file = "patches/statics.mjdelta"
+
+[[patch]]
+archive_path = "package\\5000af12.p3d"
+file = "patches/5000af12.mjdelta"
+
+[[patch]]
+archive_path = "mdl\\c80d681a.p3d"
+file = "patches/c80d681a.mjdelta"
+
+[[patch]]
+archive_path = "levels\\L4_E4\\props_normal.lua"
+file = "patches/props_normal.mjdelta"
+
+[[patch]]
+archive_path = "package\\7a8185b0.p3d"
+file = "patches/7a8185b0.mjdelta"
+
+[[patch]]
+archive_path = "package\\c1e387c7.p3d"
+file = "patches/c1e387c7.mjdelta"
+
+[[patch]]
+archive_path = "package\\7efdcd91.p3d"
+file = "patches/7efdcd91.mjdelta"
+
+[[patch]]
+archive_path = "package\\7a88cba0.p3d"
+file = "patches/7a88cba0.mjdelta"
+
+[[patch]]
+archive_path = "package\\cdd70a8c.p3d"
+file = "patches/cdd70a8c.mjdelta"
+
+[[patch]]
+archive_path = "package\\97597d1b.p3d"
+file = "patches/97597d1b.mjdelta"
+
+[[patch]]
+archive_path = "package\\b4c85fe7.p3d"
+file = "patches/b4c85fe7.mjdelta"
+
+[[patch]]
+archive_path = "package\\bea9f18c.p3d"
+file = "patches/bea9f18c.mjdelta"
+
+[[patch]]
+archive_path = "package\\79aea37a.p3d"
+file = "patches/79aea37a.mjdelta"
+
+[[patch]]
+archive_path = "package\\a2c6e833.p3d"
+file = "patches/a2c6e833.mjdelta"

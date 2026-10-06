@@ -10,10 +10,13 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "../host/window.h"
+#include "texture_abi.h"
+#include "vulkan_adapter_policy.h"
 
 namespace mojorecomp::gpu {
 namespace {
@@ -108,7 +111,7 @@ int RunHardwareProbeJson()
     };
     VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     application.pApplicationName = "MojoRecomp Hardware Probe";
-    application.apiVersion = VK_API_VERSION_1_0;
+    application.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instanceInfo.pApplicationInfo = &application;
     instanceInfo.enabledExtensionCount = 2;
@@ -125,8 +128,9 @@ int RunHardwareProbeJson()
 
     PFN_vkDestroyInstance destroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices enumeratePhysicalDevices = nullptr;
+    PFN_vkEnumerateDeviceExtensionProperties enumerateDeviceExtensionProperties = nullptr;
     PFN_vkGetPhysicalDeviceProperties getPhysicalDeviceProperties = nullptr;
-    PFN_vkGetPhysicalDeviceFeatures getPhysicalDeviceFeatures = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2 = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties getQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR getSurfaceSupport = nullptr;
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getPresentModes = nullptr;
@@ -135,8 +139,10 @@ int RunHardwareProbeJson()
     const bool loaded =
         LoadInstance(getInstanceProcAddr, instance, destroyInstance, "vkDestroyInstance") &&
         LoadInstance(getInstanceProcAddr, instance, enumeratePhysicalDevices, "vkEnumeratePhysicalDevices") &&
+        LoadInstance(getInstanceProcAddr, instance, enumerateDeviceExtensionProperties,
+                     "vkEnumerateDeviceExtensionProperties") &&
         LoadInstance(getInstanceProcAddr, instance, getPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties") &&
-        LoadInstance(getInstanceProcAddr, instance, getPhysicalDeviceFeatures, "vkGetPhysicalDeviceFeatures") &&
+        LoadInstance(getInstanceProcAddr, instance, getPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2") &&
         LoadInstance(getInstanceProcAddr, instance, getQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties") &&
         LoadInstance(getInstanceProcAddr, instance, getSurfaceSupport, "vkGetPhysicalDeviceSurfaceSupportKHR") &&
         LoadInstance(getInstanceProcAddr, instance, getPresentModes, "vkGetPhysicalDeviceSurfacePresentModesKHR") &&
@@ -179,8 +185,14 @@ int RunHardwareProbeJson()
     }
 
     VkPhysicalDevice selected = VK_NULL_HANDLE;
+    uint32_t bestPreference = 0;
+    bool haveCompatibleAdapter = false;
     for (VkPhysicalDevice candidate : physicalDevices)
     {
+        VkPhysicalDeviceProperties candidateProperties{};
+        getPhysicalDeviceProperties(candidate, &candidateProperties);
+
+        bool graphicsPresent = false;
         uint32_t queueCount = 0;
         getQueueFamilyProperties(candidate, &queueCount, nullptr);
         std::vector<VkQueueFamilyProperties> queues(queueCount);
@@ -191,17 +203,72 @@ int RunHardwareProbeJson()
             getSurfaceSupport(candidate, q, surface, &present);
             if ((queues[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present)
             {
-                selected = candidate;
+                graphicsPresent = true;
                 break;
             }
         }
-        if (selected)
-            break;
+
+        bool hasSwapchain = false;
+        uint32_t extensionCount = 0;
+        if (enumerateDeviceExtensionProperties(
+                candidate, nullptr, &extensionCount, nullptr) == VK_SUCCESS &&
+            extensionCount)
+        {
+            std::vector<VkExtensionProperties> extensions(extensionCount);
+            if (enumerateDeviceExtensionProperties(
+                    candidate, nullptr, &extensionCount, extensions.data()) == VK_SUCCESS)
+            {
+                for (const auto& extension : extensions)
+                {
+                    if (std::strcmp(extension.extensionName,
+                                    VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
+                    {
+                        hasSwapchain = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        VkPhysicalDeviceVulkan12Features candidate12{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan13Features candidate13{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        candidate13.pNext = &candidate12;
+        VkPhysicalDeviceFeatures2 candidateFeatures{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        candidateFeatures.pNext = &candidate13;
+        getPhysicalDeviceFeatures2(candidate, &candidateFeatures);
+
+        const VulkanAdapterCapabilities caps = VulkanAdapterCapabilitiesFor(
+            graphicsPresent,
+            hasSwapchain,
+            candidateProperties.apiVersion >= VK_API_VERSION_1_3,
+            candidateFeatures.features.shaderInt64 == VK_TRUE,
+            candidate12.bufferDeviceAddress == VK_TRUE,
+            candidate12.runtimeDescriptorArray == VK_TRUE,
+            candidate13.dynamicRendering == VK_TRUE,
+            candidateFeatures.features.shaderSampledImageArrayDynamicIndexing == VK_TRUE,
+            candidateProperties.limits,
+            true,
+            mojorecomp::texture_abi::kSlots);
+
+        const VulkanAdapterClass deviceClass =
+            VulkanAdapterClassFor(uint32_t(candidateProperties.deviceType));
+
+        const bool compatible = VulkanAdapterIsRendererCompatible(caps);
+        const uint32_t preference = VulkanAdapterPreference(deviceClass);
+        if (!compatible || (haveCompatibleAdapter && preference <= bestPreference))
+            continue;
+
+        selected = candidate;
+        bestPreference = preference;
+        haveCompatibleAdapter = true;
     }
 
     if (!selected)
     {
-        std::fprintf(stderr, "hardware probe: no graphics+present Vulkan adapter found\n");
+        std::fprintf(stderr, "hardware probe: no renderer-compatible Vulkan adapter found\n");
         destroySurface(instance, surface, nullptr);
         destroyInstance(instance, nullptr);
         HostWindow_Shutdown();
@@ -210,9 +277,9 @@ int RunHardwareProbeJson()
     }
 
     VkPhysicalDeviceProperties properties{};
-    VkPhysicalDeviceFeatures features{};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     getPhysicalDeviceProperties(selected, &properties);
-    getPhysicalDeviceFeatures(selected, &features);
+    getPhysicalDeviceFeatures2(selected, &features);
 
     uint32_t modeCount = 0;
     getPresentModes(selected, surface, &modeCount, nullptr);
@@ -238,11 +305,12 @@ int RunHardwareProbeJson()
                 VK_VERSION_MINOR(properties.apiVersion),
                 VK_VERSION_PATCH(properties.apiVersion));
     std::printf("  \"sampler_anisotropy\": %s,\n",
-                features.samplerAnisotropy ? "true" : "false");
+                features.features.samplerAnisotropy ? "true" : "false");
     std::printf("  \"max_anisotropy\": %.0f,\n",
-                features.samplerAnisotropy ? properties.limits.maxSamplerAnisotropy : 1.0f);
+                features.features.samplerAnisotropy
+                    ? properties.limits.maxSamplerAnisotropy : 1.0f);
     std::printf("  \"bc_texture_compression\": %s,\n",
-                features.textureCompressionBC ? "true" : "false");
+                features.features.textureCompressionBC ? "true" : "false");
     std::printf("  \"supported_present_modes\": [");
     for (size_t i = 0; i < modeNames.size(); ++i)
         std::printf("%s\"%s\"", i ? ", " : "", modeNames[i].c_str());

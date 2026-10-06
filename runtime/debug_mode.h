@@ -16,6 +16,7 @@ struct DebugOverlaySnapshot
     double speed = 1.0;
     double fps = 0.0;
     double frameMs = 0.0;
+    std::array<char, 96> runtimeLabel{};
     std::array<char, 96> notification{};
 };
 

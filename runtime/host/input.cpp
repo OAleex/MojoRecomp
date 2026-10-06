@@ -1,5 +1,6 @@
 #include "input.h"
 #include "input_merge.h"
+#include "window.h"
 #include "../debug_mode.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -12,12 +13,14 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -43,7 +46,9 @@ uint32_t InputPollCacheUs()
 {
     static const uint32_t value = [] {
         const char* text = std::getenv("MOJORECOMP_INPUT_POLL_CACHE_US");
-        if (!text || !*text || text[0] == '0')
+        if (!text || !*text)
+            return 1000u;
+        if (text[0] == '0')
             return 0u;
         char* end = nullptr;
         const unsigned long parsed = std::strtoul(text, &end, 10);
@@ -133,7 +138,14 @@ struct XInputStateNative
     XInputGamepadNative gamepad;
 };
 
+struct XInputVibrationNative
+{
+    uint16_t leftMotorSpeed;
+    uint16_t rightMotorSpeed;
+};
+
 using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XInputStateNative*);
+using XInputSetStateFn = DWORD(WINAPI*)(DWORD, XInputVibrationNative*);
 
 XInputGetStateFn GetXInput()
 {
@@ -146,6 +158,23 @@ XInputGetStateFn GetXInput()
             if (HMODULE module = LoadLibraryW(dll))
                 if (auto proc = GetProcAddress(module, "XInputGetState"))
                     return reinterpret_cast<XInputGetStateFn>(proc);
+        }
+        return nullptr;
+    }();
+    return fn;
+}
+
+XInputSetStateFn SetXInput()
+{
+    static XInputSetStateFn fn = []() -> XInputSetStateFn {
+        constexpr const wchar_t* dlls[] = {
+            L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll"
+        };
+        for (const wchar_t* dll : dlls)
+        {
+            if (HMODULE module = LoadLibraryW(dll))
+                if (auto proc = GetProcAddress(module, "XInputSetState"))
+                    return reinterpret_cast<XInputSetStateFn>(proc);
         }
         return nullptr;
     }();
@@ -248,7 +277,7 @@ bool MergeSdlGamepad(HostInputState& state, SDL_Gamepad* gamepad)
     return true;
 }
 
-SDL_Gamepad* FindSdlGamepad()
+bool EnsureSdlGamepadSubsystem()
 {
     static bool initAttempted = false;
     static bool initialized = false;
@@ -259,23 +288,53 @@ SDL_Gamepad* FindSdlGamepad()
         if (!initialized)
             std::fprintf(stderr, "[input] SDL3 gamepad init failed: %s\n", SDL_GetError());
     }
-    if (!initialized)
-        return nullptr;
-
-    SDL_UpdateGamepads();
-    int count = 0;
-    SDL_JoystickID* ids = SDL_GetGamepads(&count);
-    if (!ids || count <= 0)
-    {
-        SDL_free(ids);
-        return nullptr;
-    }
-
-    SDL_Gamepad* gamepad = SDL_OpenGamepad(ids[0]);
-    SDL_free(ids);
-    return gamepad;
+    return initialized;
 }
 #endif
+
+enum class ControllerBackend : uint8_t
+{
+    None,
+    SDL3,
+    XInput,
+    WinMM,
+};
+
+struct ControllerSelection
+{
+    ControllerBackend backend = ControllerBackend::None;
+    UINT id = 0;
+    JOYCAPSW caps{};
+#if defined(MOJORECOMP_HAS_SDL3)
+    SDL_Gamepad* gamepad = nullptr;
+#endif
+    std::chrono::steady_clock::time_point nextScan{};
+};
+
+std::array<ControllerSelection, kHostInputPlayerCount> g_controllers{};
+std::mutex g_controllerMutex;
+
+bool ControllerIdInUse(ControllerBackend backend, UINT id, uint32_t exceptPlayer)
+{
+    for (uint32_t player = 0; player < kHostInputPlayerCount; ++player)
+    {
+        if (player == exceptPlayer)
+            continue;
+        const auto& selected = g_controllers[player];
+        if (selected.backend == backend && selected.id == id)
+            return true;
+    }
+    return false;
+}
+
+void ClearControllerSelection(ControllerSelection& selected)
+{
+#if defined(MOJORECOMP_HAS_SDL3)
+    if (selected.gamepad)
+        SDL_CloseGamepad(selected.gamepad);
+#endif
+    selected = {};
+}
 
 void MergePov(HostInputState& state, DWORD pov)
 {
@@ -360,39 +419,29 @@ bool MergeWinMmController(HostInputState& state, UINT id, const JOYCAPSW& caps)
     return true;
 }
 
-void MergeController(HostInputState& state)
+void MergeController(HostInputState& state, uint32_t playerIndex)
 {
+    if (playerIndex >= kHostInputPlayerCount)
+        return;
+
+    std::lock_guard lock(g_controllerMutex);
     const auto getState = GetXInput();
-    enum class Backend { None, SDL3, XInput, WinMM };
-    struct Selection
-    {
-        Backend backend = Backend::None;
-        UINT id = 0;
-        JOYCAPSW caps{};
-#if defined(MOJORECOMP_HAS_SDL3)
-        SDL_Gamepad* gamepad = nullptr;
-#endif
-        std::chrono::steady_clock::time_point nextScan{};
-    };
-    static Selection selected;
+    auto& selected = g_controllers[playerIndex];
 
     // Keep using the currently selected device while it is alive. If it is
     // unplugged, fall through immediately and look for another one.
 #if defined(MOJORECOMP_HAS_SDL3)
-    if (selected.backend == Backend::SDL3)
+    if (selected.backend == ControllerBackend::SDL3)
     {
         if (MergeSdlGamepad(state, selected.gamepad))
             return;
-        if (selected.gamepad)
-            SDL_CloseGamepad(selected.gamepad);
-        selected.gamepad = nullptr;
-        std::fprintf(stderr, "[input] SDL3 controller disconnected\n");
-        selected.backend = Backend::None;
-        selected.nextScan = {};
+        std::fprintf(stderr, "[input] player %u SDL3 controller disconnected\n",
+                     playerIndex + 1);
+        ClearControllerSelection(selected);
     }
     else
 #endif
-    if (selected.backend == Backend::XInput && getState)
+    if (selected.backend == ControllerBackend::XInput && getState)
     {
         XInputStateNative native{};
         if (getState(selected.id, &native) == ERROR_SUCCESS)
@@ -400,17 +449,17 @@ void MergeController(HostInputState& state)
             MergeXInputState(state, native);
             return;
         }
-        std::fprintf(stderr, "[input] XInput controller %u disconnected\n", selected.id);
-        selected.backend = Backend::None;
-        selected.nextScan = {};
+        std::fprintf(stderr, "[input] player %u XInput controller %u disconnected\n",
+                     playerIndex + 1, selected.id);
+        ClearControllerSelection(selected);
     }
-    else if (selected.backend == Backend::WinMM)
+    else if (selected.backend == ControllerBackend::WinMM)
     {
         if (MergeWinMmController(state, selected.id, selected.caps))
             return;
-        std::fprintf(stderr, "[input] WinMM controller %u disconnected\n", selected.id);
-        selected.backend = Backend::None;
-        selected.nextScan = {};
+        std::fprintf(stderr, "[input] player %u WinMM controller %u disconnected\n",
+                     playerIndex + 1, selected.id);
+        ClearControllerSelection(selected);
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -422,17 +471,41 @@ void MergeController(HostInputState& state)
     selected.nextScan = now + std::chrono::milliseconds(250);
 
 #if defined(MOJORECOMP_HAS_SDL3)
-    if (SDL_Gamepad* gamepad = FindSdlGamepad())
+    if (EnsureSdlGamepadSubsystem())
     {
-        selected.backend = Backend::SDL3;
-        selected.gamepad = gamepad;
-        const char* name = SDL_GetGamepadName(gamepad);
-        std::fprintf(stderr,
-                     "[input] SDL3 controller connected: %s (VID=%04X PID=%04X)\n",
-                     name ? name : "unknown",
-                     SDL_GetGamepadVendor(gamepad), SDL_GetGamepadProduct(gamepad));
-        MergeSdlGamepad(state, gamepad);
-        return;
+        SDL_UpdateGamepads();
+        int count = 0;
+        SDL_JoystickID* ids = SDL_GetGamepads(&count);
+        if (ids && count > 0)
+        {
+            for (int index = 0; index < count; ++index)
+            {
+                const UINT id = static_cast<UINT>(ids[index]);
+                if (ControllerIdInUse(ControllerBackend::SDL3, id, playerIndex))
+                    continue;
+                SDL_Gamepad* gamepad = SDL_OpenGamepad(ids[index]);
+                if (!gamepad)
+                    continue;
+                selected.backend = ControllerBackend::SDL3;
+                selected.id = id;
+                selected.gamepad = gamepad;
+                const char* name = SDL_GetGamepadName(gamepad);
+                std::fprintf(stderr,
+                             "[input] player %u SDL3 controller connected: %s "
+                             "(VID=%04X PID=%04X)\n",
+                             playerIndex + 1, name ? name : "unknown",
+                             SDL_GetGamepadVendor(gamepad), SDL_GetGamepadProduct(gamepad));
+                SDL_free(ids);
+                MergeSdlGamepad(state, gamepad);
+                return;
+            }
+            SDL_free(ids);
+            // SDL owns the currently visible gamepad set. Do not fall through
+            // to XInput/WinMM and accidentally assign the same physical pad to
+            // a second virtual player through another backend.
+            return;
+        }
+        SDL_free(ids);
     }
 #endif
 
@@ -440,13 +513,17 @@ void MergeController(HostInputState& state)
     {
         for (DWORD id = 0; id < 4; ++id)
         {
+            if (ControllerIdInUse(ControllerBackend::XInput,
+                                  static_cast<UINT>(id), playerIndex))
+                continue;
             XInputStateNative native{};
             if (getState(id, &native) != ERROR_SUCCESS)
                 continue;
-            selected.backend = Backend::XInput;
+            selected.backend = ControllerBackend::XInput;
             selected.id = id;
-            std::fprintf(stderr, "[input] XInput controller connected on slot %lu\n",
-                         static_cast<unsigned long>(id));
+            std::fprintf(stderr,
+                         "[input] player %u XInput controller connected on slot %lu\n",
+                         playerIndex + 1, static_cast<unsigned long>(id));
             MergeXInputState(state, native);
             return;
         }
@@ -455,6 +532,8 @@ void MergeController(HostInputState& state)
     const UINT count = std::min<UINT>(joyGetNumDevs(), 16u);
     for (UINT id = 0; id < count; ++id)
     {
+        if (ControllerIdInUse(ControllerBackend::WinMM, id, playerIndex))
+            continue;
         JOYINFOEX probe{};
         probe.dwSize = sizeof(probe);
         probe.dwFlags = JOY_RETURNALL;
@@ -465,34 +544,73 @@ void MergeController(HostInputState& state)
         if (joyGetDevCapsW(id, &caps, sizeof(caps)) != JOYERR_NOERROR)
             continue;
 
-        selected.backend = Backend::WinMM;
+        selected.backend = ControllerBackend::WinMM;
         selected.id = id;
         selected.caps = caps;
         std::fwprintf(stderr,
-                      L"[input] WinMM/HID controller connected on slot %u: %ls "
+                      L"[input] player %u WinMM/HID controller connected on slot %u: %ls "
                       L"(VID=%04X PID=%04X)\n",
-                      id, caps.szPname, caps.wMid, caps.wPid);
+                      playerIndex + 1, id, caps.szPname, caps.wMid, caps.wPid);
         MergeWinMmController(state, id, selected.caps);
         return;
     }
 }
 
-void MergeKeyboard(HostInputState& state)
+void MergeKeyboard(HostInputState& state, uint32_t playerIndex)
 {
-    if (Down('J') || Down(VK_SPACE)) state.buttons |= kA;
-    if (Down('K')) state.buttons |= kB;
-    if (Down('U')) state.buttons |= kX;
-    if (Down('I')) state.buttons |= kY;
-    if (Down('Z')) state.buttons |= kLeftShoulder;
-    if (Down('C')) state.buttons |= kRightShoulder;
-    if (Down('F')) state.buttons |= kLeftThumb;
-    if (Down('R')) state.buttons |= kRightThumb;
+    if (playerIndex == 1)
+    {
+        if (Down('O')) state.buttons |= kA;
+        if (Down('P')) state.buttons |= kB;
+        if (Down('U')) state.buttons |= kX;
+        if (Down('Y')) state.buttons |= kY;
+        if (Down('H')) state.buttons |= kLeftShoulder;
+        if (Down(VK_OEM_1)) state.buttons |= kRightShoulder;
+        if (Down(VK_OEM_COMMA)) state.buttons |= kLeftThumb;
+        if (Down(VK_OEM_PERIOD)) state.buttons |= kRightThumb;
+        if (Down(VK_OEM_6)) state.buttons |= kStart;
+        if (Down(VK_OEM_4)) state.buttons |= kBack;
+        if (Down('N')) state.leftTrigger = 0xFF;
+        if (Down('M')) state.rightTrigger = 0xFF;
+
+        const bool left = Down('J');
+        const bool right = Down('L');
+        const bool down = Down('K');
+        const bool up = Down('I');
+        if (Down(VK_RSHIFT))
+        {
+            if (up) state.buttons |= kDpadUp;
+            if (down) state.buttons |= kDpadDown;
+            if (left) state.buttons |= kDpadLeft;
+            if (right) state.buttons |= kDpadRight;
+        }
+        else if (Down(VK_RCONTROL))
+        {
+            mojorecomp::input::MergeDigitalAxis(state.thumbRX, left, right);
+            mojorecomp::input::MergeDigitalAxis(state.thumbRY, down, up);
+        }
+        else
+        {
+            mojorecomp::input::MergeDigitalAxis(state.thumbLX, left, right);
+            mojorecomp::input::MergeDigitalAxis(state.thumbLY, down, up);
+        }
+        return;
+    }
+
+    if (Down('F') || Down(VK_SPACE)) state.buttons |= kA;
+    if (Down('G')) state.buttons |= kB;
+    if (Down('R')) state.buttons |= kX;
+    if (Down('T')) state.buttons |= kY;
+    if (Down('Q')) state.buttons |= kLeftShoulder;
+    if (Down('E')) state.buttons |= kRightShoulder;
+    if (Down('X')) state.buttons |= kLeftThumb;
+    if (Down('V')) state.buttons |= kRightThumb;
     if (Down(VK_RETURN)) state.buttons |= kStart;
     if (Down(VK_TAB)) state.buttons |= kBack;
 
     // Arrow keys are the right stick by default. Shift+arrows become the D-pad,
     // matching the old MojoRecomp bindings.
-    const bool shift = Down(VK_SHIFT);
+    const bool shift = Down(VK_LSHIFT);
     if (shift)
     {
         if (Down(VK_UP)) state.buttons |= kDpadUp;
@@ -516,8 +634,8 @@ void MergeKeyboard(HostInputState& state)
     const bool moveUp = Down('W');
     mojorecomp::input::MergeDigitalAxis(state.thumbLX, moveLeft, moveRight);
     mojorecomp::input::MergeDigitalAxis(state.thumbLY, moveDown, moveUp);
-    if (Down('Q')) state.leftTrigger = 0xFF;
-    if (Down('E')) state.rightTrigger = 0xFF;
+    if (Down('Z')) state.leftTrigger = 0xFF;
+    if (Down('C')) state.rightTrigger = 0xFF;
 }
 
 void MergeDiagnosticAutopilot(HostInputState& state)
@@ -722,8 +840,30 @@ void MergeDiagnosticCommandFile(HostInputState& state)
 
 } // namespace
 
-void HostInput_Poll(HostInputState& state)
+void HostInput_Poll(uint32_t playerIndex, HostInputState& state)
 {
+    if (playerIndex >= kHostInputPlayerCount)
+    {
+        state = {};
+        return;
+    }
+
+    const bool acceptsPhysicalInput = HostWindow_AcceptsInput();
+    const auto populate = [&] {
+        state = {};
+        if (acceptsPhysicalInput)
+        {
+            MergeController(state, playerIndex);
+            MergeKeyboard(state, playerIndex);
+        }
+        if (playerIndex == 0)
+        {
+            MergeDiagnosticAutopilot(state);
+            MergeDiagnosticCommandFile(state);
+        }
+        mojorecomp::debug::ApplyInput(state);
+    };
+
     const uint32_t cacheUs = InputPollCacheUs();
     if (cacheUs)
     {
@@ -732,33 +872,58 @@ void HostInput_Poll(HostInputState& state)
         {
             HostInputState state{};
             Clock::time_point timestamp{};
+            bool acceptsPhysicalInput = false;
             bool valid = false;
         };
-        static thread_local Cache cache;
+        static thread_local std::array<Cache, kHostInputPlayerCount> caches{};
+        Cache& cache = caches[playerIndex];
         const auto now = Clock::now();
-        if (cache.valid && now - cache.timestamp < std::chrono::microseconds(cacheUs))
+        if (cache.valid && cache.acceptsPhysicalInput == acceptsPhysicalInput &&
+            now - cache.timestamp < std::chrono::microseconds(cacheUs))
         {
             state = cache.state;
-            mojorecomp::debug::ApplyInput(state);
             return;
         }
 
-        state = {};
-        MergeController(state);
-        MergeKeyboard(state);
-        MergeDiagnosticAutopilot(state);
-        MergeDiagnosticCommandFile(state);
-        mojorecomp::debug::ApplyInput(state);
+        populate();
         cache.state = state;
         cache.timestamp = now;
+        cache.acceptsPhysicalInput = acceptsPhysicalInput;
         cache.valid = true;
         return;
     }
 
-    state = {};
-    MergeController(state);
-    MergeKeyboard(state);
-    MergeDiagnosticAutopilot(state);
-    MergeDiagnosticCommandFile(state);
-    mojorecomp::debug::ApplyInput(state);
+    populate();
+}
+
+void HostInput_SetVibration(uint32_t playerIndex, uint16_t leftMotor,
+                            uint16_t rightMotor)
+{
+    if (playerIndex >= kHostInputPlayerCount)
+        return;
+    if (!HostWindow_AcceptsInput())
+    {
+        leftMotor = 0;
+        rightMotor = 0;
+    }
+
+    std::lock_guard lock(g_controllerMutex);
+    auto& selected = g_controllers[playerIndex];
+#if defined(MOJORECOMP_HAS_SDL3)
+    if (selected.backend == ControllerBackend::SDL3 && selected.gamepad &&
+        SDL_GamepadConnected(selected.gamepad))
+    {
+        const Uint32 durationMs = (leftMotor || rightMotor) ? 1000u : 0u;
+        SDL_RumbleGamepad(selected.gamepad, leftMotor, rightMotor, durationMs);
+        return;
+    }
+#endif
+    if (selected.backend == ControllerBackend::XInput)
+    {
+        if (const auto setState = SetXInput())
+        {
+            XInputVibrationNative vibration{leftMotor, rightMotor};
+            setState(selected.id, &vibration);
+        }
+    }
 }

@@ -36,6 +36,18 @@ mojorecomp_read_version("suite" MOJORECOMP_SUITE_VERSION)
 mojorecomp_read_version("launcher" MOJORECOMP_LAUNCHER_VERSION)
 mojorecomp_read_version("cot_runtime" MOJORECOMP_COT_RUNTIME_VERSION)
 mojorecomp_read_version("mom_runtime" MOJORECOMP_MOM_RUNTIME_VERSION)
+execute_process(
+    COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY "${MOJORECOMP_ROOT}"
+    RESULT_VARIABLE MOJORECOMP_GIT_RESULT
+    OUTPUT_VARIABLE MOJORECOMP_GIT_SHA
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(MOJORECOMP_GIT_RESULT EQUAL 0 AND MOJORECOMP_GIT_SHA)
+    set(MOJORECOMP_BUILD_ID "git-${MOJORECOMP_GIT_SHA}")
+else()
+    set(MOJORECOMP_BUILD_ID "unknown")
+endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 configure_file(version_generated.h.in
     "${CMAKE_CURRENT_BINARY_DIR}/generated/mojorecomp_version.h" @ONLY)
@@ -53,6 +65,7 @@ endif()
 # explicit project requirement instead of relying on an inherited cache flag.
 if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
     add_compile_options(/EHsc)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 
     # Keep optimized configurations optimized even when a local/reconfigured
     # CMake cache has empty CMAKE_CXX_FLAGS_<CONFIG> entries.  build-smoke was
@@ -71,7 +84,67 @@ if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
         "$<$<CONFIG:MinSizeRel>:/DNDEBUG>")
 endif()
 
+set(MOJORECOMP_LTO OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(MOJORECOMP_LTO ON)
+endif()
+
+function(mojorecomp_enable_lto TARGET_NAME)
+    if(NOT TARGET ${TARGET_NAME})
+        message(FATAL_ERROR
+            "Unknown MojoRecomp target: ${TARGET_NAME}")
+    endif()
+
+    get_target_property(MOJORECOMP_OPT_TARGET_TYPE ${TARGET_NAME} TYPE)
+
+    if(MOJORECOMP_LTO)
+        target_compile_options(${TARGET_NAME} PRIVATE
+            "$<$<CONFIG:Release>:-flto=thin>")
+        if(NOT MOJORECOMP_OPT_TARGET_TYPE STREQUAL "STATIC_LIBRARY" AND
+           NOT MOJORECOMP_OPT_TARGET_TYPE STREQUAL "OBJECT_LIBRARY")
+            target_link_options(${TARGET_NAME} PRIVATE
+                "$<$<CONFIG:Release>:-flto=thin>")
+        endif()
+    endif()
+
+endfunction()
+
 if(BUILD_TESTING)
+    add_executable(MojoRecompStutterProfilerTest
+        tests/stutter_profiler_test.cpp
+        host/stutter_profiler.cpp)
+    add_test(NAME StutterProfiler COMMAND MojoRecompStutterProfilerTest)
+    set_tests_properties(StutterProfiler PROPERTIES TIMEOUT 10 LABELS "host;performance")
+    add_executable(MojoRecompFrameRatePolicyTest tests/frame_rate_policy_test.cpp)
+    add_test(NAME FrameRatePolicy COMMAND MojoRecompFrameRatePolicyTest)
+    set_tests_properties(FrameRatePolicy PROPERTIES TIMEOUT 10 LABELS "host;timing")
+    add_executable(MojoRecompTimingTest tests/timing_test.cpp)
+    add_test(NAME HostTiming COMMAND MojoRecompTimingTest)
+    set_tests_properties(HostTiming PROPERTIES TIMEOUT 10 LABELS "host;timing")
+    add_executable(MojoRecompPresentationMetricsTest
+        tests/presentation_metrics_test.cpp
+        host/presentation_metrics.cpp)
+    add_test(NAME PresentationMetrics COMMAND MojoRecompPresentationMetricsTest)
+    set_tests_properties(PresentationMetrics PROPERTIES TIMEOUT 10 LABELS "host;timing;performance")
+    add_executable(MojoRecompGpuExecutorTest
+        tests/gpu_executor_test.cpp
+        gpu/gpu_executor.cpp
+        gpu/guest_memory_snapshot.cpp)
+    add_test(NAME GpuExecutor COMMAND MojoRecompGpuExecutorTest)
+    set_tests_properties(GpuExecutor PROPERTIES TIMEOUT 10 LABELS "gpu;performance")
+    add_executable(MojoRecompGuestMemorySnapshotTest
+        tests/guest_memory_snapshot_test.cpp
+        gpu/guest_memory_snapshot.cpp)
+    if(WIN32)
+        target_link_libraries(MojoRecompGuestMemorySnapshotTest PRIVATE onecore)
+    endif()
+    add_test(NAME GuestMemorySnapshot COMMAND MojoRecompGuestMemorySnapshotTest)
+    set_tests_properties(GuestMemorySnapshot PROPERTIES TIMEOUT 10 LABELS "gpu;memory")
+    add_executable(MojoRecompShaderMetadataTest
+        tests/shader_metadata_test.cpp
+        gpu/shader_metadata.cpp)
+    add_test(NAME ShaderMetadata COMMAND MojoRecompShaderMetadataTest)
+    set_tests_properties(ShaderMetadata PROPERTIES TIMEOUT 10 LABELS "gpu;shader")
     add_executable(MojoRecompTextureAbiTest tests/texture_abi_test.cpp)
     add_test(NAME TextureAbi COMMAND MojoRecompTextureAbiTest)
     add_executable(MojoRecompDebugOverlayTest tests/debug_overlay_test.cpp)
@@ -208,7 +281,12 @@ file(GLOB PPC_SOURCES CONFIGURE_DEPENDS "${PPC_DIR}/*.cpp")
 list(LENGTH PPC_SOURCES PPC_TU_COUNT)
 message(STATUS "Crash of the Titans translated image: ${PPC_TU_COUNT} C++ files")
 
-add_library(mojorecomp_ppc STATIC ${PPC_SOURCES})
+if(MOJORECOMP_LTO)
+    add_library(mojorecomp_ppc OBJECT ${PPC_SOURCES})
+else()
+    add_library(mojorecomp_ppc STATIC ${PPC_SOURCES})
+endif()
+mojorecomp_enable_lto(mojorecomp_ppc)
 target_include_directories(mojorecomp_ppc PUBLIC
     "${PPC_DIR}"
     "${XENON_ROOT}/thirdparty/simde")
@@ -262,18 +340,25 @@ endforeach()
 file(READ "${XENOS_ROOT}/XenosRecomp/shader_common.h" MOJO_SHADER_COMMON_HEX HEX)
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," MOJO_SHADER_COMMON_BYTES
        "${MOJO_SHADER_COMMON_HEX}")
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/mojorecomp_shader_common_embedded.h"
-    "// Generated from the pinned XenosRecomp shader_common.h.\n"
-    "#pragma once\n"
-    "inline constexpr unsigned char g_mojoShaderCommonH[] = {${MOJO_SHADER_COMMON_BYTES}};\n"
-    "inline constexpr unsigned long g_mojoShaderCommonHSize = sizeof(g_mojoShaderCommonH);\n")
+file(CONFIGURE
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/mojorecomp_shader_common_embedded.h"
+    CONTENT "// Generated from the pinned XenosRecomp shader_common.h.\n#pragma once\ninline constexpr unsigned char g_mojoShaderCommonH[] = {${MOJO_SHADER_COMMON_BYTES}};\ninline constexpr unsigned long g_mojoShaderCommonHSize = sizeof(g_mojoShaderCommonH);\n"
+    @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${XENOS_ROOT}/XenosRecomp/shader_common.h")
 
-add_library(mojorecomp_shader_xlate STATIC
-    gpu/shader_translator.cpp
-    host/host_paths.cpp
-    "${XENOS_ROOT}/XenosRecomp/shader_recompiler.cpp")
+if(MOJORECOMP_LTO)
+    add_library(mojorecomp_shader_xlate OBJECT
+        gpu/shader_translator.cpp
+        host/host_paths.cpp
+        "${XENOS_ROOT}/XenosRecomp/shader_recompiler.cpp")
+else()
+    add_library(mojorecomp_shader_xlate STATIC
+        gpu/shader_translator.cpp
+        host/host_paths.cpp
+        "${XENOS_ROOT}/XenosRecomp/shader_recompiler.cpp")
+endif()
+mojorecomp_enable_lto(mojorecomp_shader_xlate)
 target_compile_definitions(mojorecomp_shader_xlate PRIVATE MOJORECOMP_XENOS_BOOL_EXEC)
 target_include_directories(mojorecomp_shader_xlate PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -311,10 +396,17 @@ set(MOJORECOMP_KERNEL_SOURCES
     kernel/vfs.cpp
     gpu/pm4.cpp
     gpu/renderer_probe.cpp
+    gpu/draw_snapshot.cpp
+    gpu/gpu_executor.cpp
+    gpu/guest_memory_snapshot.cpp
     gpu/shader_cache.cpp
+    gpu/shader_metadata.cpp
     gpu/vk_presenter.cpp
     gpu/vd.cpp
     host/input.cpp
+    host/presentation_metrics.cpp
+    host/stutter_profiler.cpp
+    host/timing.cpp
     host/system_font_atlas.cpp
     host/window.cpp
     audio/xaudio.cpp
@@ -325,6 +417,7 @@ set(MOJORECOMP_KERNEL_SOURCES
     cpu/guest_thread.cpp
     cpu/guest_fiber.cpp
     runtime_state.cpp
+    title_resources.cpp
     title_hooks.cpp)
 
 if(BUILD_TESTING AND WIN32)
@@ -348,6 +441,10 @@ if(BUILD_TESTING AND WIN32)
     add_test(NAME RuntimeCrashLogPath
         COMMAND MojoRecompBootProbe --crash-log-path-self-test)
     set_tests_properties(RuntimeCrashLogPath PROPERTIES TIMEOUT 15 LABELS "host;logging")
+
+    add_test(NAME RuntimeCrashDump
+        COMMAND MojoRecompBootProbe --crash-dump-self-test)
+    set_tests_properties(RuntimeCrashDump PROPERTIES TIMEOUT 20 LABELS "host;logging;crash")
 
     add_test(NAME RuntimeWindowResize
         COMMAND MojoRecompBootProbe --window-resize-self-test)
@@ -376,8 +473,14 @@ if(BUILD_TESTING AND WIN32)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/texture_probe_vs.hlsl"
         DEPENDS tests/texture_probe_vs.hlsl VERBATIM)
     add_executable(MojoRecompTextureGpuProbe tests/texture_gpu_probe.cpp
+        host/crash_reporter_stub.cpp
         gpu/shader_cache.cpp
+        gpu/shader_metadata.cpp
+        gpu/guest_memory_snapshot.cpp
+        gpu/pm4.cpp
         kernel/klog.cpp
+        host/presentation_metrics.cpp
+        host/stutter_profiler.cpp
         host/window.cpp
         host/system_font_atlas.cpp
         config/runtime_config.cpp
@@ -419,8 +522,10 @@ endif()
 
 add_executable(MojoRecompSmoke
     smoke_main.cpp
+    host/crash_reporter_stub.cpp
     ${MOJORECOMP_KERNEL_SOURCES}
     generated_import_stubs.cpp)
+mojorecomp_enable_lto(MojoRecompSmoke)
 target_include_directories(MojoRecompSmoke PRIVATE
     "${PPC_DIR}"
     "${MOJORECOMP_VULKAN_HEADERS}"
@@ -437,6 +542,7 @@ if(WIN32)
     target_link_libraries(MojoRecompSmoke PRIVATE
         onecore
         gdi32
+        ws2_32
         winmm
         ucrt
         oldnames
@@ -448,14 +554,14 @@ if(WIN32)
     endif()
 endif()
 
-# PPCFuncMappings references every translated symbol.  Linking it from the same
-# archive as the translated image makes this executable a full-image link gate,
-# not a sample that accidentally succeeds while dead code remains unresolved.
-if(MSVC)
-    target_link_options(MojoRecompSmoke PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:mojorecomp_ppc>")
-else()
-    target_link_options(MojoRecompSmoke PRIVATE
-        "-Wl,--whole-archive" "$<TARGET_FILE:mojorecomp_ppc>" "-Wl,--no-whole-archive")
+get_target_property(MOJORECOMP_PPC_TARGET_TYPE mojorecomp_ppc TYPE)
+if(MOJORECOMP_PPC_TARGET_TYPE STREQUAL "STATIC_LIBRARY")
+    if(MSVC)
+        target_link_options(MojoRecompSmoke PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:mojorecomp_ppc>")
+    else()
+        target_link_options(MojoRecompSmoke PRIVATE
+            "-Wl,--whole-archive" "$<TARGET_FILE:mojorecomp_ppc>" "-Wl,--no-whole-archive")
+    endif()
 endif()
 
 if(WIN32 AND EXISTS "${CLANG_BUILTINS}")
@@ -465,10 +571,24 @@ endif()
 if(WIN32)
     add_executable(MojoRecompBootProbe
         boot_probe.cpp
+        host/crash_reporter_windows.cpp
         tests/fiber_probe.cpp
         tests/event_probe.cpp
         ${MOJORECOMP_KERNEL_SOURCES}
         generated_import_stubs.cpp)
+    mojorecomp_enable_lto(MojoRecompBootProbe)
+    if(MSVC OR CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+        target_compile_options(MojoRecompBootProbe PRIVATE
+            "$<$<CONFIG:Release>:/Zi>")
+        target_link_options(MojoRecompBootProbe PRIVATE
+            "$<$<CONFIG:Release>:/DEBUG:FULL>"
+            "$<$<CONFIG:Release>:/PDBALTPATH:cot-runtime.pdb>"
+            "$<$<CONFIG:Release>:/OPT:REF>"
+            "$<$<CONFIG:Release>:/OPT:ICF>")
+        set_target_properties(MojoRecompBootProbe PROPERTIES
+            PDB_NAME "cot-runtime"
+            PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
     target_sources(MojoRecompBootProbe PRIVATE
         "${CMAKE_CURRENT_BINARY_DIR}/generated/mojorecomp_runtime.rc")
     target_include_directories(MojoRecompBootProbe PRIVATE
@@ -497,7 +617,9 @@ if(WIN32)
         "${CLANG_BUILTINS}"
         onecore
         gdi32
-        winmm)
+        ws2_32
+        winmm
+        dbghelp)
     if(MOJORECOMP_HAS_FFMPEG)
         target_link_libraries(MojoRecompBootProbe PRIVATE
             "${MOJORECOMP_FFMPEG_LIBDIR}/libavcodec.lib"
@@ -514,8 +636,12 @@ if(WIN32)
                 "$<TARGET_FILE_DIR:MojoRecompBootProbe>/mojorecomp-ffmpeg.dll"
             VERBATIM)
     endif()
-    target_link_options(MojoRecompBootProbe PRIVATE
-        "/WHOLEARCHIVE:$<TARGET_FILE:mojorecomp_ppc>" "/MAP")
+    if(MOJORECOMP_PPC_TARGET_TYPE STREQUAL "STATIC_LIBRARY")
+        target_link_options(MojoRecompBootProbe PRIVATE
+            "/WHOLEARCHIVE:$<TARGET_FILE:mojorecomp_ppc>" "/MAP")
+    else()
+        target_link_options(MojoRecompBootProbe PRIVATE "/MAP")
+    endif()
     add_custom_command(TARGET MojoRecompBootProbe POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:MojoRecompBootProbe>"

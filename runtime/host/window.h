@@ -9,6 +9,7 @@ void HostWindow_Pump();
 void HostWindow_Shutdown();
 void* HostWindow_NativeHandle();
 bool HostWindow_Alive();
+bool HostWindow_AcceptsInput();
 void HostWindow_SetTitle(const wchar_t* title);
 bool HostWindow_ConsumeResize(uint64_t& generation, uint32_t& width,
                               uint32_t& height, bool& minimized);

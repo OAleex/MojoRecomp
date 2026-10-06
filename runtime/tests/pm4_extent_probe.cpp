@@ -4,9 +4,23 @@
 #include <windows.h>
 #include "../gpu/pm4.h"
 #include "../gpu/xenos.h"
+#include "../title_resources.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
+
+namespace {
+
+void StoreBe32(uint8_t* destination, uint32_t value)
+{
+    destination[0] = static_cast<uint8_t>(value >> 24);
+    destination[1] = static_cast<uint8_t>(value >> 16);
+    destination[2] = static_cast<uint8_t>(value >> 8);
+    destination[3] = static_cast<uint8_t>(value);
+}
+
+} // namespace
 
 int main()
 {
@@ -68,6 +82,32 @@ int main()
     std::printf("%s: Type-0 shader constant fast path\n",
                 constantsValid ? "PASS" : "FAIL");
 
+    // A ShaderContainer uses the 0x102A11xx family. The low byte contains
+    // container flags and must not make a structurally valid pixel shader fail.
+    std::vector<uint8_t> binkContainer(0x24u + 12u, 0);
+    StoreBe32(binkContainer.data() + 0x00u, 0x102A117Fu);
+    StoreBe32(binkContainer.data() + 0x04u, 0x24u);
+    StoreBe32(binkContainer.data() + 0x08u, 12u);
+    StoreBe32(binkContainer.data() + 0x18u, 0x1Cu);
+    StoreBe32(binkContainer.data() + 0x1Cu, 0u);
+    StoreBe32(binkContainer.data() + 0x20u, 12u);
+    StoreBe32(binkContainer.data() + 0x24u, 0x00001000u);
+    StoreBe32(binkContainer.data() + 0x28u, 0x00001000u);
+    StoreBe32(binkContainer.data() + 0x2Cu, 0u);
+    const bool binkFamilyValid = Pm4_RegisterBinkPixelShaderContainer(
+        binkContainer.data(), binkContainer.size());
+    binkContainer[0] = 0x11;
+    const bool binkRejectsWrongFamily = !Pm4_RegisterBinkPixelShaderContainer(
+        binkContainer.data(), binkContainer.size());
+    const bool binkPathValid = CotTitleResources_IsBinkShaderPath(
+        "D:\\SHADERS\\BinkDecompress.out") &&
+        CotTitleResources_IsBinkShaderPath("D:/shaders/binkdecompress.out") &&
+        !CotTitleResources_IsBinkShaderPath("D:\\movies\\intro.bik");
+    std::printf("%s: Bink ShaderContainer 0x102A11xx family\n",
+                binkFamilyValid && binkRejectsWrongFamily && binkPathValid
+                    ? "PASS" : "FAIL");
+
     VirtualFree(base, 0, MEM_RELEASE);
-    return valid && constantsValid ? 0 : 1;
+    return valid && constantsValid && binkFamilyValid && binkRejectsWrongFamily &&
+           binkPathValid ? 0 : 1;
 }

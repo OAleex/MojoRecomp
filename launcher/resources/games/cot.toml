@@ -1,7 +1,7 @@
 id = "cot"
 name = "Crash of the Titans"
 runtime = "cot-runtime.exe"
-runtime_version = "0.1.0-alpha"
+runtime_version = "0.2.0-alpha"
 status = "alpha"
 playable = true
 

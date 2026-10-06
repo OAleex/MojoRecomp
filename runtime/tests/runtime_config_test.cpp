@@ -17,6 +17,14 @@ int Fail(const char* message)
 
 int main()
 {
+    const mojorecomp::config::RuntimeConfig defaults{};
+    if (defaults.resolutionScale != 1 ||
+        defaults.aspectRatio != mojorecomp::config::AspectRatio::Native16x9 ||
+        defaults.vsync ||
+        defaults.antiAliasing != mojorecomp::config::AntiAliasing::FxaaExtreme ||
+        defaults.textureFiltering != 8)
+        return Fail("balanced graphics defaults changed unexpectedly");
+
     const std::filesystem::path path =
         std::filesystem::temp_directory_path() / "mojorecomp-runtime-config-test.toml";
     {

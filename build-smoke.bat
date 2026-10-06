@@ -22,8 +22,8 @@ if not exist "%CLANGCL%" (
 )
 
 call "%VSVARS%" >nul || exit /b 1
-"%CMAKE%" -S "%ROOT%\runtime" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER="%CLANGCL%" -DCMAKE_CXX_COMPILER="%CLANGCL%" || exit /b 1
-"%CMAKE%" --build "%BUILD%" --parallel 8 || exit /b 1
+"%CMAKE%" -S "%ROOT%\runtime" -B "%BUILD%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_C_COMPILER="%CLANGCL%" -DCMAKE_CXX_COMPILER="%CLANGCL%" || exit /b 1
+"%CMAKE%" --build "%BUILD%" --target MojoRecompBootProbe MojoRecompSmoke --parallel || exit /b 1
 
 "%BUILD%\MojoRecompSmoke.exe"
 if errorlevel 1 (

@@ -48,8 +48,12 @@ int main()
     snapshot.speed = 1.0;
     snapshot.fps = 30.0;
     snapshot.frameMs = 33.333;
+    std::snprintf(snapshot.runtimeLabel.data(), snapshot.runtimeLabel.size(),
+                  "%s", "Crash of the Titans - 0.2.0-alpha Runtime");
     text = BuildOverlayText(snapshot);
-    if (!text.visible || text.left[0] != '\0' || text.rightCount != 1 ||
+    if (!text.visible ||
+        std::string_view(text.left.data()) != "Crash of the Titans - 0.2.0-alpha Runtime" ||
+        text.rightCount != 1 ||
         std::string_view(text.right[0].data()) !=
             "30.0 FPS | 33.33 ms | 1.00x")
         return 2;
@@ -60,7 +64,9 @@ int main()
     std::snprintf(snapshot.notification.data(), snapshot.notification.size(),
                   "%s", "All episodes unlocked");
     text = BuildOverlayText(snapshot);
-    if (text.rightCount != 2 ||
+    if (std::string_view(text.left.data()) !=
+            "Crash of the Titans - 0.2.0-alpha Runtime | DEBUG MODE" ||
+        text.rightCount != 2 ||
         std::string_view(text.right[0].data()) != "All episodes unlocked" ||
         std::string_view(text.right[1].data()) !=
             "30.0 FPS | 33.33 ms | 1.00x | FAST | PAUSED")

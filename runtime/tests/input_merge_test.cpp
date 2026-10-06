@@ -1,4 +1,5 @@
 #include "../host/input_merge.h"
+#include "../host/input.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -6,6 +7,7 @@
 
 int main()
 {
+    static_assert(kHostInputPlayerCount == 2);
     using mojorecomp::input::MergeDigitalAxis;
 
     int16_t leftX = 12345;

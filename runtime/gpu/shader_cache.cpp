@@ -78,6 +78,44 @@ bool ReadTextFile(const std::filesystem::path& path, std::string& out)
     return bool(input.read(out.data(), size));
 }
 
+bool LoadDiskTranslationFiles(const std::string& name, uint64_t expectedCodeHash,
+                              ShaderTranslator::Result& out)
+{
+    const auto dir = ShaderDiskCacheDir();
+    std::vector<uint8_t> stampBytes;
+    if (!ReadBinaryFile(dir / (name + ".key"), stampBytes) ||
+        stampBytes.size() != sizeof(ShaderDiskCacheStamp))
+        return false;
+
+    ShaderDiskCacheStamp stamp{};
+    std::memcpy(&stamp, stampBytes.data(), sizeof(stamp));
+    if (stamp.magic != kShaderDiskCacheMagic ||
+        stamp.schema != kShaderDiskCacheSchema ||
+        (expectedCodeHash && stamp.codeHash != expectedCodeHash))
+        return false;
+
+    if (!ReadBinaryFile(dir / (name + ".spv"), out.spirv) ||
+        !ReadTextFile(dir / (name + ".meta.json"), out.metaJson) ||
+        !ReadTextFile(dir / (name + ".hlsl"), out.hlsl))
+    {
+        out = {};
+        return false;
+    }
+    if ((out.spirv.size() & 3u) != 0 || out.spirv.size() < sizeof(uint32_t))
+    {
+        out = {};
+        return false;
+    }
+    uint32_t magic = 0;
+    std::memcpy(&magic, out.spirv.data(), sizeof(magic));
+    if (magic != 0x07230203u)
+    {
+        out = {};
+        return false;
+    }
+    return true;
+}
+
 bool LoadDiskTranslation(const std::string& name, const uint8_t* code,
                          size_t sizeBytes, ShaderTranslator::Result& out)
 {
@@ -283,6 +321,40 @@ void ShaderCache_OnBind(uint32_t type, uint64_t hash,
     KLOG_DIAG("shader cache: %s %s -> %zu-byte SPIR-V, %zu-byte HLSL (total=%llu)\n",
               diskHit ? "loaded" : "translated", name, spvSize, hlslSize,
               static_cast<unsigned long long>(count));
+}
+
+bool ShaderCache_Preload(uint32_t type, uint64_t hash)
+{
+    if (!ShaderCache_TranslationEnabled() || type > 1 || !hash)
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (FindLocked(type, hash))
+            return true;
+    }
+
+    char name[32]{};
+    std::snprintf(name, sizeof(name), "%s_%016llx",
+                  type == 0 ? "vs" : "ps",
+                  static_cast<unsigned long long>(hash));
+    ShaderTranslator::Result translated;
+    if (!LoadDiskTranslationFiles(name, hash, translated))
+        return false;
+
+    MojoTranslatedShader shader{};
+    shader.type = type;
+    shader.hash = hash;
+    shader.spirv = std::move(translated.spirv);
+    shader.metaJson = std::move(translated.metaJson);
+    shader.hlsl = std::move(translated.hlsl);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!FindLocked(type, hash))
+            g_shaders.push_back(std::move(shader));
+    }
+    g_diskHits.fetch_add(1, std::memory_order_relaxed);
+    g_translated.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 const MojoTranslatedShader* ShaderCache_Find(uint32_t type, uint64_t hash)

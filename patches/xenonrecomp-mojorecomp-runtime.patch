@@ -1,8 +1,208 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..ec37bcc 100644
+index fa91527..1b3f319 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
-@@ -609,7 +609,13 @@ bool Recompiler::Recompile(
+@@ -252,6 +252,145 @@ void Recompiler::Analyse()
+     }
+
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++
++    AnalyseContextLocalSafety();
++}
++
++void Recompiler::AnalyseContextLocalSafety()
++{
++    contextUnsafeFunctions.clear();
++
++    if (config.contextBarrierFunctions.empty() ||
++        (!config.crRegistersAsLocalVariables && !config.nonVolatileRegistersAsLocalVariables))
++    {
++        return;
++    }
++
++    std::unordered_set<uint32_t> guestFunctions;
++    guestFunctions.reserve(functions.size());
++    for (const auto& fn : functions)
++        guestFunctions.emplace(static_cast<uint32_t>(fn.base));
++
++    std::unordered_map<uint32_t, std::vector<uint32_t>> callers;
++    callers.reserve(functions.size());
++    std::vector<uint32_t> pending;
++    pending.reserve(functions.size());
++
++    auto markUnsafe = [&](uint32_t address)
++    {
++        if (contextUnsafeFunctions.emplace(address).second)
++            pending.push_back(address);
++    };
++
++    auto isSaveRestoreHelper = [&](uint32_t address)
++    {
++        auto symbol = image.symbols.find(address);
++        if (symbol == image.symbols.end() || symbol->address != address || symbol->type != Symbol_Function)
++            return false;
++        return symbol->name.find("__save") == 0 || symbol->name.find("__rest") == 0;
++    };
++
++    for (uint32_t barrier : config.contextBarrierFunctions)
++        markUnsafe(barrier);
++
++    for (const auto& fn : functions)
++    {
++        const uint32_t fnBase = static_cast<uint32_t>(fn.base);
++        const uint32_t fnEnd = fnBase + static_cast<uint32_t>(fn.size);
++        auto symbol = image.symbols.find(fnBase);
++        if (symbol != image.symbols.end() && symbol->address == fnBase && symbol->type == Symbol_Function &&
++            (symbol->name.find("__save") == 0 || symbol->name.find("__rest") == 0))
++        {
++            // Unsafe callers keep these helpers, so the helpers themselves must
++            // continue to operate on PPCContext-backed non-volatile registers.
++            markUnsafe(fnBase);
++        }
++
++        const auto* data = static_cast<const uint32_t*>(image.Find(fnBase));
++        if (!data)
++        {
++            markUnsafe(fnBase);
++            continue;
++        }
++
++        for (uint32_t address = fnBase; address < fnEnd; address += 4)
++        {
++            const uint32_t instruction = ByteSwap(data[(address - fnBase) / 4]);
++            const uint32_t op = PPC_OP(instruction);
++            const bool link = PPC_BL(instruction) != 0;
++
++            // Mid-asm hooks cross into host code. Keep context-sensitive locals
++            // out of those functions unless a future hook-specific contract says
++            // that the hook cannot re-enter guest execution.
++            if (config.midAsmHooks.find(address) != config.midAsmHooks.end())
++                markUnsafe(fnBase);
++
++            bool directBranch = false;
++            uint32_t target = 0;
++            if (op == PPC_OP_B)
++            {
++                const int32_t displacement = PPC_BI(instruction);
++                target = PPC_BA(instruction) ? static_cast<uint32_t>(displacement)
++                                             : address + displacement;
++                directBranch = true;
++            }
++            else if (op == PPC_OP_BC)
++            {
++                const int32_t displacement = PPC_BD(instruction);
++                target = PPC_BA(instruction) ? static_cast<uint32_t>(displacement)
++                                             : address + displacement;
++                directBranch = true;
++            }
++
++            if (directBranch)
++            {
++                const bool leavesFunction = target < fnBase || target >= fnEnd;
++                if (link || leavesFunction)
++                {
++                    // When non-volatile locals are enabled these ABI save/restore
++                    // calls are omitted in context-safe functions, so they must
++                    // not poison the reverse call graph.
++                    if (config.nonVolatileRegistersAsLocalVariables && isSaveRestoreHelper(target))
++                        continue;
++
++                    if (guestFunctions.find(target) != guestFunctions.end())
++                        callers[target].push_back(fnBase);
++                    else
++                        markUnsafe(fnBase); // host/import/unknown direct target
++                }
++                continue;
++            }
++
++            if (op == PPC_OP_CTR)
++            {
++                const uint32_t xop = PPC_XOP(instruction);
++                if (xop == 528)
++                {
++                    // A known switch table is intra-function control flow. Any
++                    // other branch-through-CTR can invoke an arbitrary guest or
++                    // host target, so keep the active frame context-backed.
++                    if (config.switchTables.find(address) == config.switchTables.end())
++                        markUnsafe(fnBase);
++                }
++                else if (xop == 16 && link)
++                {
++                    markUnsafe(fnBase);
++                }
++            }
++        }
++    }
++
++    for (size_t i = 0; i < pending.size(); ++i)
++    {
++        auto it = callers.find(pending[i]);
++        if (it == callers.end())
++            continue;
++        for (uint32_t caller : it->second)
++            markUnsafe(caller);
++    }
++
++    fmt::println("Context-safe register localization: {} safe, {} context-backed",
++        functions.size() - contextUnsafeFunctions.size(), contextUnsafeFunctions.size());
+ }
+
+ bool Recompiler::Recompile(
+@@ -265,11 +404,14 @@ bool Recompiler::Recompile(
+ {
+     println("\t// {} {}", insn.opcode->name, insn.op_str);
+
++    const bool contextSensitiveLocalsAllowed =
++        contextUnsafeFunctions.find(static_cast<uint32_t>(fn.base)) == contextUnsafeFunctions.end();
++
+     // TODO: we could cache these formats in an array
+     auto r = [&](size_t index)
+         {
+             if ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) ||
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++                (config.nonVolatileRegistersAsLocalVariables && contextSensitiveLocalsAllowed && index >= 14))
+             {
+                 localVariables.r[index] = true;
+                 return fmt::format("r{}", index);
+@@ -280,7 +422,7 @@ bool Recompiler::Recompile(
+     auto f = [&](size_t index)
+         {
+             if ((config.nonArgumentRegistersAsLocalVariables && index == 0) ||
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++                (config.nonVolatileRegistersAsLocalVariables && contextSensitiveLocalsAllowed && index >= 14))
+             {
+                 localVariables.f[index] = true;
+                 return fmt::format("f{}", index);
+@@ -291,7 +433,8 @@ bool Recompiler::Recompile(
+     auto v = [&](size_t index)
+         {
+             if ((config.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+-                (config.nonVolatileRegistersAsLocalVariables && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
++                (config.nonVolatileRegistersAsLocalVariables && contextSensitiveLocalsAllowed &&
++                    ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
+             {
+                 localVariables.v[index] = true;
+                 return fmt::format("v{}", index);
+@@ -301,7 +444,7 @@ bool Recompiler::Recompile(
+
+     auto cr = [&](size_t index)
+         {
+-            if (config.crRegistersAsLocalVariables)
++            if (config.crRegistersAsLocalVariables && contextSensitiveLocalsAllowed)
+             {
+                 localVariables.cr[index] = true;
+                 return fmt::format("cr{}", index);
+@@ -388,7 +531,8 @@ bool Recompiler::Recompile(
+
+                 if (targetSymbol != image.symbols.end() && targetSymbol->address == address && targetSymbol->type == Symbol_Function)
+                 {
+-                    if (config.nonVolatileRegistersAsLocalVariables && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
++                    if (config.nonVolatileRegistersAsLocalVariables && contextSensitiveLocalsAllowed &&
++                        (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
+                     {
+                         // print nothing
+                     }
+@@ -609,7 +753,13 @@ bool Recompiler::Recompile(
      case PPC_INST_BCTR:
          if (switchTable != config.switchTables.end())
          {
@@ -14,13 +214,13 @@ index fa91527..ec37bcc 100644
 +            // make the host compiler index its jump table far out of range while
 +            // the preceding guest cmplwi still accepted the low 32-bit value.
 +            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
- 
+
              for (size_t i = 0; i < switchTable->second.labels.size(); i++)
              {
-@@ -812,6 +818,12 @@ bool Recompiler::Recompile(
+@@ -812,6 +962,12 @@ bool Recompiler::Recompile(
          // no op
          break;
- 
+
 +    case PPC_INST_DCBST:
 +        // Data-cache block store is a cache-management hint on Xenon. Guest
 +        // memory is coherent host memory in a static recompilation, so there is
@@ -30,10 +230,10 @@ index fa91527..ec37bcc 100644
      case PPC_INST_DCBZ:
          print("\tmemset(base + ((");
          if (insn.operands[0] != 0)
-@@ -895,6 +907,14 @@ bool Recompiler::Recompile(
+@@ -895,6 +1051,14 @@ bool Recompiler::Recompile(
          println("\t{}.compare({}.f64, {}.f64);", cr(insn.operands[0]), f(insn.operands[1]), f(insn.operands[2]));
          break;
- 
+
 +    case PPC_INST_FCMPO:
 +        // The translated runtime currently models the condition result, which
 +        // is what title code consumes. This matches the existing fcmpu path and
@@ -45,10 +245,10 @@ index fa91527..ec37bcc 100644
      case PPC_INST_FCTID:
          printSetFlushMode(false);
          println("\t{}.s64 = ({}.f64 > double(LLONG_MAX)) ? LLONG_MAX : simde_mm_cvtsd_si64(simde_mm_load_sd(&{}.f64));", f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
-@@ -985,6 +1005,11 @@ bool Recompiler::Recompile(
+@@ -985,6 +1149,11 @@ bool Recompiler::Recompile(
          println("\t{}.f64 = float(1.0 / {}.f64);", f(insn.operands[0]), f(insn.operands[1]));
          break;
- 
+
 +    case PPC_INST_FRSQRTE:
 +        printSetFlushMode(false);
 +        println("\t{}.f64 = double(float(1.0 / sqrt({}.f64)));", f(insn.operands[0]), f(insn.operands[1]));
@@ -57,7 +257,7 @@ index fa91527..ec37bcc 100644
      case PPC_INST_FRSP:
          printSetFlushMode(false);
          println("\t{}.f64 = double(float({}.f64));", f(insn.operands[0]), f(insn.operands[1]));
-@@ -1137,6 +1162,7 @@ bool Recompiler::Recompile(
+@@ -1137,6 +1306,7 @@ bool Recompiler::Recompile(
      case PPC_INST_LVEWX128:
      case PPC_INST_LVX:
      case PPC_INST_LVX128:
@@ -65,10 +265,10 @@ index fa91527..ec37bcc 100644
          // NOTE: for endian swapping, we reverse the whole vector instead of individual elements.
          // this is accounted for in every instruction (eg. dp3 sums yzw instead of xyz)
          print("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ((", v(insn.operands[0]));
-@@ -1240,6 +1266,10 @@ bool Recompiler::Recompile(
+@@ -1240,6 +1410,10 @@ bool Recompiler::Recompile(
          }
          break;
- 
+
 +    case PPC_INST_MCRF:
 +        println("\t{} = {};", cr(insn.operands[0]), cr(insn.operands[1]));
 +        break;
@@ -76,10 +276,10 @@ index fa91527..ec37bcc 100644
      case PPC_INST_MFFS:
          println("\t{}.u64 = ctx.fpscr.loadFromHost();", f(insn.operands[0]));
          break;
-@@ -1311,6 +1341,12 @@ bool Recompiler::Recompile(
+@@ -1311,6 +1485,12 @@ bool Recompiler::Recompile(
              println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
          break;
- 
+
 +    case PPC_INST_MULHDU:
 +        println("\t{}.u64 = static_cast<uint64_t>((static_cast<__uint128_t>({}.u64) * static_cast<__uint128_t>({}.u64)) >> 64);", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
 +        if (strchr(insn.opcode->name, '.'))
@@ -89,19 +289,181 @@ index fa91527..ec37bcc 100644
      case PPC_INST_MULLD:
          println("\t{}.s64 = {}.s64 * {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
          break;
-@@ -1609,6 +1645,7 @@ bool Recompiler::Recompile(
- 
+@@ -1609,6 +1789,7 @@ bool Recompiler::Recompile(
+
      case PPC_INST_STVLX:
      case PPC_INST_STVLX128:
 +    case PPC_INST_STVLXL128:
          // TODO: vectorize
          // NOTE: accounting for the full vector reversal here
          print("\t{} = ", ea());
-@@ -1769,6 +1806,7 @@ bool Recompiler::Recompile(
+@@ -1769,6 +1950,7 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
- 
+
 +    case PPC_INST_VANDC:
      case PPC_INST_VANDC128:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
          break;
+@@ -2526,6 +2708,8 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+             println("#define PPC_CONFIG_NON_ARGUMENT_AS_LOCAL");
+         if (config.nonVolatileRegistersAsLocalVariables)
+             println("#define PPC_CONFIG_NON_VOLATILE_AS_LOCAL");
++        if (config.preserveLocalContextStorage)
++            println("#define PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE");
+
+         println("");
+
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..2ea878a 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -31,6 +31,7 @@ struct Recompiler
+     static constexpr uint32_t c_eieio = 0xAC06007C;
+     Image image;
+     std::vector<Function> functions;
++    std::unordered_set<uint32_t> contextUnsafeFunctions;
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
+@@ -51,6 +52,7 @@ struct Recompiler
+     }
+
+     void Analyse();
++    void AnalyseContextLocalSafety();
+
+     // TODO: make a RecompileArgs struct instead this is getting messy
+     bool Recompile(
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..4ac545e 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -26,6 +26,13 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+         crRegistersAsLocalVariables = main["cr_as_local"].value_or(false);
+         nonArgumentRegistersAsLocalVariables = main["non_argument_as_local"].value_or(false);
+         nonVolatileRegistersAsLocalVariables = main["non_volatile_as_local"].value_or(false);
++        preserveLocalContextStorage = main["preserve_local_context_storage"].value_or(false);
++
++        if (auto barrierArray = main["context_barrier_functions"].as_array())
++        {
++            for (auto& address : *barrierArray)
++                contextBarrierFunctions.emplace(*address.value<uint32_t>());
++        }
+
+         restGpr14Address = main["restgprlr_14_address"].value_or(0u);
+         saveGpr14Address = main["savegprlr_14_address"].value_or(0u);
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..5f8d1d9 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -39,6 +39,8 @@ struct RecompilerConfig
+     bool crRegistersAsLocalVariables = false;
+     bool nonArgumentRegistersAsLocalVariables = false;
+     bool nonVolatileRegistersAsLocalVariables = false;
++    bool preserveLocalContextStorage = false;
++    std::unordered_set<uint32_t> contextBarrierFunctions;
+     uint32_t restGpr14Address = 0;
+     uint32_t saveGpr14Address = 0;
+     uint32_t restFpr14Address = 0;
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..e08ca78 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -304,11 +304,11 @@ struct PPCFPSCRRegister
+ struct alignas(0x40) PPCContext
+ {
+     PPCRegister r3;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_ARGUMENT_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister r0;
+ #endif
+     PPCRegister r1;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_ARGUMENT_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister r2;
+ #endif
+     PPCRegister r4;
+@@ -318,12 +318,12 @@ struct alignas(0x40) PPCContext
+     PPCRegister r8;
+     PPCRegister r9;
+     PPCRegister r10;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_ARGUMENT_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister r11;
+     PPCRegister r12;
+ #endif
+     PPCRegister r13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_VOLATILE_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister r14;
+     PPCRegister r15;
+     PPCRegister r16;
+@@ -347,19 +347,19 @@ struct alignas(0x40) PPCContext
+ #ifndef PPC_CONFIG_SKIP_LR
+     uint64_t lr;
+ #endif
+-#ifndef PPC_CONFIG_CTR_AS_LOCAL
++#if !defined(PPC_CONFIG_CTR_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister ctr;
+ #endif
+-#ifndef PPC_CONFIG_XER_AS_LOCAL
++#if !defined(PPC_CONFIG_XER_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCXERRegister xer;
+ #endif
+-#ifndef PPC_CONFIG_RESERVED_AS_LOCAL
++#if !defined(PPC_CONFIG_RESERVED_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister reserved;
+ #endif
+ #ifndef PPC_CONFIG_SKIP_MSR
+     uint32_t msr = 0x200A000;
+ #endif
+-#ifndef PPC_CONFIG_CR_AS_LOCAL
++#if !defined(PPC_CONFIG_CR_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCCRRegister cr0;
+     PPCCRRegister cr1;
+     PPCCRRegister cr2;
+@@ -371,7 +371,7 @@ struct alignas(0x40) PPCContext
+ #endif
+     PPCFPSCRRegister fpscr;
+
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_ARGUMENT_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister f0;
+ #endif
+     PPCRegister f1;
+@@ -387,7 +387,7 @@ struct alignas(0x40) PPCContext
+     PPCRegister f11;
+     PPCRegister f12;
+     PPCRegister f13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_VOLATILE_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCRegister f14;
+     PPCRegister f15;
+     PPCRegister f16;
+@@ -422,7 +422,7 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v11;
+     PPCVRegister v12;
+     PPCVRegister v13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_VOLATILE_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCVRegister v14;
+     PPCVRegister v15;
+     PPCVRegister v16;
+@@ -442,7 +442,7 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v30;
+     PPCVRegister v31;
+ #endif
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_ARGUMENT_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCVRegister v32;
+     PPCVRegister v33;
+     PPCVRegister v34;
+@@ -476,7 +476,7 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v62;
+     PPCVRegister v63;
+ #endif
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++#if !defined(PPC_CONFIG_NON_VOLATILE_AS_LOCAL) || defined(PPC_CONFIG_PRESERVE_LOCAL_CONTEXT_STORAGE)
+     PPCVRegister v64;
+     PPCVRegister v65;
+     PPCVRegister v66;

@@ -2,6 +2,8 @@
 
 #include "../gpu/primitive_utils.h"
 #include "../gpu/render_policy.h"
+#include "../gpu/vulkan_adapter_policy.h"
+#include "../gpu/xenos.h"
 
 namespace {
 
@@ -15,6 +17,38 @@ int Fail(const char* message)
 
 int main()
 {
+    auto bruteMaxRemapped = [](uint32_t count, uint32_t offset,
+                               uint32_t minVertex, uint32_t maxVertex) {
+        uint32_t maximum = 0;
+        for (uint32_t i = 0; i < count; ++i)
+            maximum = std::max(
+                maximum, xenos::RemapVertexIndex(i, offset, minVertex, maxVertex));
+        return maximum;
+    };
+    const struct {
+        uint32_t count;
+        uint32_t offset;
+        uint32_t minVertex;
+        uint32_t maxVertex;
+    } remapCases[] = {
+        {0, 0, 0, xenos::kVertexIndexMask},
+        {1, 0, 0, xenos::kVertexIndexMask},
+        {4096, 17, 0, xenos::kVertexIndexMask},
+        {4096, 17, 128, 2048},
+        {64, xenos::kVertexIndexMask - 15u, 0, xenos::kVertexIndexMask},
+        {64, xenos::kVertexIndexMask - 15u, 4, 1000},
+        {1024, 0x00FFF000u, 0x100u, 0x8000u},
+    };
+    for (const auto& test : remapCases)
+    {
+        const uint32_t fast = xenos::MaxRemappedAutoVertexIndex(
+            test.count, test.offset, test.minVertex, test.maxVertex);
+        const uint32_t brute = bruteMaxRemapped(
+            test.count, test.offset, test.minVertex, test.maxVertex);
+        if (fast != brute)
+            return Fail("O(1) auto-index remap maximum differs from brute-force semantics");
+    }
+
     using mojorecomp::gpu::RectangleStripSources;
     using mojorecomp::gpu::UsesSeparateBackfaceStencil;
     using mojorecomp::gpu::ShouldApplyConfiguredAspect;
@@ -30,6 +64,10 @@ int main()
     using mojorecomp::gpu::EdramDepthTransferMode;
     using mojorecomp::gpu::SelectEdramDepthTransferMode;
     using mojorecomp::gpu::ApplyStencilBitPlane;
+    using mojorecomp::gpu::VulkanAdapterCapabilities;
+    using mojorecomp::gpu::VulkanAdapterClass;
+    using mojorecomp::gpu::VulkanAdapterIsRendererCompatible;
+    using mojorecomp::gpu::VulkanAdapterPreference;
 
     if (SelectEdramDepthTransferMode(true) !=
             EdramDepthTransferMode::ShaderStencilExport ||
@@ -49,6 +87,28 @@ int main()
         if (reconstructed != source)
             return Fail("fixed-function EDRAM stencil reconstruction lost bits");
     }
+
+    VulkanAdapterCapabilities compatible{};
+    compatible.graphicsPresent = true;
+    compatible.swapchain = true;
+    compatible.api13 = true;
+    compatible.shaderInt64 = true;
+    compatible.bufferDeviceAddress = true;
+    compatible.runtimeDescriptorArray = true;
+    compatible.dynamicRendering = true;
+    compatible.sampledImageArrayDynamicIndexing = true;
+    compatible.descriptorLimits = true;
+    compatible.extentSupported = true;
+    if (!VulkanAdapterIsRendererCompatible(compatible))
+        return Fail("a fully capable Vulkan adapter was rejected");
+    compatible.dynamicRendering = false;
+    if (VulkanAdapterIsRendererCompatible(compatible))
+        return Fail("an adapter missing a required Vulkan feature was accepted");
+    if (VulkanAdapterPreference(VulkanAdapterClass::Discrete) <=
+            VulkanAdapterPreference(VulkanAdapterClass::Integrated) ||
+        VulkanAdapterPreference(VulkanAdapterClass::Integrated) <=
+            VulkanAdapterPreference(VulkanAdapterClass::Virtual))
+        return Fail("Vulkan adapter automatic preference order is incorrect");
 
     // Xenos RECTLIST front/back classification follows the cyclic order of its
     // three guest vertices. Host strip expansion must preserve that winding for

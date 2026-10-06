@@ -12,7 +12,7 @@ if errorlevel 1 (
 
 where tar.exe >nul 2>nul
 if errorlevel 1 (
-  echo ERROR: Windows tar.exe is required to create the portable ZIP archive.
+  echo ERROR: Windows tar.exe is required to create the runtime and source archives.
   exit /b 1
 )
 
@@ -38,6 +38,18 @@ if not "%MOJORECOMP_RELEASE_VERSION%"=="%MOJORECOMP_SUITE_VERSION%" (
   exit /b 1
 )
 
+if defined MOJORECOMP_RELEASE_SIGNING_KEY (
+  if not exist "%MOJORECOMP_RELEASE_SIGNING_KEY%" (
+    echo ERROR: Release signing key not found: %MOJORECOMP_RELEASE_SIGNING_KEY%
+    exit /b 1
+  )
+) else (
+  if not exist "release-signing-private.pem" (
+    echo ERROR: Release signing key not found: %CD%\release-signing-private.pem
+    exit /b 1
+  )
+)
+
 set "MOJORECOMP_RELEASE_TAG=v%MOJORECOMP_RELEASE_VERSION%"
 set "MOJORECOMP_RELEASE_REPOSITORY=https://github.com/OAleex/MojoRecomp"
 
@@ -54,6 +66,9 @@ echo Release notes: %MOJORECOMP_UPDATE_NOTES_URL%
 echo.
 
 if /i "%~1"=="--show-config" exit /b 0
+
+call build-smoke.bat
+if errorlevel 1 exit /b 1
 
 call npm.cmd --prefix launcher run build:production
 if errorlevel 1 exit /b 1

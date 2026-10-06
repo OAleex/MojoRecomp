@@ -1,0 +1,28 @@
+Crash of the Titans - Brazilian Portuguese
+===========================================
+
+Original translation: version 5.0 (June 7, 2025)
+Localization component: MojoRecomp
+
+Credits
+-------
+Project Administrator: OAleex
+Romhacking: OAleex
+Translation: OAleex, Lucaz "BIG BOSS" Andrade
+Graphics Editing: OAleex
+Text Tool: Donut Team
+Archive Tool: TicoDoido
+Graphics Tool: OAleex, Donut Team
+Installer: OAleex
+Proofreading: OAleex
+
+Special Thanks
+--------------
+HNNEWGAMES - for granting OAleex permission to manage the project.
+CRASHARKI - for the game's font.
+Lucaz "BIG BOSS" Andrade - for testing the translation on real hardware.
+Niccbilac - for reporting terminology revisions for version 5.0.
+
+Credits Source
+--------------
+https://oaleextraducoes.com/posts/2024/10/Crash-of-the-Titans/crash-of-the-titans-x360/

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isGitHubReleaseFeedUrl,
-  launcherHistoryFromCatalog,
   newestGitHubReleaseAssetUrl,
   normalizedHttpsBase,
   runtimeHistoryFromCatalog,
@@ -91,7 +90,7 @@ test("release channel and date use the catalog contract", () => {
   assert.throws(() => validateReleaseDate("not-a-date"));
 });
 
-test("runtime history keeps older verified runtime releases", () => {
+test("runtime history keeps older signed runtime releases", () => {
   const catalog = `schema_version = 1
 channel = "development"
 
@@ -109,7 +108,7 @@ notes_url = "https://github.com/example/MojoRecomp/releases/tag/v1.1.0"
 package = "zip"
 unpacked_size = 200
 entrypoint = "cot-runtime.exe"
-required_files = ["cot-runtime.exe", "dxcompiler.dll"]
+required_files = ["cot-runtime.exe", "dxcompiler.dll", "mojorecomp-package.toml", "mojorecomp-package.sig"]
 game_id = "cot"
 
 [release.compatibility]
@@ -129,53 +128,27 @@ notes_url = "https://github.com/example/MojoRecomp/releases/tag/v1.0.0"
 package = "zip"
 unpacked_size = 180
 entrypoint = "cot-runtime.exe"
-required_files = ["cot-runtime.exe", "dxcompiler.dll"]
+required_files = ["cot-runtime.exe", "dxcompiler.dll", "mojorecomp-package.toml", "mojorecomp-package.sig"]
 game_id = "cot"
+localization_catalog_url = "https://github.com/example/MojoRecomp/releases/download/v1.0.0/localization-catalog.toml"
 
 [release.compatibility]
 min_launcher = "1.0.0"
+
+[[release.compatibility.require]]
+id = "runtime.mom"
+min_version = "0.4.0"
+max_version = "0.4.9"
 `;
   const history = runtimeHistoryFromCatalog(catalog, "0.2.0");
   assert.equal(history.length, 1);
   assert.equal(history[0].version, "0.1.0-alpha");
   assert.equal(history[0].minLauncher, "1.0.0");
-});
-
-test("launcher history keeps older verified portable releases", () => {
-  const catalog = `schema_version = 1
-channel = "stable"
-
-[[release]]
-id = "launcher"
-kind = "launcher"
-version = "1.1.0"
-platform = "windows"
-arch = "x86_64"
-url = "https://github.com/example/MojoRecomp/releases/download/v1.1.0/launcher-1.1.0.zip"
-size = 200
-sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-published = "2026-09-28"
-notes_url = "https://github.com/example/MojoRecomp/releases/tag/v1.1.0"
-package = "portable-zip"
-
-[release.compatibility]
-
-[[release]]
-id = "launcher"
-kind = "launcher"
-version = "1.0.0"
-platform = "windows"
-arch = "x86_64"
-url = "https://github.com/example/MojoRecomp/releases/download/v1.0.0/launcher-1.0.0.zip"
-size = 180
-sha256 = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-published = "2026-09-20"
-notes_url = "https://github.com/example/MojoRecomp/releases/tag/v1.0.0"
-package = "portable-zip"
-
-[release.compatibility]
-`;
-  const history = launcherHistoryFromCatalog(catalog, "1.1.0");
-  assert.equal(history.length, 1);
-  assert.equal(history[0].version, "1.0.0");
+  assert.equal(
+    history[0].localizationCatalogUrl,
+    "https://github.com/example/MojoRecomp/releases/download/v1.0.0/localization-catalog.toml",
+  );
+  assert.deepEqual(history[0].requirements, [
+    { id: "runtime.mom", minVersion: "0.4.0", maxVersion: "0.4.9" },
+  ]);
 });

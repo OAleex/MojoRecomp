@@ -18,7 +18,7 @@ user-owned games. They are not covered by the MojoRecomp ISC License. Their sour
 URLs record where the exact files were obtained; no
 separate asset-specific license was found, so this record does not invent one.
 
-Crash of the Titans, Crash: Mind over Mutant, their names, logos, characters,
+Crash of the Titans, Crash: Mind Over Mutant, their names, logos, characters,
 and related artwork remain the property of their respective rights holders.
 
 References reviewed for this retained set:

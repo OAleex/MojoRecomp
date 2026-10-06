@@ -12,7 +12,7 @@ namespace mojorecomp::debug {
 struct DebugOverlayText
 {
     bool visible = false;
-    std::array<char, 32> left{};
+    std::array<char, 128> left{};
     std::array<std::array<char, 128>, 2> right{};
     uint32_t rightCount = 0;
 };
@@ -24,8 +24,19 @@ inline DebugOverlayText BuildOverlayText(const DebugOverlaySnapshot& snapshot)
         return text;
 
     text.visible = true;
-    if (snapshot.enabled)
+    if (snapshot.showPerformance && snapshot.runtimeLabel[0])
+    {
+        if (snapshot.enabled)
+            std::snprintf(text.left.data(), text.left.size(), "%s | DEBUG MODE",
+                          snapshot.runtimeLabel.data());
+        else
+            std::snprintf(text.left.data(), text.left.size(), "%s",
+                          snapshot.runtimeLabel.data());
+    }
+    else if (snapshot.enabled)
+    {
         std::snprintf(text.left.data(), text.left.size(), "DEBUG MODE");
+    }
 
     if (snapshot.notification[0] && text.rightCount < text.right.size())
     {

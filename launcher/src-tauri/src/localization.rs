@@ -3,16 +3,38 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const PT_BR_PROFILE: &str = "pt-BR";
 const CACHE_SCHEMA_VERSION: u32 = 2;
-const BUILDER_VERSION: &str = "cot-ptbr-rcf-v1";
+const BUILDER_VERSION: &str = "cot-localization-rcf-v2";
 const DISK_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 100_000;
+const LANGUAGE_PATCH_SCHEMA_VERSION: u32 = 1;
+const LANGUAGE_PATCH_MANIFEST: &str = "language-patches.toml";
+const DELTA_MAGIC: &[u8; 8] = b"MJRDIF01";
+const MAX_PATCHED_RESOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DELTA_OPERATIONS: u32 = 1_000_000;
 
-const PT_BR_TARGETS: [&str; 14] = [
+const COT_LOCALIZATION_TARGETS: [&str; 14] = [
+    r"levels\L3_E3\statics.lua",
+    r"package\5000af12.p3d",
+    r"mdl\c80d681a.p3d",
+    r"levels\L4_E4\props_normal.lua",
+    r"package\7a8185b0.p3d",
+    r"package\c1e387c7.p3d",
+    r"package\7efdcd91.p3d",
+    r"package\7a88cba0.p3d",
+    r"package\cdd70a8c.p3d",
+    r"package\97597d1b.p3d",
+    r"package\b4c85fe7.p3d",
+    r"package\bea9f18c.p3d",
+    r"package\79aea37a.p3d",
+    r"package\a2c6e833.p3d",
+];
+
+const COT_LEGACY_LOCALIZATION_TARGETS: [&str; 14] = [
     r"cinematics\348a5480.p3d",
     r"cinematics\348a54bd.p3d",
     r"cinematics\3eac4648.p3d",
@@ -29,7 +51,22 @@ const PT_BR_TARGETS: [&str; 14] = [
     r"package\cdd70a8c.p3d",
 ];
 
-include!(concat!(env!("OUT_DIR"), "/bundled_ptbr.rs"));
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LanguagePatchManifest {
+    schema_version: u32,
+    game_id: String,
+    locale: String,
+    #[serde(rename = "patch")]
+    patches: Vec<LanguagePatchEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LanguagePatchEntry {
+    archive_path: String,
+    file: String,
+}
 
 #[derive(Clone, Serialize)]
 pub struct LocalizationStatus {
@@ -58,55 +95,57 @@ struct SourceIdentity {
     modified_ns: u64,
 }
 
-fn profile_root(game_root: &Path) -> PathBuf {
-    game_root.join("localization").join(PT_BR_PROFILE)
+fn profile_root(game_root: &Path, profile: &str) -> PathBuf {
+    game_root.join("localization").join(profile)
 }
 
-fn source_root(game_root: &Path) -> PathBuf {
-    profile_root(game_root).join("source")
+fn source_root(game_root: &Path, profile: &str) -> PathBuf {
+    profile_root(game_root, profile).join("source")
 }
 
-pub fn overlay_root(game_root: &Path) -> PathBuf {
-    profile_root(game_root)
+pub fn overlay_root(game_root: &Path, profile: &str) -> PathBuf {
+    profile_root(game_root, profile)
 }
 
-pub fn overlay_archive(game_root: &Path) -> PathBuf {
-    profile_root(game_root).join("default.rcf")
+pub fn overlay_archive(game_root: &Path, profile: &str) -> PathBuf {
+    profile_root(game_root, profile).join("default.rcf")
 }
 
-fn cache_manifest_path(game_root: &Path) -> PathBuf {
-    profile_root(game_root).join("manifest.toml")
+fn cache_manifest_path(game_root: &Path, profile: &str) -> PathBuf {
+    profile_root(game_root, profile).join("manifest.toml")
 }
 
 fn bundled_marker_path(game_root: &Path) -> PathBuf {
-    profile_root(game_root).join(".bundled-source")
+    profile_root(game_root, PT_BR_PROFILE).join(".bundled-source")
 }
 
-fn component_marker_path(game_root: &Path) -> PathBuf {
-    profile_root(game_root).join(".component-source")
+fn component_marker_path(game_root: &Path, profile: &str) -> PathBuf {
+    profile_root(game_root, profile).join(".component-source")
 }
 
 pub fn uses_bundled_source(game_root: &Path) -> bool {
     bundled_marker_path(game_root).is_file()
 }
 
-pub fn uses_component_source(game_root: &Path) -> bool {
-    component_marker_path(game_root).is_file()
+pub fn uses_component_source(game_root: &Path, profile: &str) -> bool {
+    component_marker_path(game_root, profile).is_file()
 }
 
-pub fn component_source_version(game_root: &Path) -> Option<String> {
-    let text = fs::read_to_string(component_marker_path(game_root)).ok()?;
+pub fn component_source_version(game_root: &Path, profile: &str) -> Option<String> {
+    let text = fs::read_to_string(component_marker_path(game_root, profile)).ok()?;
     let mut lines = text.lines();
     let component_id = lines.next()?;
     let version = lines.next()?;
-    if component_id != "language.cot.pt-br" || version.is_empty() {
+    if component_id != format!("language.cot.{}", profile.to_ascii_lowercase())
+        || version.is_empty()
+    {
         return None;
     }
     Some(version.to_string())
 }
 
-fn acquire_profile_lock(game_root: &Path) -> Result<File, String> {
-    let root = overlay_root(game_root);
+fn acquire_profile_lock(game_root: &Path, profile: &str) -> Result<File, String> {
+    let root = overlay_root(game_root, profile);
     fs::create_dir_all(&root)
         .map_err(|error| format!("Could not create localization overlay directory: {error}"))?;
     let lock = OpenOptions::new()
@@ -175,25 +214,282 @@ fn validate_p3d(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_localization_resource(path: &Path, archive_path: &str) -> Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "Could not inspect localization resource {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PATCHED_RESOURCE_BYTES {
+        return Err(format!(
+            "Localization resource has an invalid size: {}",
+            path.display()
+        ));
+    }
+    if archive_path.to_ascii_lowercase().ends_with(".p3d") {
+        validate_p3d(path)?;
+    }
+    Ok(())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+fn read_delta_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| "Localization delta cursor overflow".to_string())?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "Localization delta ended unexpectedly".to_string())?;
+    *cursor = end;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn read_delta_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, String> {
+    let end = cursor
+        .checked_add(8)
+        .ok_or_else(|| "Localization delta cursor overflow".to_string())?;
+    let value = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| "Localization delta ended unexpectedly".to_string())?;
+    *cursor = end;
+    Ok(u64::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn localization_payload_path(root: &Path, value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value.starts_with(['/', '\\']) || value.contains(':') {
+        return Err(format!("Unsafe Localization Pack path: {value}"));
+    }
+    let mut path = root.to_path_buf();
+    for component in value.split(['/', '\\']) {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(format!("Unsafe Localization Pack path: {value}"));
+        }
+        path.push(component);
+    }
+    Ok(path)
+}
+
+fn apply_delta_patch(
+    source: &[u8],
+    patch_path: &Path,
+    destination: &Path,
+    archive_path: &str,
+) -> Result<(), String> {
+    let metadata = fs::metadata(patch_path)
+        .map_err(|error| format!("Could not inspect localization delta: {error}"))?;
+    if !metadata.is_file()
+        || metadata.len() > MAX_PATCHED_RESOURCE_BYTES.saturating_add(1024 * 1024)
+    {
+        return Err("Localization delta is missing or too large".into());
+    }
+    let patch = fs::read(patch_path)
+        .map_err(|error| format!("Could not read localization delta: {error}"))?;
+    let header_size = DELTA_MAGIC.len() + 32 + 32 + 8 + 4;
+    if patch.len() < header_size || &patch[..DELTA_MAGIC.len()] != DELTA_MAGIC {
+        return Err("Localization delta has an invalid signature".into());
+    }
+    let mut cursor = DELTA_MAGIC.len();
+    let expected_source = patch[cursor..cursor + 32].to_vec();
+    cursor += 32;
+    let expected_result = patch[cursor..cursor + 32].to_vec();
+    cursor += 32;
+    let result_size = read_delta_u64(&patch, &mut cursor)?;
+    let operation_count = read_delta_u32(&patch, &mut cursor)?;
+    if result_size == 0
+        || result_size > MAX_PATCHED_RESOURCE_BYTES
+        || operation_count == 0
+        || operation_count > MAX_DELTA_OPERATIONS
+    {
+        return Err("Localization delta declares unsafe output metadata".into());
+    }
+    if sha256_bytes(source).as_slice() != expected_source.as_slice() {
+        return Err("Localization delta does not match this game resource".into());
+    }
+
+    let capacity: usize = result_size
+        .try_into()
+        .map_err(|_| "Localization delta output is too large for this host".to_string())?;
+    let mut output = Vec::with_capacity(capacity);
+    for _ in 0..operation_count {
+        let operation = *patch
+            .get(cursor)
+            .ok_or_else(|| "Localization delta ended before all operations".to_string())?;
+        cursor += 1;
+        match operation {
+            1 => {
+                let offset = read_delta_u64(&patch, &mut cursor)?;
+                let length = read_delta_u64(&patch, &mut cursor)?;
+                let end = offset
+                    .checked_add(length)
+                    .ok_or_else(|| "Localization delta copy range overflow".to_string())?;
+                if end > source.len() as u64 || length == 0 {
+                    return Err("Localization delta contains an invalid copy range".into());
+                }
+                let start: usize = offset
+                    .try_into()
+                    .map_err(|_| "Delta copy offset overflow")?;
+                let end: usize = end.try_into().map_err(|_| "Delta copy end overflow")?;
+                output.extend_from_slice(&source[start..end]);
+            }
+            2 => {
+                let length = read_delta_u64(&patch, &mut cursor)?;
+                if length == 0 {
+                    return Err("Localization delta contains an empty literal".into());
+                }
+                let length: usize = length
+                    .try_into()
+                    .map_err(|_| "Localization delta literal is too large".to_string())?;
+                let end = cursor
+                    .checked_add(length)
+                    .ok_or_else(|| "Localization delta literal range overflow".to_string())?;
+                let literal = patch
+                    .get(cursor..end)
+                    .ok_or_else(|| "Localization delta literal is truncated".to_string())?;
+                output.extend_from_slice(literal);
+                cursor = end;
+            }
+            _ => {
+                return Err(format!(
+                    "Localization delta has an unknown operation: {operation}"
+                ));
+            }
+        }
+        if output.len() > capacity {
+            return Err("Localization delta produced more data than declared".into());
+        }
+    }
+    if cursor != patch.len() || output.len() != capacity {
+        return Err("Localization delta output length is invalid".into());
+    }
+    if sha256_bytes(&output).as_slice() != expected_result.as_slice() {
+        return Err("Localization delta output failed SHA-256 verification".into());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create localization delta output path: {error}"))?;
+    }
+    fs::write(destination, output)
+        .map_err(|error| format!("Could not write patched localization resource: {error}"))?;
+    validate_localization_resource(destination, archive_path)
+}
+
+fn install_delta_component_patch(
+    selected_root: &Path,
+    component_id: &str,
+    version: &str,
+    profile: &str,
+    game_root: &Path,
+) -> Result<(), String> {
+    let manifest_path = selected_root.join(LANGUAGE_PATCH_MANIFEST);
+    let text = fs::read_to_string(&manifest_path)
+        .map_err(|error| format!("Could not read language patch manifest: {error}"))?;
+    let manifest: LanguagePatchManifest = toml::from_str(&text)
+        .map_err(|error| format!("Language patch manifest is invalid: {error}"))?;
+    if manifest.schema_version != LANGUAGE_PATCH_SCHEMA_VERSION
+        || manifest.game_id != "cot"
+        || !manifest.locale.eq_ignore_ascii_case(profile)
+        || manifest.patches.len() != COT_LOCALIZATION_TARGETS.len()
+    {
+        return Err("Language patch manifest does not match this COT localization profile".into());
+    }
+
+    let mut patch_by_target = HashMap::new();
+    for patch in &manifest.patches {
+        let key = patch.archive_path.replace('/', "\\").to_ascii_lowercase();
+        if !COT_LOCALIZATION_TARGETS
+            .iter()
+            .any(|target| target.eq_ignore_ascii_case(&key))
+            || patch_by_target.insert(key, patch).is_some()
+        {
+            return Err(format!(
+                "Language patch manifest contains an unexpected or duplicate target: {}",
+                patch.archive_path
+            ));
+        }
+    }
+
+    let _profile_lock = acquire_profile_lock(game_root, profile)?;
+    let parent = profile_root(game_root, profile);
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("Could not create localization source storage: {error}"))?;
+    let staging = parent.join(".source-component.tmp");
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .map_err(|error| format!("Could not remove stale localization staging: {error}"))?;
+    }
+    fs::create_dir_all(&staging)
+        .map_err(|error| format!("Could not create localization staging: {error}"))?;
+    let original_archive = game_root.join("default.rcf");
+
+    let result = (|| {
+        for target in COT_LOCALIZATION_TARGETS {
+            let key = target.to_ascii_lowercase();
+            let patch = patch_by_target
+                .get(&key)
+                .ok_or_else(|| format!("Language patch is missing target: {target}"))?;
+            let patch_path = localization_payload_path(selected_root, &patch.file)?;
+            let source = rcf::read_entry(&original_archive, target, MAX_PATCHED_RESOURCE_BYTES)?;
+            let destination = archive_relative_path(&staging, target);
+            apply_delta_patch(&source, &patch_path, &destination, target)?;
+        }
+        replacements_from_root_for_targets(&staging, &COT_LOCALIZATION_TARGETS)?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+
+    let finalize = (|| {
+        promote_directory(&staging, &source_root(game_root, profile))?;
+        let bundled_marker = bundled_marker_path(game_root);
+        if profile == PT_BR_PROFILE && bundled_marker.exists() {
+            fs::remove_file(bundled_marker)
+                .map_err(|error| format!("Could not clear legacy bundled PT-BR marker: {error}"))?;
+        }
+        let managed_marker = component_marker_path(game_root, profile);
+        if managed_marker.exists() {
+            fs::remove_file(&managed_marker)
+                .map_err(|error| format!("Could not replace language component marker: {error}"))?;
+        }
+        if component_id.lines().count() != 1 || version.lines().count() != 1 {
+            return Err("Language component metadata contains an invalid newline".into());
+        }
+        fs::write(&managed_marker, format!("{component_id}\n{version}\n"))
+            .map_err(|error| format!("Could not write language component marker: {error}"))
+    })();
+    if finalize.is_err() && staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    finalize
+}
+
 fn discover_p3d_files(root: &Path) -> Result<HashMap<String, Vec<PathBuf>>, String> {
     if !root.is_dir() {
-        return Err("Selected PT-BR patch folder does not exist".into());
+        return Err("Selected localization source folder does not exist".into());
     }
     let mut result: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut stack = vec![root.to_path_buf()];
     let mut discovered = 0usize;
     while let Some(directory) = stack.pop() {
         for entry in fs::read_dir(&directory)
-            .map_err(|error| format!("Could not read PT-BR patch folder: {error}"))?
+            .map_err(|error| format!("Could not read localization source folder: {error}"))?
         {
-            let entry =
-                entry.map_err(|error| format!("Could not inspect PT-BR patch entry: {error}"))?;
-            let kind = entry
-                .file_type()
-                .map_err(|error| format!("Could not inspect PT-BR patch entry type: {error}"))?;
+            let entry = entry
+                .map_err(|error| format!("Could not inspect localization source entry: {error}"))?;
+            let kind = entry.file_type().map_err(|error| {
+                format!("Could not inspect localization source entry type: {error}")
+            })?;
             if kind.is_symlink() {
                 return Err(format!(
-                    "PT-BR patch folder contains a symbolic link: {}",
+                    "Localization source folder contains a symbolic link: {}",
                     entry.path().display()
                 ));
             }
@@ -206,7 +502,9 @@ fn discover_p3d_files(root: &Path) -> Result<HashMap<String, Vec<PathBuf>>, Stri
             }
             discovered += 1;
             if discovered > MAX_DISCOVERED_FILES {
-                return Err("Selected folder contains too many files to be a PT-BR patch".into());
+                return Err(
+                    "Selected folder contains too many files to be a localization source".into(),
+                );
             }
             let path = entry.path();
             let is_p3d = path
@@ -233,27 +531,40 @@ fn expected_basename(target: &str) -> &str {
     target.rsplit('\\').next().unwrap_or(target)
 }
 
-fn replacements_from_root(root: &Path) -> Result<Vec<Replacement>, String> {
-    let mut replacements = Vec::with_capacity(PT_BR_TARGETS.len());
-    for target in PT_BR_TARGETS {
+fn replacements_from_root_for_targets(
+    root: &Path,
+    targets: &[&str],
+) -> Result<Vec<Replacement>, String> {
+    let mut replacements = Vec::with_capacity(targets.len());
+    for target in targets {
         let source = archive_relative_path(root, target);
         if !source.is_file() {
             return Err(format!(
-                "PT-BR source is incomplete: missing {}",
+                "Localization source is incomplete: missing {}",
                 expected_basename(target)
             ));
         }
-        validate_p3d(&source)?;
+        validate_localization_resource(&source, target)?;
         replacements.push(Replacement {
-            archive_path: target.to_string(),
+            archive_path: (*target).to_string(),
             source_path: source,
         });
     }
     Ok(replacements)
 }
 
-fn managed_replacements(game_root: &Path) -> Result<Vec<Replacement>, String> {
-    replacements_from_root(&source_root(game_root))
+fn replacements_from_root(root: &Path) -> Result<Vec<Replacement>, String> {
+    match replacements_from_root_for_targets(root, &COT_LOCALIZATION_TARGETS) {
+        Ok(replacements) => Ok(replacements),
+        Err(current_error) => {
+            replacements_from_root_for_targets(root, &COT_LEGACY_LOCALIZATION_TARGETS)
+                .map_err(|_| current_error)
+        }
+    }
+}
+
+fn managed_replacements(game_root: &Path, profile: &str) -> Result<Vec<Replacement>, String> {
+    replacements_from_root(&source_root(game_root, profile))
 }
 
 fn promote_directory(staging: &Path, destination: &Path) -> Result<(), String> {
@@ -299,11 +610,12 @@ fn promote_directory(staging: &Path, destination: &Path) -> Result<(), String> {
 fn import_patch_with_component_marker(
     selected_root: &Path,
     game_root: &Path,
+    profile: &str,
     component_marker: Option<(&str, &str)>,
 ) -> Result<(), String> {
     let discovered = discover_p3d_files(selected_root)?;
-    let _profile_lock = acquire_profile_lock(game_root)?;
-    let parent = profile_root(game_root);
+    let _profile_lock = acquire_profile_lock(game_root, profile)?;
+    let parent = profile_root(game_root, profile);
     fs::create_dir_all(&parent)
         .map_err(|error| format!("Could not create localization source storage: {error}"))?;
     let staging = parent.join(".source-import.tmp");
@@ -315,12 +627,12 @@ fn import_patch_with_component_marker(
         .map_err(|error| format!("Could not create localization import staging: {error}"))?;
 
     let result = (|| {
-        for target in PT_BR_TARGETS {
+        for target in COT_LEGACY_LOCALIZATION_TARGETS {
             let basename = expected_basename(target).to_ascii_lowercase();
             let candidates = discovered.get(&basename).cloned().unwrap_or_default();
             if candidates.len() != 1 {
                 return Err(if candidates.is_empty() {
-                    format!("Selected folder is missing required PT-BR file: {basename}")
+                    format!("Selected folder is missing required localization file: {basename}")
                 } else {
                     format!("Selected folder contains multiple copies of required file: {basename}")
                 });
@@ -333,7 +645,7 @@ fn import_patch_with_component_marker(
                 })?;
             }
             fs::copy(&candidates[0], &destination).map_err(|error| {
-                format!("Could not import required PT-BR file {basename}: {error}")
+                format!("Could not import required localization file {basename}: {error}")
             })?;
         }
         Ok::<(), String>(())
@@ -344,24 +656,27 @@ fn import_patch_with_component_marker(
         return Err(error);
     }
     let finalize = (|| {
-        replacements_from_root(&staging)?;
-        promote_directory(&staging, &source_root(game_root))?;
+        replacements_from_root_for_targets(&staging, &COT_LEGACY_LOCALIZATION_TARGETS)?;
+        promote_directory(&staging, &source_root(game_root, profile))?;
         let bundled_marker = bundled_marker_path(game_root);
-        if bundled_marker.exists() {
-            fs::remove_file(bundled_marker)
-                .map_err(|error| format!("Could not clear bundled PT-BR marker: {error}"))?;
+        if profile == PT_BR_PROFILE && bundled_marker.exists() {
+            fs::remove_file(bundled_marker).map_err(|error| {
+                format!("Could not clear legacy bundled localization marker: {error}")
+            })?;
         }
-        let managed_marker = component_marker_path(game_root);
+        let managed_marker = component_marker_path(game_root, profile);
         if managed_marker.exists() {
-            fs::remove_file(&managed_marker)
-                .map_err(|error| format!("Could not clear component PT-BR marker: {error}"))?;
+            fs::remove_file(&managed_marker).map_err(|error| {
+                format!("Could not clear localization component marker: {error}")
+            })?;
         }
         if let Some((component_id, version)) = component_marker {
             if component_id.lines().count() != 1 || version.lines().count() != 1 {
                 return Err("Language component metadata contains an invalid newline".into());
             }
-            fs::write(&managed_marker, format!("{component_id}\n{version}\n"))
-                .map_err(|error| format!("Could not write component PT-BR marker: {error}"))?;
+            fs::write(&managed_marker, format!("{component_id}\n{version}\n")).map_err(
+                |error| format!("Could not write localization component marker: {error}"),
+            )?;
         }
         Ok(())
     })();
@@ -371,100 +686,33 @@ fn import_patch_with_component_marker(
     finalize
 }
 
-pub fn import_patch(selected_root: &Path, game_root: &Path) -> Result<(), String> {
-    import_patch_with_component_marker(selected_root, game_root, None)
+#[cfg(test)]
+fn import_patch(selected_root: &Path, game_root: &Path) -> Result<(), String> {
+    import_patch_with_component_marker(selected_root, game_root, PT_BR_PROFILE, None)
 }
 
 pub fn install_component_patch(
     selected_root: &Path,
     component_id: &str,
     version: &str,
+    profile: &str,
     game_root: &Path,
 ) -> Result<(), String> {
-    import_patch_with_component_marker(selected_root, game_root, Some((component_id, version)))
-}
-
-pub fn bundled_patch_available() -> bool {
-    BUNDLED_PT_BR_AVAILABLE && BUNDLED_PT_BR_FILES.len() == PT_BR_TARGETS.len()
-}
-
-pub fn bundled_source_matches(game_root: &Path) -> bool {
-    if !bundled_patch_available() {
-        return false;
-    }
-    BUNDLED_PT_BR_FILES.iter().all(|(target, bundled)| {
-        let path = archive_relative_path(&source_root(game_root), target);
-        fs::read(path)
-            .map(|installed| installed.as_slice() == *bundled)
-            .unwrap_or(false)
-    })
-}
-
-pub fn install_bundled_patch(game_root: &Path) -> Result<(), String> {
-    if !bundled_patch_available() {
-        return Err(
-            "This MojoRecomp Launcher build does not contain the PT-BR Localization Pack".into(),
+    if selected_root.join(LANGUAGE_PATCH_MANIFEST).is_file() {
+        return install_delta_component_patch(
+            selected_root,
+            component_id,
+            version,
+            profile,
+            game_root,
         );
     }
-
-    let _profile_lock = acquire_profile_lock(game_root)?;
-    let parent = profile_root(game_root);
-    fs::create_dir_all(&parent)
-        .map_err(|error| format!("Could not create localization source storage: {error}"))?;
-    let staging = parent.join(".source-bundled.tmp");
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .map_err(|error| format!("Could not remove stale PT-BR staging directory: {error}"))?;
-    }
-    fs::create_dir_all(&staging)
-        .map_err(|error| format!("Could not create PT-BR staging directory: {error}"))?;
-
-    let result = (|| {
-        for (target, bytes) in BUNDLED_PT_BR_FILES {
-            if !PT_BR_TARGETS
-                .iter()
-                .any(|expected| expected.eq_ignore_ascii_case(target))
-            {
-                return Err(format!(
-                    "Bundled PT-BR resource has an unexpected target: {target}"
-                ));
-            }
-            if bytes.len() < 4 || &bytes[..4] != b"P3D\xFF" {
-                return Err(format!("Bundled PT-BR resource is not Pure3D: {target}"));
-            }
-            let destination = archive_relative_path(&staging, target);
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("Could not create PT-BR staging path: {error}"))?;
-            }
-            let mut file = File::create(&destination)
-                .map_err(|error| format!("Could not create bundled PT-BR resource: {error}"))?;
-            file.write_all(bytes)
-                .map_err(|error| format!("Could not write bundled PT-BR resource: {error}"))?;
-        }
-        replacements_from_root(&staging)?;
-        Ok::<(), String>(())
-    })();
-
-    if let Err(error) = result {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-
-    let finalize = (|| {
-        promote_directory(&staging, &source_root(game_root))?;
-        let component_marker = component_marker_path(game_root);
-        if component_marker.exists() {
-            fs::remove_file(component_marker)
-                .map_err(|error| format!("Could not clear component PT-BR marker: {error}"))?;
-        }
-        fs::write(bundled_marker_path(game_root), b"bundled")
-            .map_err(|error| format!("Could not write bundled PT-BR marker: {error}"))
-    })();
-    if finalize.is_err() && staging.exists() {
-        let _ = fs::remove_dir_all(&staging);
-    }
-    finalize
+    import_patch_with_component_marker(
+        selected_root,
+        game_root,
+        profile,
+        Some((component_id, version)),
+    )
 }
 
 fn hash_reader(
@@ -535,14 +783,14 @@ fn replacements_sha256(replacements: &[Replacement]) -> Result<String, String> {
         hasher.update(replacement.archive_path.as_bytes());
         let metadata = fs::metadata(&replacement.source_path).map_err(|error| {
             format!(
-                "Could not query PT-BR resource {}: {error}",
+                "Could not query localization resource {}: {error}",
                 replacement.source_path.display()
             )
         })?;
         hasher.update(metadata.len().to_le_bytes());
         let mut file = File::open(&replacement.source_path).map_err(|error| {
             format!(
-                "Could not open PT-BR resource {}: {error}",
+                "Could not open localization resource {}: {error}",
                 replacement.source_path.display()
             )
         })?;
@@ -551,61 +799,63 @@ fn replacements_sha256(replacements: &[Replacement]) -> Result<String, String> {
     Ok(digest_hex(hasher))
 }
 
-fn combined_fingerprint(source_sha256: &str, replacements_sha256: &str) -> String {
+fn combined_fingerprint(profile: &str, source_sha256: &str, replacements_sha256: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(BUILDER_VERSION.as_bytes());
-    hasher.update(PT_BR_PROFILE.as_bytes());
+    hasher.update(profile.as_bytes());
     hasher.update(source_sha256.as_bytes());
     hasher.update(replacements_sha256.as_bytes());
     digest_hex(hasher)
 }
 
-fn manifest_format_matches(manifest: &CacheManifest) -> bool {
+fn manifest_format_matches(manifest: &CacheManifest, profile: &str) -> bool {
     manifest.schema_version == CACHE_SCHEMA_VERSION
-        && manifest.profile == PT_BR_PROFILE
+        && manifest.profile == profile
         && manifest.builder_version == BUILDER_VERSION
 }
 
 fn manifest_fast_inputs_match(
     manifest: &CacheManifest,
+    profile: &str,
     source: SourceIdentity,
     replacements_sha256: &str,
 ) -> bool {
-    manifest_format_matches(manifest)
+    manifest_format_matches(manifest, profile)
         && manifest.source_size == source.size
         && manifest.source_modified_ns == source.modified_ns
         && manifest.replacements_sha256 == replacements_sha256
         && manifest.fingerprint
-            == combined_fingerprint(&manifest.source_sha256, replacements_sha256)
+            == combined_fingerprint(profile, &manifest.source_sha256, replacements_sha256)
 }
 
-fn cached_archive_matches(manifest: &CacheManifest, game_root: &Path) -> bool {
-    let archive = overlay_archive(game_root);
+fn cached_archive_matches(manifest: &CacheManifest, game_root: &Path, profile: &str) -> bool {
+    let archive = overlay_archive(game_root, profile);
     fs::metadata(&archive)
         .map(|metadata| metadata.len() == manifest.archive_size)
         .unwrap_or(false)
         && rcf::inspect(&archive).is_ok()
 }
 
-fn read_cache_manifest(game_root: &Path) -> Option<CacheManifest> {
-    let text = fs::read_to_string(cache_manifest_path(game_root)).ok()?;
+fn read_cache_manifest(game_root: &Path, profile: &str) -> Option<CacheManifest> {
+    let text = fs::read_to_string(cache_manifest_path(game_root, profile)).ok()?;
     toml::from_str(&text).ok()
 }
 
 fn write_cache_manifest(
     game_root: &Path,
+    profile: &str,
     fingerprint: &str,
     archive_size: u64,
     source: SourceIdentity,
     source_sha256: &str,
     replacements_sha256: &str,
 ) -> Result<(), String> {
-    let root = overlay_root(game_root);
+    let root = overlay_root(game_root, profile);
     fs::create_dir_all(&root)
         .map_err(|error| format!("Could not create localization overlay directory: {error}"))?;
     let manifest = CacheManifest {
         schema_version: CACHE_SCHEMA_VERSION,
-        profile: PT_BR_PROFILE.into(),
+        profile: profile.into(),
         builder_version: BUILDER_VERSION.into(),
         fingerprint: fingerprint.into(),
         archive_size,
@@ -624,7 +874,7 @@ fn write_cache_manifest(
     }
     fs::write(&temp, text)
         .map_err(|error| format!("Could not write localization cache metadata: {error}"))?;
-    let destination = cache_manifest_path(game_root);
+    let destination = cache_manifest_path(game_root, profile);
     if destination.exists() {
         fs::remove_file(&destination)
             .map_err(|error| format!("Could not replace localization cache metadata: {error}"))?;
@@ -633,32 +883,21 @@ fn write_cache_manifest(
         .map_err(|error| format!("Could not activate localization cache metadata: {error}"))
 }
 
-pub fn status(original_archive: &Path, game_root: &Path) -> LocalizationStatus {
-    let replacements = match managed_replacements(game_root) {
+pub fn status(original_archive: &Path, game_root: &Path, profile: &str) -> LocalizationStatus {
+    let replacements = match managed_replacements(game_root, profile) {
         Ok(value) => value,
         Err(error) => {
             return LocalizationStatus {
-                profile: PT_BR_PROFILE.into(),
+                profile: profile.into(),
                 source_installed: false,
                 overlay_ready: false,
                 detail: error,
             };
         }
     };
-    if uses_bundled_source(game_root)
-        && bundled_patch_available()
-        && !bundled_source_matches(game_root)
-    {
+    let Some(manifest) = read_cache_manifest(game_root, profile) else {
         return LocalizationStatus {
-            profile: PT_BR_PROFILE.into(),
-            source_installed: true,
-            overlay_ready: false,
-            detail: "A Localization Pack update is available.".into(),
-        };
-    }
-    let Some(manifest) = read_cache_manifest(game_root) else {
-        return LocalizationStatus {
-            profile: PT_BR_PROFILE.into(),
+            profile: profile.into(),
             source_installed: true,
             overlay_ready: false,
             detail: "The Localization Pack needs to be installed.".into(),
@@ -666,7 +905,7 @@ pub fn status(original_archive: &Path, game_root: &Path) -> LocalizationStatus {
     };
     if let Err(error) = rcf::inspect(original_archive) {
         return LocalizationStatus {
-            profile: PT_BR_PROFILE.into(),
+            profile: profile.into(),
             source_installed: true,
             overlay_ready: false,
             detail: error,
@@ -676,7 +915,7 @@ pub fn status(original_archive: &Path, game_root: &Path) -> LocalizationStatus {
         Ok(value) => value,
         Err(error) => {
             return LocalizationStatus {
-                profile: PT_BR_PROFILE.into(),
+                profile: profile.into(),
                 source_installed: true,
                 overlay_ready: false,
                 detail: error,
@@ -687,17 +926,17 @@ pub fn status(original_archive: &Path, game_root: &Path) -> LocalizationStatus {
         Ok(value) => value,
         Err(error) => {
             return LocalizationStatus {
-                profile: PT_BR_PROFILE.into(),
+                profile: profile.into(),
                 source_installed: true,
                 overlay_ready: false,
                 detail: error,
             };
         }
     };
-    let valid = manifest_fast_inputs_match(&manifest, source, &replacements_sha256)
-        && cached_archive_matches(&manifest, game_root);
+    let valid = manifest_fast_inputs_match(&manifest, profile, source, &replacements_sha256)
+        && cached_archive_matches(&manifest, game_root, profile);
     LocalizationStatus {
-        profile: PT_BR_PROFILE.into(),
+        profile: profile.into(),
         source_installed: true,
         overlay_ready: valid,
         detail: if valid {
@@ -746,21 +985,22 @@ fn activate_archive(temp: &Path, destination: &Path) -> Result<(), String> {
 pub fn prepare_overlay(
     original_archive: &Path,
     game_root: &Path,
+    profile: &str,
     mut on_progress: impl FnMut(u64, u64) -> Result<(), String>,
 ) -> Result<PathBuf, String> {
-    let _profile_lock = acquire_profile_lock(game_root)?;
-    let root = overlay_root(game_root);
+    let _profile_lock = acquire_profile_lock(game_root, profile)?;
+    let root = overlay_root(game_root, profile);
     cleanup_stale_build_files(&root)?;
-    let replacements = managed_replacements(game_root)?;
+    let replacements = managed_replacements(game_root, profile)?;
     rcf::inspect(original_archive)?;
     let source = source_identity(original_archive)?;
     let replacements_sha256 = replacements_sha256(&replacements)?;
-    let existing_manifest = read_cache_manifest(game_root);
+    let existing_manifest = read_cache_manifest(game_root, profile);
     if let Some(manifest) = existing_manifest.as_ref()
-        && manifest_fast_inputs_match(manifest, source, &replacements_sha256)
-        && cached_archive_matches(manifest, game_root)
+        && manifest_fast_inputs_match(manifest, profile, source, &replacements_sha256)
+        && cached_archive_matches(manifest, game_root, profile)
     {
-        return Ok(overlay_archive(game_root));
+        return Ok(overlay_archive(game_root, profile));
     }
 
     let source_sha256 = match existing_manifest.as_ref() {
@@ -773,23 +1013,24 @@ pub fn prepare_overlay(
         }
         _ => source_sha256(original_archive)?,
     };
-    let expected_fingerprint = combined_fingerprint(&source_sha256, &replacements_sha256);
+    let expected_fingerprint = combined_fingerprint(profile, &source_sha256, &replacements_sha256);
     if let Some(manifest) = existing_manifest.as_ref()
-        && manifest_format_matches(manifest)
+        && manifest_format_matches(manifest, profile)
         && manifest.source_sha256 == source_sha256
         && manifest.replacements_sha256 == replacements_sha256
         && manifest.fingerprint == expected_fingerprint
-        && cached_archive_matches(manifest, game_root)
+        && cached_archive_matches(manifest, game_root, profile)
     {
         write_cache_manifest(
             game_root,
+            profile,
             &expected_fingerprint,
             manifest.archive_size,
             source,
             &source_sha256,
             &replacements_sha256,
         )?;
-        return Ok(overlay_archive(game_root));
+        return Ok(overlay_archive(game_root, profile));
     }
 
     let estimated_size = rcf::estimate_rebuild_size(original_archive, &replacements)?;
@@ -821,15 +1062,16 @@ pub fn prepare_overlay(
     if rebuilt.source_size != estimated_size {
         let _ = fs::remove_file(&temp);
         return Err(format!(
-            "Rebuilt PT-BR archive size mismatch: expected {estimated_size}, got {}",
+            "Rebuilt localization archive size mismatch: expected {estimated_size}, got {}",
             rebuilt.source_size
         ));
     }
 
-    let destination = overlay_archive(game_root);
+    let destination = overlay_archive(game_root, profile);
     activate_archive(&temp, &destination)?;
     write_cache_manifest(
         game_root,
+        profile,
         &expected_fingerprint,
         rebuilt.source_size,
         source,
@@ -859,11 +1101,24 @@ mod tests {
     fn create_synthetic_cot_archive(path: &Path) -> Vec<(String, Vec<u8>)> {
         const HEADER_SIZE: usize = 60;
         const ALIGNMENT: u64 = 2048;
-        let mut files = PT_BR_TARGETS
+        let mut targets = COT_LOCALIZATION_TARGETS.to_vec();
+        for target in COT_LEGACY_LOCALIZATION_TARGETS {
+            if !targets
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(target))
+            {
+                targets.push(target);
+            }
+        }
+        let mut files = targets
             .iter()
             .enumerate()
             .map(|(index, target)| {
-                let mut payload = b"P3D\xFForiginal-".to_vec();
+                let mut payload = if target.to_ascii_lowercase().ends_with(".p3d") {
+                    b"P3D\xFForiginal-".to_vec()
+                } else {
+                    b"-- original-".to_vec()
+                };
                 payload.extend_from_slice(index.to_string().as_bytes());
                 ((*target).to_string(), payload)
             })
@@ -940,6 +1195,22 @@ mod tests {
         files
     }
 
+    fn write_literal_delta(source: &[u8], target: &[u8], path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(DELTA_MAGIC);
+        bytes.extend_from_slice(&sha256_bytes(source));
+        bytes.extend_from_slice(&sha256_bytes(target));
+        bytes.extend_from_slice(&(target.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(2);
+        bytes.extend_from_slice(&(target.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(target);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("delta parent");
+        }
+        fs::write(path, bytes).expect("delta");
+    }
+
     #[test]
     fn patch_discovery_ignores_pal_backups_and_requires_unique_expected_names() {
         let root = test_root("discovery");
@@ -962,40 +1233,9 @@ mod tests {
         fs::write(&invalid, b"BAD!payload").expect("invalid");
         assert!(validate_p3d(&valid).is_ok());
         assert!(validate_p3d(&invalid).is_err());
-        fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn bundled_ptbr_pack_contains_all_required_resources() {
-        assert!(bundled_patch_available());
-        assert_eq!(BUNDLED_PT_BR_FILES.len(), PT_BR_TARGETS.len());
-        for target in PT_BR_TARGETS {
-            let (_, bytes) = BUNDLED_PT_BR_FILES
-                .iter()
-                .find(|(bundled_target, _)| bundled_target.eq_ignore_ascii_case(target))
-                .expect("bundled target");
-            assert!(bytes.starts_with(b"P3D\xFF"), "{target}");
-        }
-
-        let root = test_root("bundled-install");
-        let game_root = root.join("game");
-        fs::create_dir_all(&game_root).expect("game root");
-        let original_archive = game_root.join("default.rcf");
-        create_synthetic_cot_archive(&original_archive);
-        install_bundled_patch(&game_root).expect("install bundled patch");
-        assert!(uses_bundled_source(&game_root));
-        assert!(bundled_source_matches(&game_root));
-        let replacements = managed_replacements(&game_root).expect("bundled replacements");
-        assert_eq!(replacements.len(), PT_BR_TARGETS.len());
-        for replacement in replacements {
-            assert!(replacement.source_path.starts_with(source_root(&game_root)));
-            assert!(replacement.source_path.is_file());
-        }
-        let derived =
-            prepare_overlay(&original_archive, &game_root, |_, _| Ok(())).expect("prepare bundle");
-        assert_eq!(derived, overlay_archive(&game_root));
-        assert!(derived.is_file());
-        assert!(status(&original_archive, &game_root).overlay_ready);
+        assert!(validate_localization_resource(&valid, r"package\valid.p3d").is_ok());
+        assert!(validate_localization_resource(&invalid, r"package\invalid.p3d").is_err());
+        assert!(validate_localization_resource(&invalid, r"levels\L3_E3\statics.lua").is_ok());
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -1006,7 +1246,7 @@ mod tests {
         let game_root = root.join("game");
         fs::create_dir_all(&selected).expect("selected");
         fs::create_dir_all(&game_root).expect("game root");
-        for (index, target) in PT_BR_TARGETS.iter().enumerate() {
+        for (index, target) in COT_LEGACY_LOCALIZATION_TARGETS.iter().enumerate() {
             let directory = selected.join(format!("source-{index}"));
             fs::create_dir_all(&directory).expect("source directory");
             let mut resource = b"P3D\xFF".to_vec();
@@ -1020,14 +1260,19 @@ mod tests {
         }
 
         import_patch(&selected, &game_root).expect("import");
-        let replacements = managed_replacements(&game_root).expect("managed replacements");
-        assert_eq!(replacements.len(), PT_BR_TARGETS.len());
+        let replacements =
+            managed_replacements(&game_root, PT_BR_PROFILE).expect("managed replacements");
+        assert_eq!(replacements.len(), COT_LEGACY_LOCALIZATION_TARGETS.len());
         for replacement in replacements {
             assert!(replacement.source_path.is_file());
-            assert!(replacement.source_path.starts_with(source_root(&game_root)));
+            assert!(
+                replacement
+                    .source_path
+                    .starts_with(source_root(&game_root, PT_BR_PROFILE))
+            );
         }
         assert_eq!(
-            source_root(&game_root),
+            source_root(&game_root, PT_BR_PROFILE),
             game_root
                 .join("localization")
                 .join(PT_BR_PROFILE)
@@ -1046,7 +1291,7 @@ mod tests {
         fs::create_dir_all(&component).expect("component");
         fs::create_dir_all(&manual).expect("manual");
         fs::create_dir_all(&game_root).expect("game root");
-        for (index, target) in PT_BR_TARGETS.iter().enumerate() {
+        for (index, target) in COT_LEGACY_LOCALIZATION_TARGETS.iter().enumerate() {
             let name = expected_basename(target);
             let mut component_bytes = b"P3D\xFFcomponent-".to_vec();
             component_bytes.extend_from_slice(index.to_string().as_bytes());
@@ -1057,22 +1302,84 @@ mod tests {
             fs::write(manual.join(name), manual_bytes).expect("manual resource");
         }
 
-        install_component_patch(&component, "language.cot.pt-br", "1.2.3", &game_root)
-            .expect("install component source");
-        assert!(uses_component_source(&game_root));
+        install_component_patch(
+            &component,
+            "language.cot.pt-br",
+            "1.2.3",
+            PT_BR_PROFILE,
+            &game_root,
+        )
+        .expect("install component source");
+        assert!(uses_component_source(&game_root, PT_BR_PROFILE));
         assert!(!uses_bundled_source(&game_root));
         assert_eq!(
-            component_source_version(&game_root).as_deref(),
+            component_source_version(&game_root, PT_BR_PROFILE).as_deref(),
             Some("1.2.3")
         );
 
         import_patch(&manual, &game_root).expect("manual import");
-        assert!(!uses_component_source(&game_root));
+        assert!(!uses_component_source(&game_root, PT_BR_PROFILE));
         assert!(!uses_bundled_source(&game_root));
-        assert!(component_source_version(&game_root).is_none());
-        let first = archive_relative_path(&source_root(&game_root), PT_BR_TARGETS[0]);
+        assert!(component_source_version(&game_root, PT_BR_PROFILE).is_none());
+        let first = archive_relative_path(
+            &source_root(&game_root, PT_BR_PROFILE),
+            COT_LEGACY_LOCALIZATION_TARGETS[0],
+        );
         assert!(fs::read(first).unwrap().starts_with(b"P3D\xFFmanual-"));
 
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn delta_language_component_uses_original_rcf_and_builds_generic_profile() {
+        let root = test_root("delta-component");
+        let game_root = root.join("game");
+        let component = root.join("component");
+        fs::create_dir_all(&game_root).expect("game root");
+        fs::create_dir_all(&component).expect("component root");
+        let original_archive = game_root.join("default.rcf");
+        let original_files = create_synthetic_cot_archive(&original_archive);
+
+        let mut manifest =
+            String::from("schema_version = 1\ngame_id = \"cot\"\nlocale = \"ar\"\n\n");
+        for (index, target) in COT_LOCALIZATION_TARGETS.iter().enumerate() {
+            let source = &original_files
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(target))
+                .expect("original target")
+                .1;
+            let mut translated = if target.to_ascii_lowercase().ends_with(".p3d") {
+                b"P3D\xFFdelta-language-".to_vec()
+            } else {
+                b"-- delta-language-".to_vec()
+            };
+            translated.extend_from_slice(index.to_string().as_bytes());
+            let patch_name = format!("patches/{index:02}.mjdelta");
+            write_literal_delta(source, &translated, &component.join(&patch_name));
+            manifest.push_str("[[patch]]\n");
+            manifest.push_str(&format!(
+                "archive_path = \"{}\"\n",
+                target.replace('\\', "\\\\")
+            ));
+            manifest.push_str(&format!("file = \"{patch_name}\"\n\n"));
+        }
+        fs::write(component.join(LANGUAGE_PATCH_MANIFEST), manifest).expect("patch manifest");
+
+        install_component_patch(&component, "language.cot.ar", "1.0.0", "ar", &game_root)
+            .expect("install delta component");
+        assert!(uses_component_source(&game_root, "ar"));
+        assert_eq!(
+            component_source_version(&game_root, "ar").as_deref(),
+            Some("1.0.0")
+        );
+        let first =
+            archive_relative_path(&source_root(&game_root, "ar"), COT_LOCALIZATION_TARGETS[0]);
+        assert_eq!(fs::read(first).unwrap(), b"-- delta-language-0");
+
+        let overlay = prepare_overlay(&original_archive, &game_root, "ar", |_, _| Ok(()))
+            .expect("prepare generic language overlay");
+        assert!(overlay.is_file());
+        assert!(status(&original_archive, &game_root, "ar").overlay_ready);
         fs::remove_dir_all(root).expect("cleanup");
     }
 
@@ -1087,7 +1394,7 @@ mod tests {
         let original_files = create_synthetic_cot_archive(&original_archive);
         let original_bytes = fs::read(&original_archive).expect("original bytes");
 
-        for (index, target) in PT_BR_TARGETS.iter().enumerate() {
+        for (index, target) in COT_LEGACY_LOCALIZATION_TARGETS.iter().enumerate() {
             let directory = selected.join(format!("patch-{index}"));
             fs::create_dir_all(&directory).expect("patch directory");
             let mut payload = b"P3D\xFFtranslated-resource-".to_vec();
@@ -1095,15 +1402,20 @@ mod tests {
             fs::write(directory.join(expected_basename(target)), payload).expect("patch file");
         }
         import_patch(&selected, &game_root).expect("import");
-        let stale_temp = overlay_root(&game_root).join(".default.rcf.98765.tmp");
+        let stale_temp = overlay_root(&game_root, PT_BR_PROFILE).join(".default.rcf.98765.tmp");
         fs::write(&stale_temp, b"stale").expect("stale temp");
 
         let mut progress_calls = 0usize;
-        let derived = prepare_overlay(&original_archive, &game_root, |done, total| {
-            assert!(done <= total);
-            progress_calls += 1;
-            Ok(())
-        })
+        let derived = prepare_overlay(
+            &original_archive,
+            &game_root,
+            PT_BR_PROFILE,
+            |done, total| {
+                assert!(done <= total);
+                progress_calls += 1;
+                Ok(())
+            },
+        )
         .expect("prepare");
         assert!(progress_calls > 0);
         assert!(!stale_temp.exists());
@@ -1119,7 +1431,7 @@ mod tests {
             fs::read(&original_archive).expect("original after"),
             original_bytes
         );
-        let ready = status(&original_archive, &game_root);
+        let ready = status(&original_archive, &game_root, PT_BR_PROFILE);
         assert!(ready.source_installed);
         assert!(ready.overlay_ready);
 
@@ -1127,7 +1439,11 @@ mod tests {
         let first = derived_index
             .entries
             .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(PT_BR_TARGETS[0]))
+            .find(|entry| {
+                entry
+                    .name
+                    .eq_ignore_ascii_case(COT_LEGACY_LOCALIZATION_TARGETS[0])
+            })
             .expect("first target");
         let mut derived_file = File::open(&derived).expect("derived file");
         derived_file
@@ -1161,7 +1477,7 @@ mod tests {
         );
 
         let mut cached_progress_calls = 0usize;
-        let cached = prepare_overlay(&original_archive, &game_root, |_, _| {
+        let cached = prepare_overlay(&original_archive, &game_root, PT_BR_PROFILE, |_, _| {
             cached_progress_calls += 1;
             Ok(())
         })
@@ -1173,23 +1489,23 @@ mod tests {
             original_bytes
         );
 
-        let mut stale_builder_manifest =
-            read_cache_manifest(&game_root).expect("cache manifest before builder invalidation");
+        let mut stale_builder_manifest = read_cache_manifest(&game_root, PT_BR_PROFILE)
+            .expect("cache manifest before builder invalidation");
         stale_builder_manifest.builder_version = "older-builder".into();
         fs::write(
-            cache_manifest_path(&game_root),
+            cache_manifest_path(&game_root, PT_BR_PROFILE),
             toml::to_string_pretty(&stale_builder_manifest).expect("serialize stale manifest"),
         )
         .expect("write stale builder manifest");
-        assert!(!status(&original_archive, &game_root).overlay_ready);
+        assert!(!status(&original_archive, &game_root, PT_BR_PROFILE).overlay_ready);
         let mut builder_rebuild_progress_calls = 0usize;
-        prepare_overlay(&original_archive, &game_root, |_, _| {
+        prepare_overlay(&original_archive, &game_root, PT_BR_PROFILE, |_, _| {
             builder_rebuild_progress_calls += 1;
             Ok(())
         })
         .expect("rebuild after builder version invalidation");
         assert!(builder_rebuild_progress_calls > 0);
-        assert!(status(&original_archive, &game_root).overlay_ready);
+        assert!(status(&original_archive, &game_root, PT_BR_PROFILE).overlay_ready);
 
         drop(derived_file);
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1218,14 +1534,15 @@ mod tests {
         let externally_modified =
             fs::read(&original_archive).expect("externally modified original bytes");
         assert_ne!(externally_modified, original_bytes);
-        assert!(!status(&original_archive, &game_root).overlay_ready);
+        assert!(!status(&original_archive, &game_root, PT_BR_PROFILE).overlay_ready);
 
         let mut rebuild_progress_calls = 0usize;
-        let rebuilt_after_source_change = prepare_overlay(&original_archive, &game_root, |_, _| {
-            rebuild_progress_calls += 1;
-            Ok(())
-        })
-        .expect("rebuild after source change");
+        let rebuilt_after_source_change =
+            prepare_overlay(&original_archive, &game_root, PT_BR_PROFILE, |_, _| {
+                rebuild_progress_calls += 1;
+                Ok(())
+            })
+            .expect("rebuild after source change");
         assert_eq!(rebuilt_after_source_change, derived);
         assert!(rebuild_progress_calls > 0);
         assert_eq!(
@@ -1264,7 +1581,7 @@ mod tests {
         create_synthetic_cot_archive(&original_archive);
         let original_bytes = fs::read(&original_archive).expect("original bytes");
 
-        for (index, target) in PT_BR_TARGETS.iter().enumerate() {
+        for (index, target) in COT_LEGACY_LOCALIZATION_TARGETS.iter().enumerate() {
             let directory = selected.join(format!("patch-{index}"));
             fs::create_dir_all(&directory).expect("patch directory");
             let mut payload = b"P3D\xFFtranslated-resource-".to_vec();
@@ -1272,14 +1589,17 @@ mod tests {
             fs::write(directory.join(expected_basename(target)), payload).expect("patch file");
         }
         import_patch(&selected, &game_root).expect("import");
-        let existing = prepare_overlay(&original_archive, &game_root, |_, _| Ok(()))
+        let existing = prepare_overlay(&original_archive, &game_root, PT_BR_PROFILE, |_, _| Ok(()))
             .expect("initial cached archive");
         let existing_bytes = fs::read(&existing).expect("existing derived bytes");
-        let changed_patch = archive_relative_path(&source_root(&game_root), PT_BR_TARGETS[0]);
+        let changed_patch = archive_relative_path(
+            &source_root(&game_root, PT_BR_PROFILE),
+            COT_LEGACY_LOCALIZATION_TARGETS[0],
+        );
         fs::write(&changed_patch, b"P3D\xFFchanged-after-cache").expect("change managed patch");
-        assert!(!status(&original_archive, &game_root).overlay_ready);
+        assert!(!status(&original_archive, &game_root, PT_BR_PROFILE).overlay_ready);
 
-        let result = prepare_overlay(&original_archive, &game_root, |done, _| {
+        let result = prepare_overlay(&original_archive, &game_root, PT_BR_PROFILE, |done, _| {
             if done > 0 {
                 return Err("cancelled by test".into());
             }
@@ -1287,11 +1607,12 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(
-            fs::read(overlay_archive(&game_root)).expect("existing derived after cancel"),
+            fs::read(overlay_archive(&game_root, PT_BR_PROFILE))
+                .expect("existing derived after cancel"),
             existing_bytes
         );
         assert!(
-            !overlay_root(&game_root)
+            !overlay_root(&game_root, PT_BR_PROFILE)
                 .join(".default.rcf.building.tmp")
                 .exists()
         );
