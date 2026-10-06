@@ -148,16 +148,31 @@ min_launcher = "1.0.0"
 id = "runtime.mom"
 min_version = "0.4.0"
 max_version = "0.4.9"
+
+[[release]]
+id = "runtime.cot"
+kind = "runtime"
+version = "0.1.1-alpha"
+platform = "windows"
+arch = "x86_64"
+url = "https://github.com/example/MojoRecomp/releases/download/v1.0.1/runtime-0.1.1-alpha.zip"
+size = 95
+sha256 = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+published = "2026-09-21"
+notes_url = "https://github.com/example/MojoRecomp/releases/tag/v1.0.1"
+package = "zip"
+unpacked_size = 190
+entrypoint = "cot-runtime.exe"
+required_files = ["cot-runtime.exe", "dxcompiler.dll", "dxil.dll", "mojorecomp-ffmpeg.dll", "mojorecomp-lzx.dll", "extract-xiso.exe", "mojorecomp-package.toml", "mojorecomp-package.sig"]
+game_id = "cot"
+
+[release.compatibility]
+min_launcher = "1.1.0"
 `;
   const history = runtimeHistoryFromCatalog(catalog, "0.2.0");
   assert.equal(history.length, 1);
-  assert.equal(history[0].version, "0.1.0-alpha");
-  assert.equal(history[0].minLauncher, "1.0.0");
-  assert.equal(
-    history[0].localizationCatalogUrl,
-    "https://github.com/example/MojoRecomp/releases/download/v1.0.0/localization-catalog.toml",
-  );
-  assert.deepEqual(history[0].requirements, [
-    { id: "runtime.mom", minVersion: "0.4.0", maxVersion: "0.4.9" },
-  ]);
+  assert.equal(history[0].version, "0.1.1-alpha");
+  assert.equal(history[0].minLauncher, "1.1.0");
+  assert.equal(history[0].localizationCatalogUrl, null);
+  assert.deepEqual(history[0].requirements, []);
 });

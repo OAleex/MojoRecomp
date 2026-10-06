@@ -202,6 +202,7 @@
         published: "",
         notes_url: "",
         size: 0,
+        downloadable: false,
         local_only: true
       });
     }
@@ -217,6 +218,7 @@
     const installed = installedRuntimeVersion(release.version);
     if (installed && !installed.healthy) return "Damaged";
     if (installed) return "Downloaded";
+    if (!release.downloadable) return "Archived";
     return index === 0 ? "Latest" : "Available";
   }
 
@@ -1684,26 +1686,26 @@
                   {/if}
                 </article>
 
-                <div class="release-history-heading"><div><span>Available runtime versions</span><strong>{selected.name}</strong></div></div>
-                <div class="version-table" role="table" aria-label="Available runtime versions">
+                <div class="release-history-heading"><div><span>Runtime versions</span><strong>{selected.name}</strong></div></div>
+                <div class="version-table" role="table" aria-label="Runtime versions">
                   <div class="version-row version-head" role="row"><span>Status</span><span>Version</span><span>Released</span><span>Package</span><span>Action</span></div>
                   {#each selectedRuntimeVersions as release, index}
                     <div class:active-version={release.version === selectedRuntimeComponent?.installed_version} class="version-row" role="row">
                       <span data-label="Status"><i class:installed={!!installedRuntimeVersion(release.version)}></i>{runtimeVersionStatusLabel(release, index)}</span>
                       <strong data-label="Version">{release.version}</strong>
                       <span data-label="Released">{release.local_only ? "Local" : formatReleaseDate(release.published)}</span>
-                      <span data-label="Package">{release.local_only ? "Installed" : humanBytes(release.size)}</span>
+                      <span data-label="Package">{release.local_only ? "Installed" : release.downloadable ? humanBytes(release.size) : "Archived"}</span>
                       <div class="version-row-actions" data-label="Action">
                         {#if release.version === selectedRuntimeComponent?.installed_version}
-                          {#if !release.local_only}<button type="button" class="secondary-button" onclick={() => installRuntimeRelease(release)} disabled={updateInteractionBusy}>Redownload</button>{/if}
+                          {#if !release.local_only && release.downloadable}<button type="button" class="secondary-button" onclick={() => installRuntimeRelease(release)} disabled={updateInteractionBusy}>Redownload</button>{/if}
                           <button type="button" class="danger-button compact" onclick={() => removeRuntimeVersion(release.version)} disabled={updateInteractionBusy}>Remove</button>
                         {:else if installedRuntimeVersion(release.version)?.healthy}
                           <button type="button" class="primary-button" onclick={() => activateRuntimeVersion(release.version)} disabled={updateInteractionBusy}>Activate</button>
                           <button type="button" class="secondary-button" onclick={() => removeRuntimeVersion(release.version)} disabled={updateInteractionBusy}>Remove</button>
                         {:else if installedRuntimeVersion(release.version)}
-                          {#if !release.local_only}<button type="button" class="primary-button" onclick={() => installRuntimeRelease(release)} disabled={updateInteractionBusy}>Repair</button>{/if}
+                          {#if !release.local_only && release.downloadable}<button type="button" class="primary-button" onclick={() => installRuntimeRelease(release)} disabled={updateInteractionBusy}>Repair</button>{/if}
                           <button type="button" class="secondary-button" onclick={() => removeRuntimeVersion(release.version)} disabled={updateInteractionBusy}>Remove</button>
-                        {:else}
+                        {:else if release.downloadable}
                           <button type="button" class="primary-button" onclick={() => installRuntimeRelease(release)} disabled={updateInteractionBusy}>{selectedRuntimeComponent?.installed_version ? "Download" : "Install"}</button>
                         {/if}
                         {#if release.notes_url}<button type="button" class="version-notes-button" onclick={() => openUpdateUrl(release.notes_url)}>Notes</button>{/if}

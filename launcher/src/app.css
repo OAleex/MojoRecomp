@@ -370,14 +370,14 @@ select:focus { border-color: #506b80; }
 .release-history-heading span { color: #6e7274; font-size: 8px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 .release-history-heading strong { margin-top: 4px; color: #bfc0bc; font-size: 10px; }
 .version-table { overflow: hidden; border: 1px solid rgba(255,255,255,.08); border-radius: 7px; background: #0d1114; }
-.version-row { min-height: 42px; display: grid; grid-template-columns: 120px minmax(120px,1fr) 150px 120px minmax(170px,auto); align-items: center; gap: 12px; padding: 0 14px; border-top: 1px solid rgba(255,255,255,.055); color: #8b8e90; font-size: 9px; }
+.version-row { min-height: 42px; display: grid; grid-template-columns: 110px minmax(150px,1fr) 150px 110px minmax(230px,280px); align-items: center; gap: 12px; padding: 0 14px; border-top: 1px solid rgba(255,255,255,.055); color: #8b8e90; font-size: 9px; }
 .version-row:first-child { border-top: 0; }
 .version-row strong { color: #d4d4d0; font: 600 10px/1 "Cascadia Mono", Consolas, monospace; }
 .version-row > span:first-child { display: flex; align-items: center; gap: 7px; }
 .version-row i { width: 7px; height: 7px; border-radius: 50%; background: #555b5f; }
 .version-row i.installed { background: var(--accent); }
 .version-row.active-version { background: rgba(var(--theme-rgb),.045); }
-.version-row-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.version-row-actions { min-width: 0; display: flex; flex-wrap: wrap; justify-content: flex-start; gap: 6px; }
 .version-row-actions .primary-button,
 .version-row-actions .secondary-button,
 .version-row-actions .danger-button { min-height: 30px; padding: 0 10px; font-size: 8px; }
@@ -387,8 +387,8 @@ select:focus { border-color: #506b80; }
 .version-empty { grid-template-columns: 1fr; min-height: 52px; color: #666c6f; }
 .version-head { min-height: 34px; color: #686c70; background: #151a1f; font-size: 8px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
 .optional-version-section { padding-top: 2px; }
-.optional-component-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.optional-version-card { background: rgba(12,16,19,.78); }
+.optional-component-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.optional-version-card { width: 100%; box-sizing: border-box; background: rgba(12,16,19,.78); }
 .versions-footer { margin-top: 12px; }
 .primary-button, .secondary-button, .danger-button { min-height: 35px; padding: 0 13px; border-radius: 6px; cursor: pointer; font-size: 9px; font-weight: 700; transition: background .15s ease, border-color .15s ease, color .15s ease; }
 .primary-button { border: 1px solid var(--accent); color: #f1f4f6; background: var(--accent-deep); box-shadow: none; }
@@ -665,10 +665,9 @@ select { min-height: 44px; font-size: 13px; }
   .game-logo { width: min(47vw, 470px); }
   .field-grid { grid-template-columns: 1fr; }
   .diagnostic-options { grid-template-columns: 1fr; }
-  .optional-component-grid { grid-template-columns: 1fr; }
   .component-release-overview { align-items: stretch; }
   .component-release-actions { min-width: 170px; }
-  .version-row { grid-template-columns: 100px minmax(100px,1fr) 120px 100px minmax(150px,auto); }
+  .version-row { grid-template-columns: 95px minmax(120px,1fr) 115px 90px minmax(190px,240px); gap: 9px; }
   .wide-field { grid-column: auto; }
 }
 @media (max-height: 700px) {

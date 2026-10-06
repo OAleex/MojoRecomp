@@ -47,6 +47,7 @@ const GAME_MANIFESTS: [&str; 2] = [
     include_str!("../../resources/games/mom.toml"),
 ];
 const SUITE_MANIFEST: &str = include_str!("../../resources/suite.toml");
+const RUNTIME_HISTORY_MANIFEST: &str = include_str!("../../resources/runtime-history.toml");
 const DISK_MINIMUM_MARGIN_BYTES: u64 = 1024 * 1024 * 1024;
 const OBS_VULKAN_CAPTURE_DISABLE_ENV: &str = "DISABLE_VULKAN_OBS_CAPTURE";
 include!(concat!(env!("OUT_DIR"), "/third_party_licenses.rs"));
@@ -674,6 +675,103 @@ struct ComponentReleaseStatus {
     published: String,
     notes_url: String,
     size: u64,
+    downloadable: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeHistoryManifest {
+    schema_version: u32,
+    #[serde(rename = "runtime")]
+    runtimes: Vec<RuntimeHistoryEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeHistoryEntry {
+    id: String,
+    version: String,
+    published: String,
+    notes_url: String,
+}
+
+fn archived_runtime_releases(component_id: &str) -> Result<Vec<ComponentReleaseStatus>, String> {
+    let manifest: RuntimeHistoryManifest = toml::from_str(RUNTIME_HISTORY_MANIFEST)
+        .map_err(|error| format!("Runtime history metadata is invalid: {error}"))?;
+    if manifest.schema_version != 1 {
+        return Err(format!(
+            "Unsupported runtime history schema version: {}",
+            manifest.schema_version
+        ));
+    }
+
+    let mut seen = HashSet::new();
+    let mut releases = Vec::new();
+    for entry in manifest
+        .runtimes
+        .into_iter()
+        .filter(|entry| entry.id == component_id)
+    {
+        semver::Version::parse(&entry.version)
+            .map_err(|_| format!("Archived runtime {} has an invalid version", entry.version))?;
+        let published = entry
+            .published
+            .split('-')
+            .collect::<Vec<_>>();
+        if published.len() != 3
+            || published[0].len() != 4
+            || published[1].len() != 2
+            || published[2].len() != 2
+            || published.iter().any(|part| !part.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            return Err(format!(
+                "Archived runtime {} has an invalid release date",
+                entry.version
+            ));
+        }
+        let notes_url = reqwest::Url::parse(&entry.notes_url)
+            .map_err(|_| format!("Archived runtime {} has an invalid notes URL", entry.version))?;
+        if notes_url.scheme() != "https" || notes_url.host_str() != Some("github.com") {
+            return Err(format!(
+                "Archived runtime {} must use an HTTPS GitHub notes URL",
+                entry.version
+            ));
+        }
+        if !seen.insert(entry.version.clone()) {
+            return Err(format!("Duplicate archived runtime version: {}", entry.version));
+        }
+        releases.push(ComponentReleaseStatus {
+            version: entry.version,
+            published: entry.published,
+            notes_url: entry.notes_url,
+            size: 0,
+            downloadable: false,
+        });
+    }
+    releases.sort_by(|left, right| {
+        semver::Version::parse(&right.version)
+            .ok()
+            .cmp(&semver::Version::parse(&left.version).ok())
+    });
+    Ok(releases)
+}
+
+fn merge_archived_runtime_releases(
+    releases: &mut Vec<ComponentReleaseStatus>,
+    component_id: &str,
+) -> Result<(), String> {
+    for archived in archived_runtime_releases(component_id)? {
+        if releases.iter().any(|release| release.version == archived.version) {
+            continue;
+        }
+        releases.push(archived);
+    }
+    releases.sort_by(|left, right| {
+        semver::Version::parse(&right.version)
+            .ok()
+            .cmp(&semver::Version::parse(&left.version).ok())
+    });
+    Ok(())
 }
 
 #[derive(Clone, Serialize)]
@@ -3821,7 +3919,7 @@ fn local_component_statuses(
             notes_url: None,
             can_rollback: active.as_ref().is_some_and(|status| status.can_rollback),
             last_action: active.and_then(|status| status.last_action),
-            releases: Vec::new(),
+            releases: archived_runtime_releases(&id)?,
             installed_versions: game_store
                 .installed_versions(&id)?
                 .into_iter()
@@ -4018,7 +4116,7 @@ fn component_statuses_from_catalog(
                 .active_status(&plan.id)?
                 .is_some_and(|status| status.can_rollback),
         };
-        let releases = updates::compatible_releases_for_component(
+        let mut releases = updates::compatible_releases_for_component(
             catalog,
             &installed,
             env!("CARGO_PKG_VERSION"),
@@ -4030,8 +4128,12 @@ fn component_statuses_from_catalog(
             published: release.published,
             notes_url: release.notes_url,
             size: release.size,
+            downloadable: true,
         })
         .collect();
+        if plan.kind == updates::ComponentKind::Runtime {
+            merge_archived_runtime_releases(&mut releases, &plan.id)?;
+        }
         let installed_versions = if plan.kind == updates::ComponentKind::Runtime {
             game_store
                 .installed_versions(&plan.id)?
@@ -4153,6 +4255,7 @@ fn launcher_component_status_from_catalog(
         published: release.published,
         notes_url: release.notes_url,
         size: release.size,
+        downloadable: true,
     })
     .collect();
 
@@ -5785,6 +5888,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cot_runtime_history_keeps_legacy_release_as_archived_only() {
+        let history = archived_runtime_releases("runtime.cot").expect("COT runtime history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, "0.1.0-alpha");
+        assert_eq!(history[0].published, "2026-09-29");
+        assert!(!history[0].downloadable);
+        assert_eq!(history[0].size, 0);
+        assert!(history[0].notes_url.ends_with("/releases/tag/v1.0.0"));
+        assert!(archived_runtime_releases("runtime.mom")
+            .expect("MOM runtime history")
+            .is_empty());
+    }
 
     #[test]
     fn runtime_processes_disable_the_obs_vulkan_capture_layer() {

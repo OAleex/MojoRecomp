@@ -1,0 +1,7 @@
+schema_version = 1
+
+[[runtime]]
+id = "runtime.cot"
+version = "0.1.0-alpha"
+published = "2026-09-29"
+notes_url = "https://github.com/OAleex/MojoRecomp/releases/tag/v1.0.0"

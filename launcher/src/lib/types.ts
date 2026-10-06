@@ -99,6 +99,7 @@ export type ComponentReleaseStatus = {
   published: string;
   notes_url: string;
   size: number;
+  downloadable: boolean;
 };
 
 export type UpdateOverview = {
