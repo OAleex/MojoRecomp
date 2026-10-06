@@ -855,11 +855,15 @@
       : runtimeAdditionalSelection.filter((value) => value !== id);
   }
 
-  function closeRuntimeAdditionalContent() {
-    if (runtimeAdditionalBusy) return;
+  function dismissRuntimeAdditionalContent() {
     runtimeAdditionalContent = null;
     runtimeAdditionalSelection = [];
     pendingRuntimeAction = null;
+  }
+
+  function closeRuntimeAdditionalContent() {
+    if (runtimeAdditionalBusy) return;
+    dismissRuntimeAdditionalContent();
   }
 
   async function executeRuntimeAction(action: PendingRuntimeAction, languageIds: string[]) {
@@ -938,19 +942,15 @@
     if (!pendingRuntimeAction || runtimeAdditionalBusy) return;
     const action = pendingRuntimeAction;
     const selectedLanguages = [...runtimeAdditionalSelection];
-    runtimeAdditionalBusy = true;
-    const ok = await executeRuntimeAction(action, selectedLanguages);
-    runtimeAdditionalBusy = false;
-    if (ok) closeRuntimeAdditionalContent();
+    dismissRuntimeAdditionalContent();
+    await executeRuntimeAction(action, selectedLanguages);
   }
 
   async function skipRuntimeAdditionalContent() {
     if (!pendingRuntimeAction || runtimeAdditionalBusy) return;
     const action = pendingRuntimeAction;
-    runtimeAdditionalBusy = true;
-    const ok = await executeRuntimeAction(action, []);
-    runtimeAdditionalBusy = false;
-    if (ok) closeRuntimeAdditionalContent();
+    dismissRuntimeAdditionalContent();
+    await executeRuntimeAction(action, []);
   }
 
   async function installRuntimeRelease(release: ComponentReleaseStatus) {
